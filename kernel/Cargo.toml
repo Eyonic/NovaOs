@@ -1,16 +1,12 @@
 [package]
 name = "nova-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Project Nova: minimal x86-64 Rust kernel booted by Limine (UEFI)"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
 # Intentionally none: the few Limine protocol structs we need live in src/limine.rs.
-
-[features]
-# Panics right after startup; used by scripts/test.sh --panic to verify the panic handler.
-panic-test = []
 
 [profile.dev]
 panic = "abort"

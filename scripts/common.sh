@@ -6,7 +6,8 @@ BUILD="$ROOT/build"
 LOGS="$BUILD/logs"
 KERNEL_DIR="$ROOT/kernel"
 PROFILE="${PROFILE:-release}"
-KERNEL_ELF="$KERNEL_DIR/target/x86_64-unknown-none/$PROFILE/nova-kernel"
+# Cargo names the dev profile's output directory "debug".
+KERNEL_ELF="$KERNEL_DIR/target/x86_64-unknown-none/$([[ $PROFILE == dev ]] && echo debug || echo "$PROFILE")/nova-kernel"
 IMAGE="${IMAGE:-$BUILD/nova.img}"
 
 # Host-provided inputs (override via environment if your distro uses other paths).

@@ -82,6 +82,45 @@ pub static BASE_REVISION: BaseRevision = BaseRevision::new(REQUESTED_REVISION);
 #[unsafe(link_section = ".limine_requests")]
 pub static BOOTLOADER_INFO: BootloaderInfoRequest = BootloaderInfoRequest::new();
 
+#[repr(C)]
+struct ExecutableCmdlineResponse {
+    revision: u64,
+    cmdline: *const c_char,
+}
+
+#[repr(C, align(8))]
+pub struct ExecutableCmdlineRequest {
+    id: [u64; 4],
+    revision: u64,
+    response: UnsafeCell<*const ExecutableCmdlineResponse>,
+}
+
+// SAFETY: as for BaseRevision.
+unsafe impl Sync for ExecutableCmdlineRequest {}
+
+impl ExecutableCmdlineRequest {
+    const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC[0], COMMON_MAGIC[1], 0x4b161536e598651e, 0xb390ad4a2f1f303a],
+            revision: 0,
+            response: UnsafeCell::new(core::ptr::null()),
+        }
+    }
+
+    /// The `cmdline:` value from limine.conf ("" if none), or None if Limine did not answer.
+    pub fn get(&self) -> Option<&'static str> {
+        // SAFETY: as for BootloaderInfoRequest::get.
+        unsafe {
+            let resp = self.response.get().read_volatile().as_ref()?;
+            CStr::from_ptr(resp.cmdline).to_str().ok()
+        }
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static EXECUTABLE_CMDLINE: ExecutableCmdlineRequest = ExecutableCmdlineRequest::new();
+
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
 static REQUESTS_END: [u64; 2] = [0xadc0e0531bb10d03, 0x9572709f31764c62];
