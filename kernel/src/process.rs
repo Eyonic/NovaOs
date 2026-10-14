@@ -130,8 +130,10 @@ pub fn init() {
         XSAVE_SIZE.store(cpuid(0xD, 0)[1] as u64, Ordering::Relaxed);
     }
     wrmsr(IA32_EFER, rdmsr(IA32_EFER) | 1 | (1 << 11)); // SCE, NXE
-    // SYSCALL: CS = 0x08, SS = 0x10. SYSRET: SS = 0x10 + 8, CS = 0x10 + 16 (both RPL 3).
-    wrmsr(IA32_STAR, (0x10u64 << 48) | ((gdt::KERNEL_CODE as u64) << 32));
+    // SYSCALL: CS = 0x08, SS = 0x10. SYSRET: SS = 0x13 + 8, CS = 0x13 + 16. The RPL bits
+    // go into STAR itself, as Linux does: Intel forces RPL 3 on both selectors, but AMD
+    // loads SS verbatim, and an SS of 0x18 (RPL 0) makes the next iretq to user mode #GP.
+    wrmsr(IA32_STAR, (((gdt::USER_DATA - 8) as u64) << 48) | ((gdt::KERNEL_CODE as u64) << 32));
     wrmsr(IA32_LSTAR, syscall_entry as *const () as u64);
     wrmsr(IA32_FMASK, 0x0004_0700); // clear IF, DF, TF and AC on entry
 }
