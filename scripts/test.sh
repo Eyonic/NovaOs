@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net chromium browser setup installed hostlogin deepseek)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net chromium browser setup installed hostlogin deepseek oom)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -40,12 +40,13 @@ CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
 # last input; 0 if the last input halts the machine).
 # Step mode: if INPUT contains "wait:TEXT" entries, inputs are not paced by shell prompts. Each wait
 # step blocks until TEXT has appeared once more than at the previous wait for the same TEXT; other
-# steps are sent immediately ("raw:..." sends without Enter).
+# steps are sent immediately ("raw:..." sends without Enter, "sleep:N" waits N seconds,
+# "dump:FILE" saves a screenshot of the display to the log directory).
 # QEMU_EXTRA: extra QEMU arguments. EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
 # MOCK=1: run with the mock Anthropic API and fail on any protocol violation it logs.
 define_case() {
     EXPECT=() CONTAINS=() FORBID=("$PANIC" "$EXC" "NESTED") CHECK_RIP=0 CMDLINE="nova.test=$1"
-    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET=0 SKIP=""
+    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET=0 SKIP="" CASE_TIMEOUT=$TIMEOUT
     local fault=("$EXC" "$STATUS" "$HALTED")
     local fault_forbid=("$PANIC" "$SHELL_START" "NESTED")
     local shell=("$EXPECTED_BANNER" "$STATUS" "$SHELL_START")
@@ -98,33 +99,55 @@ define_case() {
         deepseek) # DeepSeek as the provider (key passed in like scripts/run.sh does): Nova Assistant
                 # signs in via /models, ports a driver, then builds an app on the desktop; the mock
                 # checks DeepSeek's rules (model, effort levels, screenshots beside tool results).
-                CMDLINE="nova.deepseek_api=http://10.0.2.2:$MOCK_PORT/anthropic nova.install=no"; MOCK=1
+                CMDLINE="nova.deepseek_api=http://10.0.2.2:$MOCK_PORT/anthropic nova.comfyui=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1
                 [[ -n "${run_dir:-}" ]] && printf 'deepseek-key\nsk-deepseek-test-0123456789\nDEEPSEEK_API_KEY on the host\n' >"$run_dir/deepseek-credential"
                 QEMU_EXTRA=(-fw_cfg "name=opt/nova/claude-credential,file=${run_dir:-}/deepseek-credential" -device ich9-intel-hda)
                 INPUT=("wait:✓ Signed in with a DeepSeek API key" "wait:Starting the desktop"
-                       "wait:✓ Signed in with a DeepSeek API key" "wait:> " "ser:make me a clock app" "wait:Your clock app is ready")
+                       "wait:✓ Signed in with a DeepSeek API key" "wait:> " "ser:make me a clock app" "wait:Your clock app is ready"
+                       "wait:> " "ser:/clear" "wait:conversation cleared" "ser:make a poster image" "wait:Poster image ready.")
                 EXPECT=("$EXPECTED_BANNER" "│ ✻ Nova Assistant · DeepSeek                          │" "Porting drivers with DeepSeek"
                         "⏺ PciConfig(00:03.0)" "⏺ Write(apps/clock.rhai)" "⏺ CheckApp(apps/clock.rhai)" "  ⎿  OK, screenshot attached")
-                CONTAINS=("Your clock app is ready")
-                FORBID=("$PANIC" "$EXC" "API error" "  API key: " "not usable" "Claude") ;;
+                CONTAINS=("Your clock app is ready" "⏺ GenerateImage(apps/assets/poster-bg.png)" "256x144 image saved")
+                FORBID=("$PANIC" "$EXC" "API error" "  API key: " "not usable" "Claude" "The image failed") ;;
         native) # C/C++ programs (static glibc/libstdc++) through the Linux syscall layer.
                 CMDLINE="nova.mode=shell"
-                INPUT=("wait:$PROMPT" "ser:hello one two" "wait:  HOME=/" "ser:ctest" "wait:ctest: 24 passed"
+                INPUT=("wait:$PROMPT" "ser:mem" "wait:kernel heap:" "ser:hello one two" "wait:  HOME=/" "ser:ctest" "wait:ctest: 24 passed"
                        "ser:cxxtest" "wait:static destructor ran" "ser:threads" "wait:threads: " "ser:hello-dyn" "wait:objects in the process"
                        "ser:cxxtest-dyn" "wait:static destructor ran" "ser:guess" "wait:Your guess: " "ser:50"
-                       "wait:Your guess: " "ser:x")
+                       "wait:Your guess: " "ser:x" "wait:[exit status 1]" "ser:mem" "wait:kernel heap:")
                 EXPECT=("${shell[@]}" "Hello from C on Nova!" "  argv[2] = two" "ctest: 24 passed, 0 failed"
                         "cxxtest: 17 passed, 0 failed" "cxxtest: static destructor ran" "threads: 7 passed, 0 failed"
                         "Hello from a dynamically linked C program on Nova!" "  loaded /usr/lib/libc.so.6" "I'm thinking of a number between 1 and 100."
                         "[exit status 1]")
                 CONTAINS=("C/C++ compatibility: Linux x86-64 ABI")
                 FORBID=("$PANIC" "$EXC" "FAIL " "unimplemented Linux syscall" "illegal instruction" "segmentation fault") ;;
+        oom)    # A program that uses up all memory is stopped; the kernel and shell keep working.
+                CMDLINE="nova.mode=shell"; CASE_TIMEOUT=$(( TIMEOUT > 90 ? TIMEOUT : 90 ))
+                INPUT=("wait:$PROMPT" "ser:memhog" "wait:the program was stopped" "ser:hello again" "wait:  argv[1] = again" "ser:mem")
+                EXPECT=("${shell[@]}" "Hello from C on Nova!" "[exit status 137]")
+                CONTAINS=("memhog: 1024 MiB" "memhog: out of memory (Nova has" "kernel heap:")
+                FORBID=("$PANIC" "$EXC" "NESTED") ;;
         net)    # Linux sockets: glibc DNS (UDP) and TCP, against the local mock server.
                 CMDLINE="nova.mode=shell"; MOCK=1
                 INPUT=("wait:$PROMPT" "ser:nettest 10.0.2.2:$MOCK_PORT" "wait:bytes")
                 EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
-                CONTAINS=("nettest: HTTP/1.1 404 Not Found")
+                CONTAINS=("nettest: HTTP/1.1 404 Not Found" "nettest: MSG_PEEK kept the data")
                 FORBID=("$PANIC" "$EXC" "segmentation fault" "illegal instruction") ;;
+        webpage) # Diagnostic (needs internet, not in --all): Nova Browser opens WEB_URL (default
+                # DuckDuckGo), logs every host that served it, and saves a screenshot.
+                CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no nova.browser_log"; MOCK=1; CASE_TIMEOUT=180
+                [[ -d "$BUILD/sysroot/opt/chromium" ]] || SKIP="Chromium not downloaded"
+                INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:> " "ser:open url ${WEB_URL:-https://duckduckgo.com}" "wait:The page is open." "sleep:${WEB_WAIT:-30}" "dump:webpage.ppm")
+                EXPECT=("$EXPECTED_BANNER")
+                CONTAINS=("The page is open.") ;;
+        webimg) # Diagnostic (needs internet, not in --all): Chromium loads HTTPS images directly.
+                CMDLINE="nova.mode=shell"; CASE_TIMEOUT=150
+                [[ -d "$BUILD/sysroot/opt/chromium" ]] || SKIP="Chromium not downloaded"
+                local ch="run opt/chromium/chrome-headless-shell --no-sandbox --single-process --no-zygote --disable-gpu --virtual-time-budget=9000 --dump-dom"
+                INPUT=("wait:$PROMPT" "ser:$ch data:text/html,<img%20src=https://duckduckgo.com/favicon.ico%20onerror=document.title='E'%20onload=document.title='K'>" "wait:</html>"
+                       "ser:$ch data:text/html,<img%20src=https://www.wikipedia.org/static/favicon/wikipedia.ico%20onerror=document.title='E'%20onload=document.title='K'>" "wait:</html>")
+                EXPECT=("${shell[@]}")
+                CONTAINS=("<title>K</title>") ;;
         chromium) # The Chromium engine renders a page (no network needed) to a PNG.
                 CMDLINE="nova.mode=shell"
                 [[ -d "$BUILD/sysroot/opt/chromium" ]] || SKIP="Chromium not downloaded (scripts/fetch-chromium.sh)"
@@ -135,7 +158,8 @@ define_case() {
         browser) # Desktop: Claude opens a page in Nova Browser; Chromium loads it, Shields blocks its tracker.
                 CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1
                 [[ -d "$BUILD/sysroot/opt/chromium" ]] || SKIP="Chromium not downloaded (scripts/fetch-chromium.sh)"
-                INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:> " "ser:open the test page" "wait:shields: blocked www.google-analytics.com")
+                INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:> " "ser:open the test page" "wait:shields: blocked www.google-analytics.com"
+                       "wait:The test page is open in Nova Browser." "sleep:8" "dump:browser.ppm")
                 EXPECT=("$EXPECTED_BANNER" "⏺ OpenUrl(http://10.0.2.2:$MOCK_PORT/test-page)" "  ⎿  Opened in Nova Browser")
                 CONTAINS=("[nova] shields: blocked www.google-analytics.com" "The test page is open in Nova Browser.")
                 FORBID=("$PANIC" "$EXC" "API error" "engine stopped") ;;
@@ -278,7 +302,7 @@ run_case() {
     }
     forbidden() { local l; for l in "${FORBID[@]}"; do has_sub "$l" && { echo "$l"; return 0; }; done; return 1; }
 
-    local verdict=timeout why="" deadline=$(( SECONDS + TIMEOUT )) sent=0 step_mode=0
+    local verdict=timeout why="" deadline=$(( SECONDS + CASE_TIMEOUT )) sent=0 step_mode=0
     local -A seen=()
     [[ " ${INPUT[*]} " == *" wait:"* || "${INPUT[0]:-}" == wait:* ]] && step_mode=1
     count_of() { clean | grep -oF -- "$1" | wc -l; }
@@ -294,6 +318,11 @@ run_case() {
                 if (( $(count_of "$text") >= want )); then seen[$text]=$want; sent=$(( sent + 1 )); continue; fi
             elif [[ $step == raw:* ]]; then
                 printf '%s' "${step#raw:}" >&"$SERIAL_FD"; sent=$(( sent + 1 )); continue
+            elif [[ $step == sleep:* ]]; then
+                sleep "${step#sleep:}"; sent=$(( sent + 1 )); continue
+            elif [[ $step == dump:* ]]; then
+                # Screenshot of the VM's display (PPM) into the log directory.
+                printf 'screendump %s\n' "$run_dir/${step#dump:}" >&"$MONITOR_FD"; sleep 1; sent=$(( sent + 1 )); continue
             else
                 send_input "$step" || { verdict=fail why="could not send input"; break; }
                 sent=$(( sent + 1 )); continue
@@ -349,7 +378,7 @@ run_case() {
         printf '  \033[32mPASS\033[0m %s\n' "$name"; return 0
     fi
     [[ $verdict == timeout ]] && {
-        why="expected output not seen within ${TIMEOUT}s"
+        why="expected output not seen within ${CASE_TIMEOUT}s"
         for l in "${EXPECT[@]}"; do has_line "$l" || echo "  missing line: \"$l\""; done
         for l in "${CONTAINS[@]}"; do has_sub "$l" || echo "  missing text: \"$l\""; done
     }

@@ -430,8 +430,9 @@ fn tools() -> Value {
             json!({"path": {"type": "string"}}), &["path"]),
         tool("run_command", "Run a Nova shell command (see the system prompt for the list) and return its output. Commands that change the system ask the user first.",
             json!({"command": {"type": "string"}}), &["command"]),
-        tool("check_app", "Load a Rhai app without a window: compile it, run init(), replay optional simulated events, run draw(), and return any errors plus a PNG screenshot of the window contents. Use it after every change to an app.",
-            json!({"path": {"type": "string"}, "events": {"type": "array", "items": {"type": "string"}, "description": "Simulated events before drawing: \"click X Y\", \"key K\", \"tick\", \"tick N\""}}), &["path"]),
+        tool("check_app", "Load a Rhai app without a window: compile it, run init(), replay optional simulated events, run draw(), and return any errors plus a PNG screenshot of the window contents. Use it after every change to an app. Pass `reference` (the app's design mockup) to get it back next to the screenshot for comparison.",
+            json!({"path": {"type": "string"}, "events": {"type": "array", "items": {"type": "string"}, "description": "Simulated events before drawing: \"click X Y\", \"key K\", \"tick\", \"tick N\""},
+                   "reference": {"type": "string", "description": "Optional PNG path of the design mockup to compare against"}}), &["path"]),
         tool("launch_app", "Open an app (a .rhai file) in a window on the user's desktop.",
             json!({"path": {"type": "string"}}), &["path"]),
         tool("http_get", "Fetch a URL (http or https) from Nova's own network stack and return the status and body (truncated to 60 KB).",
@@ -442,6 +443,13 @@ fn tools() -> Value {
             json!({"address": {"type": "string"}}), &["address"]),
         tool("open_url", "Open a web page in Nova Browser (Chromium engine) on the user's desktop.",
             json!({"url": {"type": "string"}}), &["url"]),
+        tool("generate_image", "Generate an image with the image model (ComfyUI, Z-Image Turbo) and save it as a PNG on the Nova filesystem; you also get to see it. Use it for app artwork: backgrounds, illustrations, icons, sprites, textures, and for visual inspiration before designing an app. Apps draw saved images with g.image(...). Takes roughly 5 to 60 seconds per image.",
+            json!({
+                "prompt": {"type": "string", "description": "Detailed visual description: subject, style, colors, lighting, composition. Say 'no text' unless you want lettering (the model spells poorly)."},
+                "path": {"type": "string", "description": "Where to save it, ending in .png; use apps/assets/<app>-<name>.png"},
+                "width": {"type": "integer", "description": "Pixels, 64-1024 (rounded to a multiple of 16). Generate at the size the app draws it, or smaller for icons and sprites."},
+                "height": {"type": "integer", "description": "Pixels, 64-1024"}
+            }), &["prompt", "path", "width", "height"]),
         {"type": "web_search_20260209", "name": "web_search", "max_uses": 5},
     ])
 }
@@ -514,6 +522,7 @@ fn describe_call(name: &str, input: &Value) -> String {
         "system_info" => "SystemInfo".into(),
         "pci_config" => format!("PciConfig({})", arg("address")),
         "open_url" => format!("OpenUrl({})", short(arg("url"))),
+        "generate_image" => format!("GenerateImage({})", arg("path")),
         "web_search" => format!("WebSearch({})", short(arg("query"))),
         other => other.into(),
     }
@@ -550,6 +559,23 @@ impl Agent {
     fn run_tool(&mut self, name: &str, input: &Value) -> ToolOutcome {
         let r: Result<ToolOutcome, String> = (|| {
             Ok(match name {
+                "generate_image" => {
+                    let prompt = str_arg(input, "prompt")?;
+                    let path = str_arg(input, "path")?;
+                    if !path.ends_with(".png") || path.starts_with("system/") {
+                        return Ok(err("path must end in .png and not be under system/ (use apps/assets/...)"));
+                    }
+                    let dim = |k: &str| input.get(k).and_then(|v| v.as_u64()).unwrap_or(512) as u32;
+                    print!("{DIM}  ... generating image{RESET}");
+                    let result = crate::imagegen::generate(prompt, dim("width"), dim("height"));
+                    print!("\r\x1b[K");
+                    let png = result?;
+                    let (w, h) = gfx::Canvas::from_png(&png).map(|c| (c.width, c.height)).unwrap_or((0, 0));
+                    fs::write(path, &png)?;
+                    let text = format!("Saved a {w}x{h} PNG to {path} ({} KB). Draw it in an app with g.image(x, y, \"{path}\") or g.image(x, y, w, h, \"{path}\").", png.len() / 1024);
+                    let blocks = vec![json!({"type": "text", "text": text}), json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": gfx::base64(&png)}})];
+                    ToolOutcome { content: Value::Array(blocks), is_error: false, summary: format!("{w}x{h} image saved, {} KB", png.len() / 1024) }
+                }
                 "read_file" => {
                     let path = str_arg(input, "path")?;
                     let text = fs::read_string(path)?;
@@ -622,6 +648,12 @@ impl Agent {
                     if let Some(png) = &report.png {
                         text.push_str("\nScreenshot of the window contents attached.");
                         blocks.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": gfx::base64(png)}}));
+                    }
+                    if let Some(reference) = input.get("reference").and_then(|v| v.as_str())
+                        && let Ok(png) = fs::read(reference)
+                    {
+                        text.push_str(&format!("\nThe design mockup ({reference}) is attached after the screenshot: compare layout, colors, spacing and controls, and fix what differs."));
+                        blocks.push(json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": gfx::base64(&png)}}));
                     }
                     blocks.insert(0, json!({"type": "text", "text": text}));
                     let summary = if report.problems.is_empty() { format!("{GREEN}OK{RESET}, screenshot attached") } else { format!("{RED}{} problem(s){RESET}: {}", report.problems.len(), report.problems[0].lines().next().unwrap_or("")) };
@@ -1192,16 +1224,35 @@ fn help(p: Provider) {
 
 /// The interactive Claude Code session (runs in the current terminal).
 pub fn run_cli() {
+    run_cli_with(None);
+}
+
+/// Like [`run_cli`], starting with `prompt` as the first request (Home's idea cards).
+pub fn run_cli_with(prompt: Option<String>) {
     let mut cfg = Config::load();
     welcome(&cfg);
     sign_in(&mut cfg);
-    run_session(cfg, "");
+    run_session_with(cfg, "", prompt);
 }
 
 /// Prompt loop for an already set-up client.
 pub fn run_session(cfg: Config, extra_system: &str) {
+    run_session_with(cfg, extra_system, None);
+}
+
+fn run_session_with(cfg: Config, extra_system: &str, first: Option<String>) {
     let mut agent = Agent::new(cfg, extra_system);
     let mut history = History::new(100);
+    if let Some(p) = first {
+        println!();
+        println!("{BOLD}>{RESET} {p}");
+        history.add(&p);
+        if agent.cfg.logged_in() {
+            agent.turn(json!(p));
+        } else {
+            println!("  {ORANGE}Not signed in.{RESET} Use /login first.");
+        }
+    }
     loop {
         println!();
         let opts = lineedit::Options { prompt: "\x1b[1m>\x1b[0m ", max_len: 4000, masked: false, complete: None };

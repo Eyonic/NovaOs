@@ -4,8 +4,9 @@
 //! Shields answers block / upgrade / rewrite / allow:
 //!
 //! * **Ad and tracker blocking.** A built-in list of well-known ad, analytics and
-//!   tracking hosts, plus any filter lists saved under `system/shields/*.txt` in
-//!   the common Adblock Plus syntax: `||host^` anchors, `*` wildcards, `^`
+//!   tracking hosts, plus filter lists in the common Adblock Plus syntax: the ones
+//!   bundled in the image (`usr/share/nova/shields/*.txt`, EasyList and EasyPrivacy
+//!   fetched at build time) and any saved under `system/shields/*.txt`. Syntax: `||host^` anchors, `*` wildcards, `^`
 //!   separators, `|` anchors, `@@` exceptions and the `$third-party`,
 //!   `$~third-party` and `$domain=` options. Cosmetic (`##`) rules are ignored.
 //! * **HTTPS upgrades** for page loads on plain HTTP (except local addresses).
@@ -13,7 +14,7 @@
 //! * **Per-site switch.** Sites listed in `system/shields/allowed-sites` have
 //!   Shields down.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -70,10 +71,61 @@ struct Rule {
     token: String,
 }
 
+/// Rules indexed by a word every matching URL must contain (as a whole word between
+/// non-alphanumeric characters), so a request is only checked against the few rules
+/// whose word occurs in its URL. Rules without such a word are checked every time.
+#[derive(Default)]
+struct RuleSet {
+    rules: Vec<Rule>,
+    by_word: BTreeMap<String, Vec<u32>>,
+    generic: Vec<u32>,
+}
+
+impl RuleSet {
+    fn push(&mut self, r: Rule) {
+        let i = self.rules.len() as u32;
+        match index_word(&r) {
+            Some(w) => self.by_word.entry(w).or_default().push(i),
+            None => self.generic.push(i),
+        }
+        self.rules.push(r);
+    }
+
+    fn any_match(&self, url: &str, words: &[&str], host: &str, page_host: &str, third_party: bool) -> bool {
+        let hit = |i: &u32| self.rules[*i as usize].matches(url, host, page_host, third_party);
+        words.iter().any(|w| self.by_word.get(*w).is_some_and(|v| v.iter().any(hit))) || self.generic.iter().any(hit)
+    }
+}
+
+/// The longest alphanumeric run of a rule's pattern that must appear in a matching URL
+/// as a complete word: bounded on both sides by a literal non-alphanumeric character,
+/// a `^`, an anchored pattern start or an anchored end (not by a `*`).
+fn index_word(r: &Rule) -> Option<String> {
+    let p = r.pattern.as_bytes();
+    let mut best: Option<(usize, usize)> = None;
+    let mut i = 0;
+    while i < p.len() {
+        if !p[i].is_ascii_alphanumeric() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < p.len() && p[i].is_ascii_alphanumeric() {
+            i += 1;
+        }
+        let left_ok = if start == 0 { r.host_anchor || r.start_anchor } else { p[start - 1] != b'*' };
+        let right_ok = if i == p.len() { r.end_anchor } else { p[i] != b'*' };
+        if left_ok && right_ok && i - start >= 2 && best.is_none_or(|(a, b)| i - start > b - a) {
+            best = Some((start, i));
+        }
+    }
+    best.map(|(a, b)| r.pattern[a..b].into())
+}
+
 pub struct Shields {
     hosts: BTreeSet<String>,
-    rules: Vec<Rule>,
-    exceptions: Vec<Rule>,
+    rules: RuleSet,
+    exceptions: RuleSet,
     allowed_sites: BTreeSet<String>,
     pub list_rules: usize,
 }
@@ -97,6 +149,11 @@ pub fn host_of(url: &str) -> &str {
 fn site_of(host: &str) -> String {
     let labels: Vec<&str> = host.split('.').collect();
     if labels.len() <= 2 { host.into() } else { labels[labels.len() - 2..].join(".") }
+}
+
+/// `a.b.example.com`, `b.example.com`, `example.com`, `com`.
+fn suffixes(host: &str) -> impl Iterator<Item = &str> {
+    core::iter::once(host).chain(host.match_indices('.').map(move |(i, _)| &host[i + 1..]))
 }
 
 fn host_matches(host: &str, domain: &str) -> bool {
@@ -202,13 +259,15 @@ impl Rule {
 
 impl Shields {
     pub fn load() -> Shields {
-        let mut s = Shields { hosts: BUILTIN_HOSTS.iter().map(|h| h.to_string()).collect(), rules: Vec::new(), exceptions: Vec::new(), allowed_sites: BTreeSet::new(), list_rules: 0 };
-        for (name, _, _) in fs::list("system/shields/") {
-            if name.ends_with(".txt")
-                && let Ok(text) = fs::read_string(&name)
-            {
-                for line in text.lines() {
-                    s.add_line(line.trim());
+        let mut s = Shields { hosts: BUILTIN_HOSTS.iter().map(|h| h.to_string()).collect(), rules: RuleSet::default(), exceptions: RuleSet::default(), allowed_sites: BTreeSet::new(), list_rules: 0 };
+        for prefix in ["usr/share/nova/shields/", "system/shields/"] {
+            for (name, _, _) in fs::list(prefix) {
+                if name.ends_with(".txt")
+                    && let Ok(text) = fs::read_string(&name)
+                {
+                    for line in text.lines() {
+                        s.add_line(line.trim());
+                    }
                 }
             }
         }
@@ -284,13 +343,15 @@ impl Shields {
         }
         let third_party = site_of(&host) != site_of(&page_host);
         let lower = url.to_ascii_lowercase();
-        if self.exceptions.iter().any(|r| r.matches(&lower, &host, &page_host, third_party)) {
+        let words: Vec<&str> = lower.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| w.len() >= 2).collect();
+        if self.exceptions.any_match(&lower, &words, &host, &page_host, third_party) {
             return Verdict::Allow;
         }
-        if third_party && self.hosts.iter().any(|h| host_matches(&host, h)) {
+        // The host or any parent domain in the host list (`||host^` rules).
+        if third_party && suffixes(&host).any(|d| self.hosts.contains(d)) {
             return Verdict::Block(host);
         }
-        if self.rules.iter().any(|r| r.matches(&lower, &host, &page_host, third_party)) {
+        if self.rules.any_match(&lower, &words, &host, &page_host, third_party) {
             return Verdict::Block(host);
         }
         Verdict::Allow

@@ -255,6 +255,26 @@ pub struct UserState {
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
+/// Heap bytes kept back from programs (see Memory::map_zero_page).
+pub const USER_RESERVE: usize = 48 << 20;
+
+/// Out of memory on behalf of the current program: stop it (like Linux's OOM killer)
+/// and return a scratch page to back the request until its threads notice. The page is
+/// shared and never freed; only dying programs write to it.
+#[cold]
+pub fn oom_scratch_page() -> *mut u8 {
+    static SCRATCH: spin::Once<usize> = spin::Once::new();
+    let scratch = *SCRATCH.call_once(|| memory::new_table() as usize); // a zeroed page
+    if let Some(u) = task::current_user()
+        && !u.process.exiting.load(Ordering::SeqCst)
+    {
+        crate::log::warn(&format!("{}: out of memory, program stopped", u.process.name));
+        crate::println!("\n{}: out of memory (Nova has {} MiB free); the program was stopped", u.process.name, memory::heap_usage().1 >> 20);
+        kill(&u.process);
+    }
+    memory::phys_to_virt(scratch as u64) as *mut u8
+}
+
 impl Memory {
     fn new(cr3: u64) -> Self {
         Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP }
@@ -265,15 +285,31 @@ impl Memory {
         if let Some(&p) = self.pages.get(&va) {
             return p;
         }
-        // SAFETY: valid layout; zeroed so programs never see stale kernel data.
-        let page = unsafe { alloc::alloc::alloc_zeroed(alloc::alloc::Layout::from_size_align(PAGE as usize, PAGE as usize).unwrap()) };
-        assert!(!page.is_null(), "out of memory for a user page");
+        // Programs may not take the kernel's last USER_RESERVE bytes (page tables, network
+        // buffers and the desktop need them to keep running).
+        // Pool pages are zeroed, so programs never see stale kernel data.
+        let page = if memory::heap_usage().1 < USER_RESERVE { core::ptr::null_mut() } else { memory::alloc_page().unwrap_or(core::ptr::null_mut()) };
+        if page.is_null() {
+            return self.out_of_memory(va);
+        }
         let flags = PRESENT | USER | if writable { WRITABLE } else { 0 };
         let tables = &mut self.tables;
         // SAFETY: `va` is in the lower half, which belongs to this address space only.
         unsafe { memory::map_page_in(self.cr3, va, memory::virt_to_phys(page as u64), flags, PRESENT | WRITABLE | USER, &mut |t| tables.push(t)) };
         self.pages.insert(va, page);
         page
+    }
+
+    /// No memory left for a program page: kill the program (like Linux's OOM killer)
+    /// instead of the kernel. Until its threads notice, `va` is backed by a shared scratch
+    /// page that is never freed and not recorded in `pages`; only dying programs write it.
+    #[cold]
+    fn out_of_memory(&mut self, va: u64) -> *mut u8 {
+        let scratch = memory::virt_to_phys(oom_scratch_page() as u64);
+        let tables = &mut self.tables;
+        // SAFETY: as in map_zero_page; the scratch page lives for the rest of the boot.
+        unsafe { memory::map_page_in(self.cr3, va, scratch as u64, PRESENT | USER | WRITABLE, PRESENT | WRITABLE | USER, &mut |t| tables.push(t)) };
+        memory::phys_to_virt(scratch as u64) as *mut u8
     }
 
     /// Map `len` bytes of a read-only system file at `va` (page aligned), starting at
@@ -430,8 +466,8 @@ impl Memory {
                 self.unmap_page(va);
                 let not_ours = self.borrowed.remove(&va) | self.foreign.remove(&va);
                 if !not_ours {
-                    // SAFETY: allocated in map_zero_page with this layout.
-                    unsafe { alloc::alloc::dealloc(p, alloc::alloc::Layout::from_size_align(PAGE as usize, PAGE as usize).unwrap()) };
+                    // SAFETY: from the page pool in map_zero_page; just unmapped.
+                    unsafe { memory::free_page(p) };
                 }
             }
         }
@@ -542,17 +578,16 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        let layout = alloc::alloc::Layout::from_size_align(PAGE as usize, PAGE as usize).unwrap();
         for (va, p) in core::mem::take(&mut self.pages) {
             if !self.borrowed.contains(&va) && !self.foreign.contains(&va) {
-                // SAFETY: allocated in map_zero_page with this layout.
-                unsafe { alloc::alloc::dealloc(p, layout) };
+                // SAFETY: from the page pool in map_zero_page; the address space is gone.
+                unsafe { memory::free_page(p) };
             }
         }
         for t in self.tables.drain(..).chain([self.cr3]) {
-            // SAFETY: page-table pages come from memory::new_table (heap, this layout).
+            // SAFETY: page-table pages come from memory::new_table (the page pool).
             // The last thread switched to the kernel address space before dropping.
-            unsafe { alloc::alloc::dealloc(memory::phys_to_virt(t) as *mut u8, layout) };
+            unsafe { memory::free_page(memory::phys_to_virt(t) as *mut u8) };
         }
     }
 }

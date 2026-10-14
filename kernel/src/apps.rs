@@ -44,6 +44,8 @@ use crate::{fs, net, pit, rand, rtc, task};
 pub struct AppInfo {
     pub path: String,
     pub title: String,
+    /// The first comment line after the header fields (a one-line description).
+    pub about: String,
     pub icon: char,
     pub color: u32,
     pub width: i32,
@@ -75,6 +77,7 @@ pub fn info(path: &str, src: &str) -> AppInfo {
     let mut info = AppInfo {
         path: path.into(),
         title: path.rsplit('/').next().unwrap_or(path).trim_end_matches(".rhai").into(),
+        about: String::new(),
         icon: '\u{2666}',
         color: 0x5B6EE1,
         width: 480,
@@ -82,7 +85,13 @@ pub fn info(path: &str, src: &str) -> AppInfo {
     };
     for line in src.lines().take(20) {
         let Some(rest) = line.trim().strip_prefix("//") else { continue };
-        let Some((key, value)) = rest.split_once(':') else { continue };
+        let known = ["title", "icon", "color", "size"];
+        let Some((key, value)) = rest.split_once(':').filter(|(k, _)| known.contains(&k.trim())) else {
+            if info.about.is_empty() && !rest.trim().is_empty() {
+                info.about = rest.trim().into();
+            }
+            continue;
+        };
         let value = value.trim();
         match key.trim() {
             "title" => info.title = value.into(),
@@ -142,6 +151,7 @@ fn key_name(k: Key) -> String {
         Key::Down => "Down".into(),
         Key::Left => "Left".into(),
         Key::Right => "Right".into(),
+        Key::Super => "Super".into(),
     }
 }
 
@@ -155,6 +165,30 @@ struct AppCtx {
 fn app_data_key(app: &str, key: &str) -> String {
     let clean: String = key.chars().filter(|c| c.is_ascii_alphanumeric() || "._-".contains(*c)).collect();
     format!("appdata/{app}/{clean}")
+}
+
+/// Decoded PNG files, shared by all apps; dropped when the filesystem changes.
+static IMAGES: SpinLock<(u64, Vec<(String, Option<Arc<Canvas>>)>)> = SpinLock::new((0, Vec::new()));
+
+/// A PNG file from the filesystem, decoded once (None if missing or not a PNG).
+pub fn image(path: &str) -> Option<Arc<Canvas>> {
+    {
+        let mut cache = IMAGES.lock();
+        if cache.0 != fs::generation() {
+            *cache = (fs::generation(), Vec::new());
+        }
+        if let Some((_, img)) = cache.1.iter().find(|(p, _)| p == path) {
+            return img.clone();
+        }
+    }
+    let data = fs::read(path).ok().or_else(|| fs::system_file(path).map(|s| s.to_vec()));
+    let img = data.and_then(|d| Canvas::from_png(&d).ok()).map(Arc::new);
+    let mut cache = IMAGES.lock();
+    if cache.1.len() >= 48 {
+        cache.1.remove(0);
+    }
+    cache.1.push((path.into(), img.clone()));
+    img
 }
 
 fn make_engine(ctx: Arc<AppCtx>) -> Engine {
@@ -178,6 +212,29 @@ fn make_engine(ctx: Arc<AppCtx>) -> Engine {
     e.register_get("height", |g: &mut Gfx| g.with(|c| c.height as INT));
     e.register_fn("clear", |g: &mut Gfx, c: INT| g.with(|cv| cv.clear(color(c))));
     e.register_fn("rect", |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, c: INT| g.with(|cv| cv.fill_rect(Rect::new(x as i32, y as i32, w as i32, h as i32), color(c))));
+    // Images (PNG files, e.g. ones the assistant generated under apps/assets/).
+    e.register_fn("image", |g: &mut Gfx, x: INT, y: INT, path: &str| {
+        if let Some(img) = image(path) {
+            g.with(|cv| cv.blit(&img, img.bounds(), x as i32, y as i32));
+        }
+    });
+    e.register_fn("image", |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, path: &str| {
+        if let Some(img) = image(path) {
+            g.with(|cv| cv.blit_scaled(&img, Rect::new(x as i32, y as i32, w as i32, h as i32), 0, 255));
+        }
+    });
+    e.register_fn("image", |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, radius: INT, path: &str| {
+        if let Some(img) = image(path) {
+            g.with(|cv| cv.blit_scaled(&img, Rect::new(x as i32, y as i32, w as i32, h as i32), radius as i32, 255));
+        }
+    });
+    e.register_fn("image_size", |path: &str| -> Map {
+        let mut m = Map::new();
+        let (w, h) = image(path).map_or((0, 0), |i| (i.width as INT, i.height as INT));
+        m.insert("width".into(), w.into());
+        m.insert("height".into(), h.into());
+        m
+    });
     e.register_fn("frame", |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, c: INT| g.with(|cv| cv.stroke_rect(Rect::new(x as i32, y as i32, w as i32, h as i32), color(c))));
     e.register_fn("round_rect", |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, r: INT, c: INT| g.with(|cv| cv.fill_round_rect(Rect::new(x as i32, y as i32, w as i32, h as i32), r as i32, color(c))));
     e.register_fn("line", |g: &mut Gfx, x0: INT, y0: INT, x1: INT, y1: INT, c: INT| g.with(|cv| cv.line(x0 as i32, y0 as i32, x1 as i32, y1 as i32, color(c))));
@@ -495,6 +552,23 @@ pub fn check(path: &str, events: &[String]) -> Result<CheckReport, String> {
     }
     let png = Some(app.canvas.try_lock().expect("canvas").to_png());
     Ok(CheckReport { problems, png, title: meta.title })
+}
+
+/// Render an app's current frame without a window (for desktop previews): load it,
+/// run init, `ticks` ticks and draw. None if it fails.
+pub fn snapshot(path: &str, ticks: u32) -> Option<Canvas> {
+    let src = fs::read_string(path).ok()?;
+    let meta = info(path, &src);
+    let (mut app, _) = Running::load("preview", &src, None, meta.width, meta.height).ok()?;
+    for _ in 0..ticks.min(50) {
+        app.call("tick", (), 0);
+    }
+    app.draw();
+    if app.error.is_some() {
+        return None;
+    }
+    let c = app.canvas.try_lock()?.clone();
+    Some(c)
 }
 
 #[allow(dead_code)]

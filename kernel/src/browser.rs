@@ -58,6 +58,9 @@ impl Cdp {
             "--remote-debugging-pipe",
             "--incognito",
             "--hide-scrollbars",
+            // Nova has no sound device: play media into a silent sink instead of failing to
+            // open ALSA (which breaks some players).
+            "--disable-audio-output",
             &format!("--window-size={width},{height}"),
             "about:blank",
         ]
@@ -134,11 +137,20 @@ struct Browser {
     status: String,
     blocked: Vec<String>,
     upgraded: u32,
+    /// Recent network requests (id, URL), to name the ones that fail.
+    requests: Vec<(String, String)>,
+    loaded_hosts: Vec<String>,
+    probe_at: u64,
+    probe_text: String,
     loading: bool,
     panel: bool,
     viewport: (i32, i32),
     error: Option<String>,
     dirty: bool,
+}
+
+fn log_loads() -> bool {
+    crate::limine::EXECUTABLE_CMDLINE.get().is_some_and(|c| c.split_whitespace().any(|a| a == "nova.browser_log"))
 }
 
 /// Open a browser window (at `url`, or the home page).
@@ -160,6 +172,10 @@ pub fn launch(url: Option<String>) {
             status: "Starting the Chromium engine...".into(),
             blocked: Vec::new(),
             upgraded: 0,
+            requests: Vec::new(),
+            loaded_hosts: Vec::new(),
+            probe_at: 0,
+            probe_text: String::new(),
             loading: true,
             panel: false,
             viewport: (w, h - TOOLBAR - STATUS),
@@ -240,6 +256,28 @@ impl Browser {
         let session = att["sessionId"].as_str().ok_or("no session")?.to_string();
         let s = Some(session.as_str());
         cdp.call("Page.enable", json!({}), s, 30)?;
+        // The engine is the headless build of Chromium and says "HeadlessChrome", which
+        // some sites (YouTube's player) refuse to serve. Nova Browser is an interactive
+        // browser, so identify as the plain Chromium it is.
+        let version = cdp.call("Browser.getVersion", json!({}), None, 30)?;
+        let ua = version["userAgent"].as_str().unwrap_or("").replace("HeadlessChrome/", "Chrome/");
+        let full = version["product"].as_str().and_then(|p| p.split('/').nth(1)).unwrap_or("0").to_string();
+        let major = full.split('.').next().unwrap_or("0").to_string();
+        cdp.call(
+            "Emulation.setUserAgentOverride",
+            json!({
+                "userAgent": ua,
+                "userAgentMetadata": {
+                    "brands": [{"brand": "Chromium", "version": major}, {"brand": "Not=A?Brand", "version": "24"}],
+                    "fullVersionList": [{"brand": "Chromium", "version": full}, {"brand": "Not=A?Brand", "version": "24.0.0.0"}],
+                    "platform": "Linux", "platformVersion": "", "architecture": "x86", "bitness": "64", "model": "", "mobile": false,
+                },
+            }),
+            s,
+            30,
+        )?;
+        // Network events: failed requests are logged (with Chromium's reason) for diagnosis.
+        cdp.call("Network.enable", json!({"maxTotalBufferSize": 0, "maxResourceBufferSize": 0}), s, 30)?;
         cdp.call("Fetch.enable", json!({"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}), s, 30)?;
         cdp.call("Emulation.setDeviceMetricsOverride", json!({"width": w, "height": h, "deviceScaleFactor": 1, "mobile": false}), s, 30)?;
         cdp.call("Page.startScreencast", json!({"format": "png", "everyNthFrame": 1}), s, 30)?;
@@ -300,6 +338,32 @@ impl Browser {
                         self.upgraded += 1;
                         self.cdp_send("Fetch.continueRequest", json!({"requestId": id, "url": new}));
                     }
+                }
+            }
+            "Network.requestWillBeSent" => {
+                let id = params["requestId"].as_str().unwrap_or("").to_string();
+                let url = params["request"]["url"].as_str().unwrap_or("");
+                if self.requests.len() > 512 {
+                    self.requests.remove(0);
+                }
+                self.requests.push((id, url.chars().take(160).collect()));
+            }
+            "Network.responseReceived" if log_loads() => {
+                // Diagnostics (kernel option nova.browser_log): every host that served a
+                // request, so filter-list gaps show up (a tracker host listed here got through).
+                let host = crate::shields::host_of(params["response"]["url"].as_str().unwrap_or("")).to_string();
+                if !host.is_empty() && !self.loaded_hosts.contains(&host) {
+                    crate::log::info(&format!("browser: loaded from {host}"));
+                    self.loaded_hosts.push(host);
+                }
+            }
+            "Network.loadingFailed" => {
+                let id = params["requestId"].as_str().unwrap_or("");
+                let url = self.requests.iter().find(|(r, _)| r == id).map_or("?", |(_, u)| u.as_str());
+                let why = params["errorText"].as_str().unwrap_or("");
+                let blocked = params["blockedReason"].as_str().or(params["corsErrorStatus"]["corsError"].as_str()).unwrap_or("");
+                if !params["canceled"].as_bool().unwrap_or(false) {
+                    crate::log::warn(&format!("browser: {url}: {why} {blocked}"));
                 }
             }
             "Page.screencastFrame" => {
@@ -460,8 +524,28 @@ impl Browser {
                     }
                 }
             }
+            if log_loads() && pit::ticks() > self.probe_at {
+                self.probe_page_text();
+            }
             if self.dirty {
                 self.render();
+            }
+        }
+    }
+
+    /// Diagnostics (nova.browser_log): log the page's visible text when it changes, every
+    /// 10 seconds, so test pages' results (adblock-tester.com's score) can be read from
+    /// the serial log.
+    fn probe_page_text(&mut self) {
+        self.probe_at = pit::ticks() + 10 * pit::HZ;
+        let session = self.session.clone();
+        let Some(c) = &mut self.cdp else { return };
+        let expr = "document.body ? document.body.innerText.replace(/\\s+/g, ' ').slice(0, 6000) : ''";
+        if let Ok(r) = c.call("Runtime.evaluate", json!({"expression": expr, "returnByValue": true}), Some(&session), 5) {
+            let text = r["result"]["value"].as_str().unwrap_or("").to_string();
+            if text != self.probe_text {
+                crate::log::info(&format!("browser: page text: {text}"));
+                self.probe_text = text;
             }
         }
     }

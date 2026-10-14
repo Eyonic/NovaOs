@@ -427,12 +427,14 @@ pub fn tcp_send(h: SocketHandle, data: &[u8]) -> Result<usize, SockErr> {
     .map_err(|_| SockErr::NoNetwork)?
 }
 
-pub fn tcp_recv(h: SocketHandle, buf: &mut [u8]) -> Result<usize, SockErr> {
+/// Receive TCP data. With `peek` the data stays queued (MSG_PEEK: Chromium peeks one
+/// byte to check that an idle connection is still alive; consuming it corrupts TLS).
+pub fn tcp_recv(h: SocketHandle, buf: &mut [u8], peek: bool) -> Result<usize, SockErr> {
     with_stack(|s| {
         s.poll();
         let t = s.sockets.get_mut::<tcp::Socket>(h);
         if t.can_recv() {
-            t.recv_slice(buf).map_err(|_| SockErr::Closed)
+            if peek { t.peek_slice(buf) } else { t.recv_slice(buf) }.map_err(|_| SockErr::Closed)
         } else if !t.may_recv() && t.state() != tcp::State::SynSent {
             Ok(0)
         } else {
@@ -460,11 +462,20 @@ pub fn udp_send(h: SocketHandle, data: &[u8], ip: Ipv4Address, port: u16) -> Res
     .map_err(|_| SockErr::NoNetwork)?
 }
 
-pub fn udp_recv(h: SocketHandle, buf: &mut [u8]) -> Result<(usize, Ipv4Address, u16), SockErr> {
+pub fn udp_recv(h: SocketHandle, buf: &mut [u8], peek: bool) -> Result<(usize, Ipv4Address, u16), SockErr> {
     with_stack(|s| {
         s.poll();
         let u = s.sockets.get_mut::<smoltcp::socket::udp::Socket>(h);
-        match u.recv_slice(buf) {
+        let r = if peek {
+            u.peek().map(|(data, meta)| {
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                (n, *meta)
+            })
+        } else {
+            u.recv_slice(buf)
+        };
+        match r {
             Ok((n, meta)) => match meta.endpoint.addr {
                 IpAddress::Ipv4(a) => Ok((n, a, meta.endpoint.port)),
                 #[allow(unreachable_patterns)]

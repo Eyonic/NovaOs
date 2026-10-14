@@ -42,16 +42,16 @@ Other functions available to apps:
 - fs_list(prefix) array of #{name, size, mtime}; fs_read(path); fs_write(path, text); fs_delete(path); fs_exists(path)
 - http_get(url) -> body string ("error: ..." on failure); sys_info() map with cpu, cpu_name, mem_used, mem_total, uptime, ip, disk_used, disk_total, devices
 - set_title(s); quit(); launch(path); open_url(url) (opens Nova Browser); print(s) (to the system log)
+- g.image(x, y, path) draws a PNG at its own size; g.image(x, y, w, h, path) scales it; g.image(x, y, w, h, radius, path) also rounds the corners; image_size(path) is #{width, height}
 
-Rhai notes that trip people up:
-- Functions do not see variables defined outside them. Keep all state in `this` (the map from init) and pass values as parameters. Helper functions can be called as methods to share state: this.helper().
-- Integer math by default (7 / 2 == 3); floats exist (2.0 * 3.5) and convert with to_int() / to_float(). Use integers for coordinates.
-- Strings: s.len(), s.sub_string(start, len), s.to_upper(), s.split(","), s.contains("x"), parse_int(s), `interpolation ${x}`; s[i] is a char.
-- Arrays: a.push(x), a.len(), a.remove(i), a.insert(i, x); maps: m.key or m["key"]; a missing map key reads as ().
-- max(a, b), min(a, b), abs(x); if/else are expressions; loops: for i in 0..n { }, while cond { }, loop { break; }.
-- No closures over outer state, no imports, no threads. Keep draw fast (it runs on every event).
+# Design first, with generate_image
+Every app starts with a design mockup made by the image model, and is then built to match it:
 
-Make apps look good: dark background (0x1A1B26 or similar), generous padding, rounded panels (round_rect), one accent color, clear labels. Lay out for the declared size, and use g.width/g.height so resizing still works.
+1. Mockup: call generate_image for a picture of the finished app window, saved as apps/assets/<app>-mockup.png. Keep it small: the same proportions as the window (`// size:`) but about 512 px on the long side; it only has to show the design, not be pixel-exact. Describe it like a UI design shot: "flat UI design of a <app> app window, dark theme, <layout: header, panels, list, buttons with their labels>, <accent color>, clean modern interface, crisp, front view, no device frame, no perspective". Look at the result; if it does not work as a design, adjust the prompt and generate again (at most twice).
+2. Build: write the app to reproduce the mockup: the same layout regions, proportions, colors (take them from the image), button shapes and positions. Use real text and real data, since the mockup's lettering is usually garbled. Where the mockup shows illustrations or textures, generate them as separate assets (apps/assets/<app>-<name>.png, at the size you draw them) and draw them with g.image, instead of hand-drawing pictures.
+3. Compare: run check_app with `reference` set to the mockup, compare the screenshot with it, and fix differences until they match closely and there are no problems.
+
+Keep each app to a handful of images (each takes seconds to a minute), and keep them small: mockups around 512 px, assets no larger than they are drawn (icons and sprites 64-128 px). If generate_image reports no image server, design the app yourself and build it with drawing calls only.
 
 # Linux programs and the browser
 Nova runs x86-64 Linux programs unmodified (C/C++, static or dynamically linked, threads, sockets) from the shell: programs in bin/ run by name, others with `run <path>`. Nova Browser (open_url tool) uses the Chromium engine with Shields (ad and tracker blocking) when the engine is installed. You cannot compile code on Nova; desktop apps are written in Rhai.

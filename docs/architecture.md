@@ -289,11 +289,30 @@ shutdown`, plus any program in `bin/`.
 
 `wm.rs` runs in its own task. It owns the screen once started (the console stops drawing), reads
 keyboard and mouse, routes keys to the focused window and pointer events to the window under the
-pointer, and recomposes the scene when something changed (at most every 2 ticks): gradient
-wallpaper, desktop icons (built-ins plus every app on disk), windows bottom to top with shadow,
-title bar, minimise/close buttons and a resize grip, the taskbar (start button, one button per
-window in opening order, network/CPU/memory/clock) and the start menu. The scene is copied to the
+pointer, and recomposes the scene when something changed (at most every 2 ticks): Nova Home,
+windows bottom to top with shadow,
+title bar, minimise/close buttons and a resize grip. There is no taskbar or start menu. The
+Windows (Super) key, scancode E0 5B/5C, minimizes every window to show Home. Open windows are
+cards in Home's Continue row; right-clicking a card opens a menu with Open and Stop running.
+Network, CPU, memory and the clock are in Home's header. The scene is copied to the
 framebuffer; the pointer is drawn on top and moved without recomposing.
+
+Nova Home (`home.rs`) is the launcher behind the windows. A hero banner shows the selected item
+full width: its artwork, title, description, an Open button and, for apps and windows, a live
+preview. Below it are rows of poster cards:
+
+- Continue: the open windows, as live thumbnails drawn by `wm::draw_window_thumb`.
+- Create with AI: the assistant, and idea cards that open it with a first request.
+- Your apps
+- Apps
+- Web: sites opened in Nova Browser.
+- System: restart and shut down.
+
+Hovering a card selects it and enlarges it. After 0.6 s, an app card plays a live preview: a
+background task runs the app headlessly (`apps::snapshot`) about once a second. Keys browse Home
+when no window has the focus. Posters come from `usr/share/nova/home/*.png` (generated artwork
+from `assets/home/`, copied in by `build.sh`). Items without artwork get a procedural poster.
+Posters and the hero are rendered once per item and cached.
 
 Window content is a `gfx::Canvas` handed over by the app (`wm::present`) or a terminal grid.
 Apps receive `wm::Event`s (keys, mouse down/up/move, wheel, resize, close).
@@ -303,7 +322,8 @@ Apps receive `wm::Event`s (keys, mouse down/up/move, wheel, resize, close).
 Apps are Rhai scripts (`apps.rs`), each in its own task and window. Header comments give title,
 icon, colour and size; callbacks (`init`, `draw(g)`, `click`, `key`, `tick`, ...) run with `this`
 bound to the app state. The graphics object offers rectangles, rounded rectangles, lines,
-circles, text (1x/2x/scaled), buttons and progress bars; other builtins give time, random
+circles, text (1x/2x/scaled), buttons, progress bars and PNG images (`g.image`, decoded once
+and cached until the filesystem changes); other builtins give time, random
 numbers, files, HTTP, system information and launching. The Rhai engine yields to other tasks
 every 20,000 operations and stops runaway scripts (50 million operations per callback). Errors
 are shown in the window. The bundled Files, Text Editor, System Monitor and Settings apps are
@@ -327,7 +347,17 @@ Sign-in: `scripts/run.sh` passes the host's Anthropic CLI login (`ant auth print
 through the legacy I/O ports 0x510/0x511; `claude::sign_in` checks it with `GET /v1/models` and
 then uses it from memory only (OAuth tokens as `Authorization: Bearer` with the `oauth-2025-04-20`
 beta, added to any other betas). Without one, or if the API rejects it, `/login` asks for an API
-key, which is stored in `system/claude.json`. Tools: read,
+key, which is stored in `system/claude.json`.
+
+Image generation (`imagegen.rs`) uses a ComfyUI server's HTTP API. The address comes from the
+fw_cfg file `opt/nova/comfyui-url` (set by `run.sh` from `NOVA_COMFYUI_URL` or
+`~/.config/nova/comfyui-url`) or from `nova.comfyui=`. Nova posts a Z-Image Turbo workflow to
+`/prompt`, polls `/history/<id>` for up to 5 minutes (the server may be warming up) and
+downloads the PNG from `/view`. The assistant's `generate_image` tool saves the PNG and attaches
+it to the tool result, so the model sees what it got. The system prompt has the assistant design
+each app first: a small (~512 px) mockup of the window, then the app built to match it, with
+generated assets for its pictures. `check_app` takes an optional `reference` image (the mockup)
+and returns it next to the screenshot. Tools: read,
 write, edit, list and delete files; run shell commands (commands that change things and file
 deletions ask the user first, `/permissions` toggles that); `check_app` (screenshot attached as
 an image); `launch_app`; `http_get`; `system_info`; `pci_config`; and the server-side web search

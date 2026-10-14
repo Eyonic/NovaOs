@@ -13,6 +13,8 @@
 #   Anthropic: a fresh short-lived token from the Anthropic CLI (`ant auth login`),
 #              $ANTHROPIC_AUTH_TOKEN, $ANTHROPIC_API_KEY
 # NOVA_AI=anthropic checks the Anthropic sources first.
+# Image generation for the assistant: a ComfyUI server from $NOVA_COMFYUI_URL or the file
+# ~/.config/nova/comfyui-url (kept out of the repository), passed in the same way.
 # The serial console is always in this terminal (quit QEMU with Ctrl-A then X).
 # Only files under build/ are used as disks; nothing touches your real disks.
 source "$(dirname "$0")/common.sh"
@@ -57,8 +59,10 @@ anthropic_credential() {
         return 1
     fi
 }
-cred_file=""
-trap '[[ -n "$cred_file" ]] && rm -f "$cred_file"' EXIT
+COMFYUI_URL="${NOVA_COMFYUI_URL:-}"
+[[ -z "$COMFYUI_URL" && -r "${XDG_CONFIG_HOME:-$HOME/.config}/nova/comfyui-url" ]] && COMFYUI_URL=$(head -n1 "${XDG_CONFIG_HOME:-$HOME/.config}/nova/comfyui-url" | tr -d '[:space:]')
+cred_file="" comfy_file=""
+trap 'rm -f ${cred_file:+"$cred_file"} ${comfy_file:+"$comfy_file"}' EXIT
 fw_cfg=()
 refresh_login() {
     fw_cfg=()
@@ -69,6 +73,12 @@ refresh_login() {
         fw_cfg=(-fw_cfg "name=opt/nova/claude-credential,file=$cred_file")
     else
         log "Assistant: no host login found (set DEEPSEEK_API_KEY or run \`ant auth login\` to skip typing a key)"
+    fi
+    if [[ -n "$COMFYUI_URL" ]]; then
+        [[ -n "$comfy_file" ]] || comfy_file=$(umask 077; mktemp "$BUILD/.comfyui-url.XXXXXX")
+        printf '%s\n' "$COMFYUI_URL" >"$comfy_file"
+        fw_cfg+=(-fw_cfg "name=opt/nova/comfyui-url,file=$comfy_file")
+        log "Assistant: image generation via your ComfyUI server"
     fi
 }
 

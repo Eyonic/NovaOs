@@ -7,9 +7,9 @@ drivers (the assistant drafts ports for anything without a driver), offers to in
 disk, and then drops you into a desktop. On the desktop, the assistant is the app creator: ask
 for an app and it writes, checks and opens it.
 
-![Nova Assistant built a Pomodoro timer on request and opened it on the desktop](docs/screenshots/assistant-app.png)
+![Nova Home: a hero banner and rows of poster cards with generated artwork](docs/screenshots/home.png)
 
-![Nova Browser (Chromium engine with Shields) and a System Monitor app written by the assistant](docs/screenshots/desktop-browser.png)
+![Nova Browser (Chromium engine with Shields) showing DuckDuckGo](docs/screenshots/browser.png)
 
 **Milestone 0.4.** Everything runs in QEMU. Nothing here writes to your real disks, ESP or host
 bootloader; the "disks" are files under `build/`.
@@ -24,9 +24,9 @@ bootloader; the "disks" are files under `build/`.
 | Drivers | Intel e1000 Ethernet, AHCI SATA, PS/2 keyboard and mouse (absolute pointer via vmmouse), serial, framebuffer, RTC |
 | Internet | DHCP, DNS, TCP (smoltcp); HTTPS with certificate verification (rustls + RustCrypto + Mozilla roots) |
 | Storage | GPT, NovaFS (Nova's filesystem), installer that copies Nova onto a second disk |
-| Desktop | windows, taskbar, start menu, desktop icons, mouse and keyboard; Terminal, Files, Text Editor, System Monitor, Settings |
+| Desktop | Nova Home: a full-screen launcher with a hero banner and rows of poster cards (open windows with live thumbnails, AI app ideas, your apps, apps, web favourites, system), live previews on hover, mouse/wheel/arrow-key navigation; no taskbar: the Windows key always brings back Home, right-click a running window's poster to stop it; Terminal, Files, Text Editor, System Monitor, Settings |
 | Assistant | Nova Assistant on DeepSeek (or Claude Code on Anthropic); sign-in from the host's key or Anthropic CLI login, streaming agent loop with tools (files, shell, HTTP, hardware, web search), app creation with screenshot checks |
-| Apps | Rhai scripts with a drawing API; Claude writes them, they appear on the desktop |
+| Apps | Rhai scripts with a drawing API (including PNG images); the assistant designs them with a generated mockup, builds them with generated artwork, and they appear on Home |
 | Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory |
 | Browser | Nova Browser: the Chromium engine (rendering, JavaScript, TLS) driven by a Rust shell with Shields (ad/tracker blocking, HTTPS upgrades, tracking-parameter removal) |
 
@@ -35,6 +35,7 @@ bootloader; the "disks" are files under `build/`.
 ```sh
 scripts/check-prereqs.sh   # see docs/setup.md
 scripts/fetch-chromium.sh  # optional: the browser engine (about 100 MB download)
+scripts/fetch-filters.sh   # optional: EasyList + EasyPrivacy for Shields (recommended)
 scripts/build.sh           # kernel, user programs, build/nova.img
 scripts/run.sh             # boot like a real machine: installer image + empty 2 GiB disk
 ```
@@ -51,7 +52,9 @@ First boot:
    for the next kernel build).
 4. Nova offers to install itself on the 2 GiB disk (`build/disk.img`). After installing it
    restarts, and `scripts/run.sh` boots the installed disk from then on.
-5. The desktop opens with the assistant. Ask it for an app, for example "make me a pomodoro timer".
+5. Nova Home opens, with the assistant in a window. The Windows key (or a window's yellow
+   minimize button) brings you back to Home, where open windows wait in the Continue row.
+   Ask the assistant for an app, for example "make me a pomodoro timer".
 
 The serial console is in the terminal that runs `run.sh`; the Claude Code window mirrors it, so
 you can also type there (and paste your API key). Quit QEMU with `Ctrl-A` then `X`.
@@ -84,7 +87,9 @@ console.
 With the engine downloaded (`scripts/fetch-chromium.sh`), the desktop has a **Browser** icon
 (and the shell a `browser [url]` command). Type a URL or a search in the address bar; click,
 scroll and type in pages. The orange shield shows how many ads and trackers Shields blocked on
-the page; click it for the list and to turn Shields down for a site. Add EasyList with
+the page; click it for the list and to turn Shields down for a site. With the bundled
+EasyList and EasyPrivacy (`scripts/fetch-filters.sh`; both GPLv3 / CC BY-SA, downloaded at
+build time and not kept in this repository), Shields scores 97/100 on adblock-tester.com. Add EasyList with
 `download https://easylist.to/easylist/easylist.txt system/shields/easylist.txt` in the Terminal.
 The engine is Chrome for Testing's headless shell; Nova's browser UI and Shields are written in
 Rust (see [docs/architecture.md](docs/architecture.md#nova-browser-and-shields-04)).
@@ -101,13 +106,15 @@ Rust (see [docs/architecture.md](docs/architecture.md#nova-browser-and-shields-0
 | Download the browser engine | `scripts/fetch-chromium.sh` |
 | Clean generated artifacts | `scripts/clean.sh` |
 
-`scripts/test.sh --all` boots QEMU headless for each of 20 cases and checks the serial output:
+`scripts/test.sh --all` boots QEMU headless for each of 21 cases and checks the serial output:
 boot, panic and 7 CPU-exception cases; shell and PS/2 keyboard input; native C/C++ programs
 (static, dynamic, threaded); Linux sockets (`net`); the Chromium engine rendering a page
 (`chromium`); Nova Browser opened by Claude with Shields blocking a tracker (`browser`; both
 skipped without the engine); and the full first-boot flow (`setup`: login, driver porting, installation) followed by the installed
 system building an app with Claude (`installed`), first boot signed in with a host login
-token (`hostlogin`), and the same flow on DeepSeek (`deepseek`). The Claude cases use `scripts/mock_anthropic.py`,
+token (`hostlogin`), the same flow on DeepSeek, including image
+generation against a ComfyUI stand-in (`deepseek`), and a program using up all memory being
+stopped while the system keeps running (`oom`). The Claude cases use `scripts/mock_anthropic.py`,
 a local stand-in for the Messages API that also checks Nova's requests follow the API rules.
 Logs go to `build/logs/test-<timestamp>/`.
 
@@ -116,7 +123,7 @@ Environment overrides: `LIMINE_EFI`, `OVMF_CODE`, `OVMF_VARS_TEMPLATE` (file loc
 (kernel command line baked into `build/nova.img`), `CC`/`CXX` (compilers for `userland/`).
 
 Kernel command line options: `nova.mode=shell` (text shell instead of setup/desktop),
-`nova.install=no` (don't offer installation), `nova.deepseek_api=<url>` (DeepSeek-mode endpoint), `nova.claude_api=<url>` (another API endpoint),
+`nova.install=no` (don't offer installation), `nova.deepseek_api=<url>` (DeepSeek-mode endpoint), `nova.comfyui=<url>` (image server), `nova.claude_api=<url>` (another API endpoint),
 `nova.test=<case>` (self-tests).
 
 ## Repository layout
@@ -131,6 +138,17 @@ Kernel command line options: `nova.mode=shell` (text shell instead of setup/desk
 | `scripts/` | build, image, run and test scripts; `fetch-chromium.sh`; `mkpak.py` (system-file pack); the mock Claude API and a QMP input helper |
 | `docs/` | [setup.md](docs/setup.md) (prerequisites), [architecture.md](docs/architecture.md) |
 | `build/` | generated: images, disks, logs (git-ignored) |
+
+## Generated artwork
+
+With a ComfyUI server configured, the assistant designs every app with an image model first.
+It generates a small mockup of the app window (layout, buttons, colours) and builds the app to
+match it. It generates the illustrations and sprites the app draws with `g.image`. Then it
+compares `check_app` screenshots against the mockup. Put the server's address in
+`NOVA_COMFYUI_URL` or `~/.config/nova/comfyui-url` (outside the repository); `run.sh` passes it
+in. The workflow is Z-Image Turbo (8 steps); the server needs `z_image_turbo_bf16.safetensors`,
+`qwen_3_4b.safetensors` and `ae.safetensors`. Without a server, apps are built from drawing
+calls only. Home's own posters and wallpaper (`assets/home/`) were made the same way.
 
 ## About the assistant
 

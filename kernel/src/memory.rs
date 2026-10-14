@@ -2,9 +2,11 @@
 //!
 //! * Limine maps all usable RAM at `HHDM offset + physical address` (the higher-half
 //!   direct map). Nova keeps Limine's page tables and adds to them.
-//! * The heap is the largest usable RAM region, accessed through the direct map. It is
-//!   physically contiguous, so `virt_to_phys` of any heap address is a plain
-//!   subtraction and heap allocations can be handed to DMA-capable devices.
+//! * The heap is every usable RAM region (on QEMU with more than ~2 GiB that is RAM below
+//!   the PCI hole plus RAM above 4 GiB), accessed through the direct map. Each region is
+//!   physically contiguous and an allocation never spans two, so `virt_to_phys` of any
+//!   heap address is a plain subtraction and allocations can be handed to DMA-capable
+//!   devices (Nova's drivers all take 64-bit addresses).
 //! * Device registers (PCI BARs, ...) are not in the direct map under Limine base
 //!   revision 3, so [`map_mmio`] maps them uncached into a separate window.
 
@@ -24,6 +26,12 @@ static ALLOCATOR: Talck<spin::Mutex<()>, ClaimOnOom> = Talc::new(unsafe { ClaimO
 
 static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
+static HEAP_REGIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Number of RAM regions the heap spans.
+pub fn heap_regions() -> usize {
+    HEAP_REGIONS.load(Ordering::Relaxed)
+}
 
 /// Start of the MMIO window: PML4 slot 448, far above the direct map.
 const MMIO_BASE: u64 = 0xFFFF_E000_0000_0000;
@@ -47,11 +55,15 @@ pub fn heap_size() -> usize {
     HEAP_SIZE.load(Ordering::Relaxed)
 }
 
-/// (used, free) heap bytes.
+/// (used, free) heap bytes; free pages in the page pool count as free.
 pub fn heap_usage() -> (usize, usize) {
-    let talc = ALLOCATOR.lock();
-    let counters = talc.get_counters();
-    (counters.allocated_bytes, counters.available_bytes)
+    let (allocated, available) = {
+        let talc = ALLOCATOR.lock();
+        let counters = talc.get_counters();
+        (counters.allocated_bytes, counters.available_bytes)
+    };
+    let pooled = POOL_FREE_BYTES.load(Ordering::Relaxed);
+    (allocated.saturating_sub(pooled), available + pooled)
 }
 
 /// Set up the direct map offset and the heap. Must run before anything allocates.
@@ -60,18 +72,28 @@ pub fn init() -> Result<(u64, usize), &'static str> {
     HHDM_OFFSET.store(offset, Ordering::Relaxed);
     KERNEL_CR3.store(read_cr3(), Ordering::Relaxed);
 
-    let region = limine::MEMMAP
+    let largest = limine::MEMMAP
         .entries()
         .filter(|e| e.kind == limine::MEMMAP_USABLE)
         .max_by_key(|e| e.length)
         .ok_or("no usable memory")?;
-    let start = (offset + region.base) as *mut u8;
-    // SAFETY: the region is usable RAM per the memory map, mapped by the direct map,
-    // and nothing else uses it; it is claimed exactly once.
-    unsafe {
-        ALLOCATOR.lock().claim(Span::from_base_size(start, region.length as usize)).map_err(|_| "heap claim failed")?;
+    let mut total = 0usize;
+    // Regions under 1 MiB are not worth the allocator's bookkeeping.
+    for region in limine::MEMMAP.entries().filter(|e| e.kind == limine::MEMMAP_USABLE && e.length >= 1 << 20) {
+        let start = (offset + region.base) as *mut u8;
+        // SAFETY: the region is usable RAM per the memory map, mapped by the direct map,
+        // and nothing else uses it; each region is claimed exactly once.
+        let claimed = unsafe { ALLOCATOR.lock().claim(Span::from_base_size(start, region.length as usize)) };
+        if claimed.is_ok() {
+            total += region.length as usize;
+            HEAP_REGIONS.fetch_add(1, Ordering::Relaxed);
+        }
     }
-    HEAP_SIZE.store(region.length as usize, Ordering::Relaxed);
+    if total == 0 {
+        return Err("heap claim failed");
+    }
+    HEAP_SIZE.store(total, Ordering::Relaxed);
+    let region = largest;
     // Create the MMIO window's top-level entry now, so address spaces that copy the
     // kernel's upper half (processes) see MMIO mappings made later.
     let entry = (phys_to_virt(read_cr3()) as *mut u64).wrapping_add(((MMIO_BASE >> 39) & 511) as usize);
@@ -106,11 +128,84 @@ const CACHE_DISABLE: u64 = 1 << 4;
 const HUGE: u64 = 1 << 7;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 
-/// One zeroed, page-aligned page from the heap, returned as a physical address.
+// ---------------------------------------------------------------------------
+// Page pool: 4 KiB pages for program memory, shared memory and page tables.
+//
+// The heap allocator keeps a small header next to each allocation, so page-aligned
+// single pages from it waste nearly a page each (programs could use only about half of
+// RAM). The pool takes 2 MiB blocks from the heap and hands out their pages; freed pages
+// go on an intrusive free list (the first 8 bytes of a free page point to the next).
+
+const POOL_BLOCK: usize = 2 << 20;
+/// Head of the free list (a kernel virtual address, 0 = empty).
+static POOL_FREE: SpinLock<usize> = SpinLock::new(0);
+/// Bytes on the free list (counted as free in `heap_usage`).
+static POOL_FREE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// One zeroed 4 KiB page (kernel virtual address), or None when memory is exhausted.
+pub fn alloc_page() -> Option<*mut u8> {
+    let page = {
+        let mut head = POOL_FREE.lock();
+        if *head == 0 {
+            refill(&mut head);
+        }
+        let p = *head;
+        if p != 0 {
+            // SAFETY: pages on the free list are ours; the first word links to the next.
+            *head = unsafe { (p as *const usize).read() };
+            POOL_FREE_BYTES.fetch_sub(PAGE_SIZE as usize, Ordering::Relaxed);
+        }
+        p
+    };
+    if page == 0 {
+        return None;
+    }
+    // SAFETY: the page is exclusively ours now.
+    unsafe { core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE as usize) };
+    Some(page as *mut u8)
+}
+
+/// Give back a page from [`alloc_page`].
+///
+/// # Safety
+/// `page` came from `alloc_page`, is not freed twice, and nothing maps or uses it any more.
+pub unsafe fn free_page(page: *mut u8) {
+    let mut head = POOL_FREE.lock();
+    // SAFETY: per the contract the page is ours to reuse as a list node.
+    unsafe { (page as *mut usize).write(*head) };
+    *head = page as usize;
+    POOL_FREE_BYTES.fetch_add(PAGE_SIZE as usize, Ordering::Relaxed);
+}
+
+/// Move a block of pages from the heap to the (empty) free list: 2 MiB, or smaller
+/// blocks when the heap has no 2 MiB run left.
+fn refill(head: &mut usize) {
+    let mut size = POOL_BLOCK;
+    while size >= PAGE_SIZE as usize {
+        let layout = Layout::from_size_align(size, PAGE_SIZE as usize).unwrap();
+        // SAFETY: non-zero size, valid alignment. Pool blocks are never returned to the heap.
+        let block = unsafe { alloc::alloc::alloc(layout) };
+        if !block.is_null() {
+            for i in (0..size).step_by(PAGE_SIZE as usize).rev() {
+                let page = block as usize + i;
+                // SAFETY: inside the block we just allocated.
+                unsafe { (page as *mut usize).write(*head) };
+                *head = page;
+            }
+            POOL_FREE_BYTES.fetch_add(size, Ordering::Relaxed);
+            return;
+        }
+        size /= 8;
+    }
+}
+
+/// One zeroed page from the page pool, returned as a physical address.
 pub fn new_table() -> u64 {
-    // SAFETY: non-zero size, valid alignment.
-    let page = unsafe { alloc_zeroed(Layout::from_size_align(4096, 4096).unwrap()) };
-    assert!(!page.is_null(), "out of memory for page tables");
+    let page = alloc_page().unwrap_or(core::ptr::null_mut());
+    if page.is_null() {
+        let (used, free) = heap_usage();
+        panic!("out of memory for page tables ({} MiB used, {} MiB free)", used >> 20, free >> 20);
+    }
     virt_to_phys(page as u64)
 }
 

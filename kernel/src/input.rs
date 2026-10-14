@@ -20,6 +20,8 @@ pub enum Key {
     Down,
     Left,
     Right,
+    /// The Windows (Super) key: always brings back Home.
+    Super,
 }
 
 const RING_SIZE: usize = 256; // power of two

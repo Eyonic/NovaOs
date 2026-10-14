@@ -16,7 +16,9 @@ mod fs;
 mod fwcfg;
 mod gdt;
 mod gfx;
+mod home;
 mod http;
+mod imagegen;
 mod input;
 mod install;
 mod ipc;
@@ -84,7 +86,13 @@ extern "C" fn kmain() -> ! {
         Err(why) => println!("[nova] console: serial only ({why})"),
     }
     match memory {
-        Ok((base, size)) => println!("[nova] memory: heap {} MiB at physical {base:#x}, direct map at {:#x}", size >> 20, memory::hhdm_offset()),
+        Ok((base, size)) => println!(
+            "[nova] memory: heap {} MiB in {} regions (largest {} MiB at physical {base:#x}), direct map at {:#x}",
+            memory::heap_size() >> 20,
+            memory::heap_regions(),
+            size >> 20,
+            memory::hhdm_offset()
+        ),
         Err(why) => panic!("memory init failed: {why}"),
     }
     rand::init();

@@ -132,6 +132,26 @@ impl Canvas {
         }
     }
 
+    /// Outline of a rounded rectangle, 2 px wide.
+    pub fn stroke_round_rect(&mut self, r: Rect, radius: i32, color: u32) {
+        for (dx, dy) in [(0, 0), (1, 1)] {
+            let o = Rect::new(r.x + dx, r.y + dy, r.w - 2 * dx, r.h - 2 * dy);
+            let rad = (radius - dx).max(0);
+            self.fill_rect(Rect::new(o.x + rad, o.y, o.w - 2 * rad, 1), color);
+            self.fill_rect(Rect::new(o.x + rad, o.y + o.h - 1, o.w - 2 * rad, 1), color);
+            self.fill_rect(Rect::new(o.x, o.y + rad, 1, o.h - 2 * rad), color);
+            self.fill_rect(Rect::new(o.x + o.w - 1, o.y + rad, 1, o.h - 2 * rad), color);
+            // Corner arcs.
+            for i in 0..=rad {
+                let j = isqrt(rad * rad - i * i);
+                for (cx, cy, sx, sy) in [(o.x + rad, o.y + rad, -1, -1), (o.x + o.w - 1 - rad, o.y + rad, 1, -1), (o.x + rad, o.y + o.h - 1 - rad, -1, 1), (o.x + o.w - 1 - rad, o.y + o.h - 1 - rad, 1, 1)] {
+                    self.set(cx + sx * i, cy + sy * j, color);
+                    self.set(cx + sx * j, cy + sy * i, color);
+                }
+            }
+        }
+    }
+
     pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
         let (dx, dy) = ((x1 - x0).abs(), -(y1 - y0).abs());
         let (sx, sy) = (if x0 < x1 { 1 } else { -1 }, if y0 < y1 { 1 } else { -1 });
@@ -234,6 +254,43 @@ impl Canvas {
             let s0 = (oy + row) as usize * src.width + ox as usize;
             let d0 = (d.y + row) as usize * self.width + d.x as usize;
             self.pixels[d0..d0 + d.w as usize].copy_from_slice(&src.pixels[s0..s0 + d.w as usize]);
+        }
+    }
+
+    /// Draw `src` scaled into `dst`: averaged 2x2 samples when shrinking, nearest pixel
+    /// when enlarging. `radius` > 0 rounds the corners; `alpha` (0..=255) fades it in.
+    pub fn blit_scaled(&mut self, src: &Canvas, dst: Rect, radius: i32, alpha: u32) {
+        if dst.w <= 0 || dst.h <= 0 || src.width == 0 || src.height == 0 {
+            return;
+        }
+        let Some(vis) = dst.intersect(&self.bounds()) else { return };
+        let (sw, sh) = (src.width as i64, src.height as i64);
+        let shrink = src.width as i32 > dst.w;
+        for y in vis.y..vis.y + vis.h {
+            let ry = y - dst.y;
+            // Horizontal inset of the rounded corner on this row.
+            let inset = if radius > 0 {
+                let dy = if ry < radius { radius - ry } else if ry >= dst.h - radius { ry - (dst.h - radius - 1) } else { 0 };
+                if dy > 0 { radius - isqrt(radius * radius - dy * dy) } else { 0 }
+            } else {
+                0
+            };
+            let sy0 = (ry as i64 * sh / dst.h as i64) as usize;
+            let sy1 = (((ry as i64 * 2 + 1) * sh / (dst.h as i64 * 2)) as usize).min(src.height - 1);
+            for x in vis.x.max(dst.x + inset)..(vis.x + vis.w).min(dst.x + dst.w - inset) {
+                let rx = (x - dst.x) as i64;
+                let sx0 = (rx * sw / dst.w as i64) as usize;
+                let p = if shrink {
+                    let sx1 = (((rx * 2 + 1) * sw / (dst.w as i64 * 2)) as usize).min(src.width - 1);
+                    let px = [src.pixels[sy0 * src.width + sx0], src.pixels[sy0 * src.width + sx1], src.pixels[sy1 * src.width + sx0], src.pixels[sy1 * src.width + sx1]];
+                    let ch = |s: u32| px.iter().map(|p| (p >> s) & 0xFF).sum::<u32>() / 4;
+                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+                } else {
+                    src.pixels[sy0 * src.width + sx0]
+                };
+                let i = y as usize * self.width + x as usize;
+                self.pixels[i] = if alpha >= 255 { p } else { blend(self.pixels[i], p, alpha) };
+            }
         }
     }
 

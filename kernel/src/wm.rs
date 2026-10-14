@@ -2,7 +2,9 @@
 //!
 //! One task ("desktop") owns the screen. It reads the keyboard and mouse, routes
 //! input to the focused window, and recomposes the scene when something changed:
-//! wallpaper, desktop icons, windows (bottom to top), taskbar, start menu. The
+//! Home (the launcher behind the windows, see home.rs) and the windows (bottom to
+//! top). There is no taskbar: open windows are in Home's Continue row, and minimizing
+//! a window shows Home. The
 //! scene is copied to the framebuffer and the mouse pointer is drawn on top.
 //!
 //! Applications run in their own tasks. A window's content is either a canvas the
@@ -27,7 +29,8 @@ use crate::tty::TtyRef;
 use crate::{apps, fs, net, pit, rtc, task};
 
 pub const TITLE_H: i32 = 30;
-pub const TASKBAR_H: i32 = 44;
+/// No taskbar: Home and full-screen windows use the whole screen.
+pub const TASKBAR_H: i32 = 0;
 const TERM_PAD: i32 = 6;
 
 pub mod theme {
@@ -123,7 +126,7 @@ pub fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
 }
 
-fn request_redraw() {
+pub fn request_redraw() {
     REDRAW.store(true, Ordering::Relaxed);
 }
 
@@ -163,6 +166,19 @@ pub fn open(title: &str, icon: char, accent: u32, w: i32, h: i32, content: Conte
 }
 
 /// Remove a window (its app has finished).
+/// Close a window as its close button does: tell the program, hang up a terminal.
+fn close_window(win: &WindowRef) {
+    {
+        let mut w = win.lock();
+        w.closed = true;
+        w.push(Event::Close);
+        if let Content::Terminal(t) = &w.content {
+            t.lock().hung_up = true;
+        }
+    }
+    close(win);
+}
+
 pub fn close(win: &WindowRef) {
     let id = win.lock().id;
     WINDOWS.lock().retain(|w| w.lock().id != id);
@@ -214,7 +230,7 @@ pub fn set_title(win: &WindowRef, title: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Launchers (desktop icons and start menu)
+// Actions (what Home's cards do)
 
 #[derive(Clone)]
 pub enum Action {
@@ -222,30 +238,16 @@ pub enum Action {
     Claude,
     Browser,
     Script(String),
+    /// Open a web page in Nova Browser.
+    Url(String),
+    /// Bring an open window to the front.
+    Focus(usize),
+    /// Open the assistant with a first request.
+    Ask(String),
+    /// Close an open window (stop the program running in it).
+    Close(usize),
     Reboot,
     Shutdown,
-}
-
-#[derive(Clone)]
-pub struct Launcher {
-    pub name: String,
-    pub icon: char,
-    pub color: u32,
-    pub action: Action,
-}
-
-fn launchers() -> Vec<Launcher> {
-    let mut v = alloc::vec![
-        Launcher { name: crate::claude::app_name().into(), icon: '*', color: 0xD97757, action: Action::Claude },
-        Launcher { name: "Terminal".into(), icon: '>', color: 0x3B4252, action: Action::Terminal },
-    ];
-    if crate::browser::engine_installed() {
-        v.insert(1, Launcher { name: "Browser".into(), icon: '@', color: 0xFB542B, action: Action::Browser });
-    }
-    for app in apps::installed() {
-        v.push(Launcher { name: app.title, icon: app.icon, color: app.color, action: Action::Script(app.path) });
-    }
-    v
 }
 
 pub fn launch(action: &Action) {
@@ -257,6 +259,29 @@ pub fn launch(action: &Action) {
             spawn_terminal(crate::claude::app_name(), '*', 0xD97757, false, |_| crate::claude::run_cli());
         }
         Action::Browser => crate::browser::launch(None),
+        Action::Url(url) => crate::browser::launch(Some(url.clone())),
+        Action::Focus(id) => {
+            if let Some(w) = window_by_id(*id) {
+                w.lock().minimized = false;
+                let mut list = WINDOWS.lock();
+                if let Some(i) = list.iter().position(|w| w.lock().id == *id) {
+                    let w = list.remove(i);
+                    list.push(w);
+                }
+                FOCUS.store(*id, Ordering::Relaxed);
+            }
+            request_redraw();
+        }
+        Action::Close(id) => {
+            if let Some(win) = window_by_id(*id) {
+                close_window(&win);
+            }
+            request_redraw();
+        }
+        Action::Ask(prompt) => {
+            let p = prompt.clone();
+            spawn_terminal(crate::claude::app_name(), '*', 0xD97757, false, move |_| crate::claude::run_cli_with(Some(p)));
+        }
         Action::Script(path) => {
             if let Err(e) = apps::launch(path) {
                 crate::log::warn(&format!("could not start {path}: {e}"));
@@ -290,12 +315,13 @@ pub fn spawn_terminal(title: &str, icon: char, accent: u32, mirror_serial: bool,
 struct Desktop {
     screen: Screen,
     scene: Canvas,
-    wallpaper: Canvas,
+    home: crate::home::Home,
+    /// Open windows as Home last saw them (id, title).
+    home_windows: Vec<(usize, String)>,
     cursor: (i32, i32),
     buttons: (bool, bool),
     drag: Option<Drag>,
-    menu_open: bool,
-    launchers: Vec<Launcher>,
+    /// Filesystem generation Home was built from (apps appear when written).
     launchers_gen: u64,
     status: String,
     last_status_tick: u64,
@@ -341,17 +367,16 @@ pub fn start() -> bool {
     RUNNING.store(true, Ordering::Relaxed);
     crate::console::suspend();
     task::spawn("desktop", move || {
-        let mut wallpaper = Canvas::new(screen.width, screen.height);
-        draw_wallpaper(&mut wallpaper);
+        let mut home = crate::home::Home::new(screen.width as i32, screen.height as i32);
+        home.refresh(&[]);
         let mut d = Desktop {
             screen,
             scene: Canvas::new(screen.width, screen.height),
-            wallpaper,
+            home,
+            home_windows: Vec::new(),
             cursor: (screen.width as i32 / 2, screen.height as i32 / 2),
             buttons: (false, false),
             drag: None,
-            menu_open: false,
-            launchers: launchers(),
             launchers_gen: fs::generation(),
             status: String::new(),
             last_status_tick: 0,
@@ -361,28 +386,6 @@ pub fn start() -> bool {
         d.run();
     });
     true
-}
-
-fn draw_wallpaper(c: &mut Canvas) {
-    let r = c.bounds();
-    c.gradient(r, theme::WALL_TOP, theme::WALL_BOTTOM);
-    // A soft glow and the Nova wordmark in the lower right.
-    let (cx, cy) = (r.w * 3 / 4, r.h * 2 / 5);
-    for i in (0..12).rev() {
-        let rad = 60 + i * 22;
-        let alpha = 6;
-        for dy in -rad..=rad {
-            let half = crate::gfx::isqrt(rad * rad - dy * dy);
-            c.blend_rect(Rect::new(cx - half, cy + dy, 2 * half, 1), theme::ACCENT, alpha);
-        }
-    }
-    let label = "nova";
-    let scale = 6;
-    let tw = label.len() as i32 * FONT_WIDTH as i32 * scale;
-    c.text_scaled(cx - tw / 2 + 3, cy - 48 + 3, label, 0x14152A, scale);
-    c.text_scaled(cx - tw / 2, cy - 48, label, 0xF3F0FF, scale);
-    let sub = "an operating system built with Claude";
-    c.text(cx - (sub.len() as i32 * 8) / 2, cy + 56, sub, 0xB8B0E8);
 }
 
 impl Desktop {
@@ -410,17 +413,26 @@ impl Desktop {
                     changed = true;
                 }
             }
+            // Home: the Continue row follows the open windows; hover previews.
+            let wins: Vec<(usize, String)> = WINDOWS.lock().iter().map(|w| { let w = w.lock(); (w.id, w.title.clone()) }).collect();
+            if wins != self.home_windows {
+                self.home_windows = wins;
+                self.refresh_home();
+                changed = true;
+            }
+            changed |= self.home.tick();
             let now = pit::ticks();
             if now - self.last_status_tick >= pit::HZ {
                 self.last_status_tick = now;
                 let status = status_line();
                 if status != self.status {
+                    self.home.set_status(&status);
                     self.status = status;
                     changed = true;
                 }
                 if fs::generation() != self.launchers_gen {
                     self.launchers_gen = fs::generation();
-                    self.launchers = launchers();
+                    self.refresh_home();
                     changed = true;
                 }
             }
@@ -440,17 +452,39 @@ impl Desktop {
 
     // ----- input -----
 
+    fn refresh_home(&mut self) {
+        let list: Vec<crate::home::OpenWindow> = taskbar_order(&WINDOWS.lock())
+            .iter()
+            .map(|w| {
+                let w = w.lock();
+                crate::home::OpenWindow { id: w.id, title: w.title.clone(), icon: w.icon, accent: w.accent }
+            })
+            .collect();
+        self.home.refresh(&list);
+    }
+
     fn focused(&self) -> Option<WindowRef> {
         let id = FOCUS.load(Ordering::Relaxed);
         WINDOWS.lock().iter().find(|w| w.lock().id == id).cloned()
     }
 
     fn key(&mut self, key: Key) {
-        if key == Key::Char(0x1B) && self.menu_open {
-            self.menu_open = false;
+        // The Windows key always brings back Home: every window steps aside (minimized;
+        // they stay in Home's Continue row).
+        if key == Key::Super {
+            for w in WINDOWS.lock().iter() {
+                w.lock().minimized = true;
+            }
+            FOCUS.store(0, Ordering::Relaxed);
             return;
         }
-        let Some(win) = self.focused() else { return };
+        let Some(win) = self.focused() else {
+            // No window has the focus: the keys browse Home.
+            if let Some(action) = self.home.key(key) {
+                launch(&action);
+            }
+            return;
+        };
         let mut w = win.lock();
         match &w.content {
             Content::Terminal(t) => t.lock().push_key(key),
@@ -536,10 +570,23 @@ impl Desktop {
                 }
             }
         }
-        if r.wheel != 0
-            && let Some(w) = self.window_at(x, y)
-        {
-            w.lock().push(Event::Wheel(r.wheel));
+        let over_window = self.window_at(x, y);
+        if r.wheel != 0 {
+            match &over_window {
+                Some(w) => w.lock().push(Event::Wheel(r.wheel)),
+                None if y < sh - TASKBAR_H => {
+                    self.home.wheel(r.wheel);
+                    changed = true;
+                }
+                None => {}
+            }
+        }
+        if self.drag.is_none() {
+            if over_window.is_none() && y < sh - TASKBAR_H {
+                changed |= self.home.hover(x, y);
+            } else {
+                changed |= self.home.hover(-1, -1);
+            }
         }
         changed
     }
@@ -552,58 +599,15 @@ impl Desktop {
     }
 
     fn press(&mut self, x: i32, y: i32, button: u8) -> bool {
-        let (sw, sh) = (self.screen.width as i32, self.screen.height as i32);
-        // Start menu.
-        if self.menu_open {
-            self.menu_open = false;
-            let items = self.menu_items();
-            let menu = menu_rect(items.len(), sh);
-            if menu.contains(x, y) {
-                let i = ((y - menu.y - 40) / 32) as usize;
-                if let Some(item) = items.get(i) {
-                    launch(&item.action);
-                }
-                return true;
-            }
-            if Rect::new(0, sh - TASKBAR_H, 120, TASKBAR_H).contains(x, y) {
-                return true; // the start button toggles the menu closed
-            }
-        }
-        // Taskbar.
-        if y >= sh - TASKBAR_H {
-            if x < 120 {
-                self.menu_open = !self.menu_open;
-                return true;
-            }
-            let list: Vec<WindowRef> = WINDOWS.lock().clone();
-            for (i, w) in taskbar_order(&list).iter().enumerate() {
-                if taskbar_button(i).contains(x, y) {
-                    let id = w.lock().id;
-                    let focused = FOCUS.load(Ordering::Relaxed) == id && !w.lock().minimized;
-                    if focused {
-                        w.lock().minimized = true;
-                        FOCUS.store(0, Ordering::Relaxed);
-                    } else {
-                        self.raise(id);
-                    }
-                    return true;
-                }
-            }
-            return false;
-        }
+        let sw = self.screen.width as i32;
         // Windows, top to bottom.
         if let Some(win) = self.window_at(x, y) {
             let id = win.lock().id;
             self.raise(id);
             let mut w = win.lock();
             if w.close_button().contains(x, y) {
-                w.closed = true;
-                w.push(Event::Close);
-                if let Content::Terminal(t) = &w.content {
-                    t.lock().hung_up = true;
-                }
                 drop(w);
-                close(&win);
+                close_window(&win);
             } else if w.minimize_button().contains(x, y) {
                 w.minimized = true;
                 FOCUS.store(0, Ordering::Relaxed);
@@ -618,46 +622,22 @@ impl Desktop {
             }
             return true;
         }
-        // Desktop icons.
+        // Home: left click opens, right click shows a card's menu.
         FOCUS.store(0, Ordering::Relaxed);
-        for (i, l) in self.launchers.iter().enumerate() {
-            if icon_rect(i, sh).contains(x, y) {
-                let action = l.action.clone();
-                launch(&action);
-                return true;
-            }
+        let action = if button == 1 { self.home.click(x, y) } else { self.home.right_click(x, y) };
+        if let Some(action) = action {
+            launch(&action);
         }
         let _ = sw;
         true
     }
 
-    fn menu_items(&self) -> Vec<Launcher> {
-        let mut items = self.launchers.clone();
-        items.push(Launcher { name: "Restart".into(), icon: '\u{21bb}', color: 0x4C5470, action: Action::Reboot });
-        items.push(Launcher { name: "Shut down".into(), icon: 'o', color: 0x4C5470, action: Action::Shutdown });
-        items
-    }
-
     // ----- drawing -----
 
     fn compose(&mut self) {
-        let sh = self.screen.height as i32;
-        let sw = self.screen.width as i32;
-        let wall = self.wallpaper.bounds();
-        self.scene.blit(&self.wallpaper, wall, 0, 0);
-
-        for (i, l) in self.launchers.iter().enumerate() {
-            let r = icon_rect(i, sh);
-            let tile = Rect::new(r.x + (r.w - 52) / 2, r.y + 6, 52, 52);
-            self.scene.shadow(tile, 4);
-            self.scene.fill_round_rect(tile, 12, l.color);
-            let g = crate::textgrid::glyph(l.icon);
-            self.scene.glyph(tile.x + 14, tile.y + 2, g, 0xFFFFFF, None, 3);
-            let label_w = l.name.chars().count() as i32 * 8;
-            let lx = r.x + (r.w - label_w.min(r.w)) / 2;
-            self.scene.text_clipped(lx + 1, r.y + 65, &l.name, 0x101018, r.w);
-            self.scene.text_clipped(lx, r.y + 64, &l.name, theme::TEXT, r.w);
-        }
+        let bg = self.home.background();
+        self.scene.blit(bg, bg.bounds(), 0, 0);
+        self.home.draw(&mut self.scene);
 
         let focus = FOCUS.load(Ordering::Relaxed);
         let list: Vec<WindowRef> = WINDOWS.lock().clone();
@@ -665,49 +645,6 @@ impl Desktop {
             let w = win.lock();
             if !w.minimized {
                 draw_window(&mut self.scene, &w, w.id == focus);
-            }
-        }
-
-        // Taskbar.
-        let bar = Rect::new(0, sh - TASKBAR_H, sw, TASKBAR_H);
-        self.scene.blend_rect(bar, theme::TASKBAR, 235);
-        self.scene.fill_rect(Rect::new(0, sh - TASKBAR_H, sw, 1), 0x2E3048);
-        let start = Rect::new(8, sh - TASKBAR_H + 7, 104, TASKBAR_H - 14);
-        self.scene.fill_round_rect(start, 8, if self.menu_open { theme::ACCENT } else { 0x2B2D42 });
-        self.scene.glyph(start.x + 10, start.y + 7, crate::textgrid::glyph('\u{263c}'), 0xFFFFFF, None, 1);
-        self.scene.text(start.x + 28, start.y + 7, "Nova", 0xFFFFFF);
-        for (i, win) in taskbar_order(&list).iter().enumerate() {
-            let w = win.lock();
-            let r = taskbar_button(i);
-            if r.x + r.w > sw - 380 {
-                break;
-            }
-            let active = w.id == focus && !w.minimized;
-            self.scene.fill_round_rect(r, 6, if active { theme::HOVER } else { 0x1F2133 });
-            self.scene.fill_round_rect(Rect::new(r.x + 6, r.y + 6, 18, 18), 5, w.accent);
-            self.scene.glyph(r.x + 11, r.y + 7, crate::textgrid::glyph(w.icon), 0xFFFFFF, None, 1);
-            self.scene.text_clipped(r.x + 30, r.y + 7, &w.title, if active { 0xFFFFFF } else { theme::TEXT_DIM }, r.w - 36);
-            if active {
-                self.scene.fill_rect(Rect::new(r.x + 8, r.y + r.h - 2, r.w - 16, 2), theme::ACCENT);
-            }
-        }
-        let tw = self.status.chars().count() as i32 * 8;
-        self.scene.text(sw - tw - 14, sh - TASKBAR_H + 14, &self.status, theme::TEXT);
-
-        if self.menu_open {
-            let items = self.menu_items();
-            let menu = menu_rect(items.len(), sh);
-            self.scene.shadow(menu, 10);
-            self.scene.fill_round_rect(menu, 10, theme::PANEL);
-            self.scene.text(menu.x + 16, menu.y + 14, "Applications", theme::TEXT_DIM);
-            for (i, item) in items.iter().enumerate() {
-                let r = Rect::new(menu.x + 8, menu.y + 40 + i as i32 * 32, menu.w - 16, 30);
-                if r.contains(self.cursor.0, self.cursor.1) {
-                    self.scene.fill_round_rect(r, 6, theme::HOVER);
-                }
-                self.scene.fill_round_rect(Rect::new(r.x + 6, r.y + 5, 20, 20), 5, item.color);
-                self.scene.glyph(r.x + 12, r.y + 7, crate::textgrid::glyph(item.icon), 0xFFFFFF, None, 1);
-                self.scene.text(r.x + 36, r.y + 7, &item.name, theme::TEXT);
             }
         }
     }
@@ -789,19 +726,31 @@ fn window_by_id(id: usize) -> Option<WindowRef> {
     WINDOWS.lock().iter().find(|w| w.lock().id == id).cloned()
 }
 
-fn icon_rect(i: usize, screen_h: i32) -> Rect {
-    let per_col = ((screen_h - TASKBAR_H - 20) / 96).max(1) as usize;
-    Rect::new(16 + (i / per_col) as i32 * 96, 16 + (i % per_col) as i32 * 96, 88, 90)
-}
-
-fn taskbar_button(i: usize) -> Rect {
-    let (_, h) = *SCREEN_SIZE.lock();
-    Rect::new(124 + i as i32 * 178, h - TASKBAR_H + 7, 170, 30)
-}
-
-fn menu_rect(items: usize, screen_h: i32) -> Rect {
-    let h = 48 + items as i32 * 32;
-    Rect::new(8, screen_h - TASKBAR_H - h - 8, 260, h)
+/// Draw a small live picture of window `id` into `r` (for Home). False if it is gone.
+pub fn draw_window_thumb(scene: &mut Canvas, id: usize, r: Rect, radius: i32) -> bool {
+    let Some(win) = window_by_id(id) else { return false };
+    let Some(w) = win.try_lock() else { return false };
+    match &w.content {
+        Content::Canvas(c) => scene.blit_scaled(c, r, radius, 255),
+        Content::Terminal(t) => {
+            scene.fill_round_rect(r, radius, PALETTE[0]);
+            let Some(t) = t.try_lock() else { return true };
+            let g = &t.grid;
+            let (cols, rows) = (g.cols.max(1) as i32, g.rows.max(1) as i32);
+            for (i, cell) in g.cells.iter().enumerate() {
+                if cell.ch == b' ' {
+                    continue;
+                }
+                let (col, row) = (i as i32 % cols, i as i32 / cols);
+                let x0 = r.x + 6 + col * (r.w - 12) / cols;
+                let x1 = r.x + 6 + (col + 1) * (r.w - 12) / cols;
+                let y0 = r.y + 6 + row * (r.h - 12) / rows;
+                let y1 = r.y + 6 + (row + 1) * (r.h - 12) / rows;
+                scene.fill_rect(Rect::new(x0, y0 + 1, (x1 - x0).max(1), (y1 - y0 - 2).max(1)), PALETTE[cell.fg as usize & 15]);
+            }
+        }
+    }
+    true
 }
 
 fn draw_window(scene: &mut Canvas, w: &Window, focused: bool) {
@@ -858,7 +807,7 @@ fn draw_window(scene: &mut Canvas, w: &Window, focused: bool) {
     }
 }
 
-/// Taskbar status: network, CPU, memory, clock.
+/// Status for Home's header: network, CPU, memory, clock.
 fn status_line() -> String {
     let net = match net::info() {
         Some(i) => match i.ip {
@@ -869,7 +818,11 @@ fn status_line() -> String {
     };
     let cpu = task::cpu_usage();
     let (used, free) = crate::memory::heap_usage();
-    let mem = used * 100 / (used + free).max(1);
+    let tenths = |b: usize| {
+        let t = (b as u64 * 10 + (1 << 29)) >> 30; // GiB in tenths, rounded
+        format!("{}.{}", t / 10, t % 10)
+    };
+    let mem = format!("{} / {} GB", tenths(used), tenths(used + free));
     let (_, _, _, h, m, _) = rtc::now();
-    format!("net {net}   cpu {cpu:>2}%   mem {mem:>2}%   {h:02}:{m:02} UTC")
+    format!("net {net}   cpu {cpu:>2}%   mem {mem}   {h:02}:{m:02} UTC")
 }

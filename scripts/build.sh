@@ -39,6 +39,14 @@ done
 SYSROOT="$BUILD/sysroot"
 rm -rf "$SYSROOT"
 mkdir -p "$SYSROOT"
+# Home screen artwork (assets/home/, generated images; see assets/home/README.md).
+mkdir -p "$SYSROOT/usr/share/nova/home"
+cp "$ROOT"/assets/home/*.png "$SYSROOT/usr/share/nova/home/"
+# Shields filter lists (scripts/fetch-filters.sh), if downloaded.
+if compgen -G "$BUILD/filters/*.txt" >/dev/null; then
+    mkdir -p "$SYSROOT/usr/share/nova/shields"
+    cp "$BUILD"/filters/*.txt "$SYSROOT/usr/share/nova/shields/"
+fi
 for src in "$USERLAND_SRC"/dynamic/*.c "$USERLAND_SRC"/dynamic/*.cpp; do
     [[ -f "$src" ]] || continue
     name="$(basename "${src%.*}")"

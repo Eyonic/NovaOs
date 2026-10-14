@@ -28,12 +28,18 @@ int main(int argc, char **argv) {
     char req[256];
     snprintf(req, sizeof req, "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
     write(fd, req, strlen(req));
+    /* MSG_PEEK must leave the data queued (Chromium peeks to check idle connections). */
+    char peeked[8] = {0};
+    ssize_t p = recv(fd, peeked, 5, MSG_PEEK);
     char buf[4096];
     long total = 0;
     ssize_t n;
     char first[128] = {0};
     while ((n = read(fd, buf, sizeof buf)) > 0) {
-        if (total == 0) { memcpy(first, buf, n < 127 ? n : 127); char *e = strchr(first, '\r'); if (e) *e = 0; }
+        if (total == 0) {
+            printf("nettest: MSG_PEEK %s\n", p == 5 && n >= 5 && memcmp(peeked, buf, 5) == 0 ? "kept the data" : "LOST DATA");
+            memcpy(first, buf, n < 127 ? n : 127); char *e = strchr(first, '\r'); if (e) *e = 0;
+        }
         total += n;
     }
     close(fd);

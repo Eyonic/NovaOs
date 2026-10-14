@@ -22,6 +22,9 @@ Usage: mock_anthropic.py <port> <log-file>
 """
 import base64
 import json
+import os
+import struct
+import zlib
 import re
 import sys
 import threading
@@ -46,6 +49,7 @@ def betas(headers):
     return [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
 LOG = None
 LOCK = threading.Lock()
+COMFY_JOBS = set()
 SIGNATURES = {}  # thinking text -> signature we sent
 ATTEMPTS = {}
 
@@ -277,6 +281,26 @@ def respond(body):
         s.text(f"Intel HD Audio ({addr}): draft driver in drivers/intel_hda.rs; needs an audio interface in the kernel.")
         return s.finish("end_turn")
 
+    if "poster image" in first:
+        if step == 0:
+            s.text("I'll generate the artwork first.")
+            s.tool("toolu_img_1", "generate_image", {"prompt": "a calm teal ocean at dusk, no text", "path": "apps/assets/poster-bg.png", "width": 256, "height": 144})
+            return s.finish("tool_use")
+        blocks = result.get("content") if isinstance(result.get("content"), list) else []
+        last = msgs[-1].get("content") if isinstance(msgs[-1].get("content"), list) else []
+        images = [b for b in blocks + last if b.get("type") == "image"]
+        ok = bool(images) and base64.b64decode(images[0]["source"]["data"]).startswith(b"\x89PNG")
+        log(f"generate_image result: {result_text(result)!r}, png ok: {ok}")
+        s.text("Poster image ready." if ok and "Saved a 256x144 PNG" in result_text(result) else "The image failed: " + result_text(result))
+        return s.finish("end_turn")
+
+    if first.startswith("open url "):   # diagnostic: a real site in Nova Browser
+        if step == 0:
+            s.tool("toolu_url_1", "open_url", {"url": first[len("open url "):].strip()})
+            return s.finish("tool_use")
+        s.text("The page is open.")
+        return s.finish("end_turn")
+
     if "list my files" in first:
         if step == 0:
             s.tool("toolu_ls_1", "run_command", {"command": "ls"})
@@ -315,16 +339,55 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # --- ComfyUI stand-in (Nova's generate_image tool) ---
+    def comfy_png(self):
+        w, h = 256, 144
+        raw = b"".join(b"\0" + bytes([20, 120, 140]) * w for _ in range(h))
+        def chunk(t, d):
+            return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
     def do_GET(self):
+        if self.path.startswith("/history/"):
+            pid = self.path.split("/")[2]
+            done = pid in COMFY_JOBS
+            return self.send_json(200, {pid: {"status": {"status_str": "success"}, "outputs": {"10": {"images": [
+                {"filename": "nova_00001_.png", "subfolder": "", "type": "output"}]}}}} if done else {})
+        if self.path.startswith("/view?"):
+            data = self.comfy_png()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path == "/models":
             ok = self.headers.get("Authorization") == f"Bearer {DEEPSEEK_KEY}"
             return self.send_json(200 if ok else 401, {"object": "list", "data": [{"id": "deepseek-flash", "object": "model"}]} if ok
                                   else {"error": {"message": "Authentication Fails", "type": "authentication_error"}})
+        if self.path in ("/test.css", "/test-image.png"):
+            log(f"browser fetched {self.path}")
+            if self.path.endswith(".css"):
+                # Large, like real sites' stylesheets (many rules), ending with the visible one.
+                data = b"".join(b".r%d { margin: %dpx; }\n" % (i, i % 9) for i in range(20000)) + b"h1 { color: #3a6; font-size: 48px; }"
+            else:
+                art = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "home", "idea_game.png")
+                data = open(art, "rb").read() if os.path.exists(art) else self.comfy_png()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/css" if self.path.endswith(".css") else "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         if self.path.startswith("/test-page"):
             log(f"browser fetched /test-page, user agent: {self.headers.get('User-Agent', '')}")
             page = (b"<!doctype html><html><head><title>Nova test page</title>"
                     b"<script src='https://www.google-analytics.com/analytics.js'></script></head>"
-                    b"<body style='font-family:sans-serif'><h1>Hello from the test page</h1></body></html>")
+                    b"<link rel='stylesheet' href='/test.css'>"
+                    b"<body style='font-family:sans-serif'><h1>Hello from the test page</h1><img src='/test-image.png'></body></html>")
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(page)))
@@ -341,6 +404,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": "not found"}})
 
     def do_POST(self):
+        if self.path == "/prompt":
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            nodes = {n.get("class_type"): n.get("inputs", {}) for n in body.get("prompt", {}).values()}
+            problems = []
+            if nodes.get("UNETLoader", {}).get("unet_name") != "z_image_turbo_bf16.safetensors":
+                problems.append("workflow should load z_image_turbo_bf16")
+            lat = nodes.get("EmptySD3LatentImage", {})
+            if (lat.get("width"), lat.get("height")) != (256, 144):
+                problems.append(f"latent size {lat.get('width')}x{lat.get('height')}, wanted 256x144")
+            if "SaveImage" not in nodes:
+                problems.append("workflow has no SaveImage")
+            for p in problems:
+                log("VIOLATION: comfyui: " + p)
+            pid = f"job{len(COMFY_JOBS) + 1}"
+            COMFY_JOBS.add(pid)
+            texts = [n["inputs"].get("text") for n in body.get("prompt", {}).values() if n.get("class_type") == "CLIPTextEncode"]
+            log(f"comfyui prompt {pid}: {texts[0] if texts else ''!r}")
+            return self.send_json(200, {"prompt_id": pid, "number": 1, "node_errors": {}})
         if self.path.startswith("/anthropic/"):   # DeepSeek's Messages API prefix
             self.path = self.path[len("/anthropic"):]
             if self.headers.get("x-api-key") != DEEPSEEK_KEY:

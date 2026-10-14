@@ -281,9 +281,9 @@ impl SharedMemory {
             self.pages.resize(index + 1, core::ptr::null_mut());
         }
         if self.pages[index].is_null() {
-            // SAFETY: valid layout; zeroed like fresh shared memory.
-            let p = unsafe { alloc::alloc::alloc_zeroed(alloc::alloc::Layout::from_size_align(PAGE, PAGE).unwrap()) };
-            assert!(!p.is_null(), "out of memory for shared memory");
+            // Zeroed like fresh shared memory; out of memory stops the program instead.
+            let p = if crate::memory::heap_usage().1 < crate::process::USER_RESERVE { None } else { crate::memory::alloc_page() };
+            let Some(p) = p else { return crate::process::oom_scratch_page() };
             self.pages[index] = p;
         }
         self.pages[index]
@@ -296,7 +296,7 @@ impl SharedMemory {
             if !p.is_null() {
                 // SAFETY: allocated in `page` with this layout. Mappings beyond the new
                 // size are the program's problem, as on Linux (SIGBUS there).
-                unsafe { alloc::alloc::dealloc(p, alloc::alloc::Layout::from_size_align(PAGE, PAGE).unwrap()) };
+                unsafe { crate::memory::free_page(p) };
             }
         }
     }
@@ -337,7 +337,7 @@ impl Drop for SharedMemory {
             if !p.is_null() {
                 // SAFETY: allocated in `page` with this layout; no mapping holds the object
                 // any more (mappings keep an Arc).
-                unsafe { alloc::alloc::dealloc(p, alloc::alloc::Layout::from_size_align(PAGE, PAGE).unwrap()) };
+                unsafe { crate::memory::free_page(p) };
             }
         }
     }

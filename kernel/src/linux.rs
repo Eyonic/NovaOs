@@ -187,7 +187,7 @@ fn inet_send(file: &FileRef, data: &[u8], to: Option<(smoltcp::wire::Ipv4Address
 }
 
 /// Receive from an inet socket. Returns data and the sender (UDP).
-fn inet_recv(file: &FileRef, max: usize, dontwait: bool) -> Result<(Vec<u8>, Option<(smoltcp::wire::Ipv4Address, u16)>), i64> {
+fn inet_recv(file: &FileRef, max: usize, dontwait: bool, peek: bool) -> Result<(Vec<u8>, Option<(smoltcp::wire::Ipv4Address, u16)>), i64> {
     let mut buf = vec![0u8; max.min(1 << 20)];
     loop {
         {
@@ -198,9 +198,9 @@ fn inet_recv(file: &FileRef, max: usize, dontwait: bool) -> Result<(Vec<u8>, Opt
                 if s.local_port == 0 {
                     s.local_port = crate::net::udp_bind(s.handle, 0).map_err(sock_err)?;
                 }
-                crate::net::udp_recv(s.handle, &mut buf).map(|(n, ip, port)| (n, Some((ip, port))))
+                crate::net::udp_recv(s.handle, &mut buf, peek).map(|(n, ip, port)| (n, Some((ip, port))))
             } else {
-                crate::net::tcp_recv(s.handle, &mut buf).map(|n| (n, None))
+                crate::net::tcp_recv(s.handle, &mut buf, peek).map(|n| (n, None))
             };
             match r {
                 Ok((n, from)) => {
@@ -741,7 +741,7 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
         return Ok(data);
     }
     if is_inet(f) {
-        return inet_recv(f, len, false).map(|(d, _)| d);
+        return inet_recv(f, len, false, false).map(|(d, _)| d);
     }
     let mut f = f.lock();
     let pos = at.unwrap_or(f.pos);
@@ -1103,7 +1103,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 // recvfrom(fd, buf, len, flags, addr, addrlen)
                 let file = fds().get(a0 as i64)?;
                 if is_inet(&file) {
-                    let (data, from) = inet_recv(&file, a2 as usize, a3 & 0x40 != 0)?;
+                    // flags: MSG_PEEK 0x2, MSG_DONTWAIT 0x40
+                    let (data, from) = inet_recv(&file, a2 as usize, a3 & 0x40 != 0, a3 & 0x2 != 0)?;
                     write_user(a1, &data)?;
                     if let Some((ip, port)) = from {
                         put_addr(a4, a5, &encode_sockaddr_in(ip, port))?;
@@ -1483,15 +1484,25 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     if len == 0 {
                         continue;
                     }
-                    if nr == 19 {
-                        let data = do_read(&file, len, None)?;
-                        write_user(base, &data)?;
-                        total += data.len() as i64;
-                        if data.len() < len {
-                            break;
-                        }
+                    // Like Linux: stop at the first short transfer, and report what was
+                    // already transferred instead of a later error (EAGAIN on a socket whose
+                    // buffer filled up). Carrying on past a short write would drop bytes
+                    // from the middle of a stream; failing after one would make the program
+                    // send them twice (both break TLS connections).
+                    let done = if nr == 19 {
+                        do_read(&file, len, None).and_then(|data| write_user(base, &data).map(|_| data.len()))
                     } else {
-                        total += do_write(&file, &read_user(base, len)?, None)? as i64;
+                        read_user(base, len).and_then(|data| do_write(&file, &data, None))
+                    };
+                    match done {
+                        Ok(n) => {
+                            total += n as i64;
+                            if n < len {
+                                break;
+                            }
+                        }
+                        Err(_) if total > 0 => break,
+                        Err(e) => return Err(e),
                     }
                 }
                 total
@@ -1792,6 +1803,16 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             273 => 0,         // set_robust_list
             140 => 20,        // getpriority: nice 0
             141 | 203 => 0,   // setpriority, sched_setaffinity
+            // Scheduling policy: every thread is SCHED_OTHER with priority 0; requests to
+            // change it are accepted and ignored (Nova schedules round-robin).
+            142 | 144 => 0,   // sched_setparam, sched_setscheduler
+            143 => {
+                // sched_getparam: struct sched_param { int sched_priority; }
+                write_user(a1, &0i32.to_le_bytes())?;
+                0
+            }
+            145 => 0,         // sched_getscheduler: SCHED_OTHER
+            146 | 147 => 0,   // sched_get_priority_max/min for SCHED_OTHER
             118 | 120 => {
                 // getresuid, getresgid: root
                 for a in [a0, a1, a2] {
@@ -2081,7 +2102,7 @@ fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
         total += len;
     }
     let (data, passed, truncated) = if is_inet(&file) {
-        let (d, from) = inet_recv(&file, total, flags & 0x40 != 0)?;
+        let (d, from) = inet_recv(&file, total, flags & 0x40 != 0, flags & 0x2 != 0)?;
         if let (Some((ip, port)), name) = (from, w(0))
             && name != 0
         {
