@@ -28,7 +28,7 @@ use crate::textgrid::{FONT_HEIGHT, FONT_WIDTH, PALETTE};
 use crate::tty::TtyRef;
 use crate::{apps, fs, net, pit, rtc, task};
 
-pub const TITLE_H: i32 = 30;
+pub const TITLE_H: i32 = 40;
 /// No taskbar: Home and full-screen windows use the whole screen.
 pub const TASKBAR_H: i32 = 0;
 const TERM_PAD: i32 = 6;
@@ -99,10 +99,10 @@ impl Window {
         Rect::new(self.x, self.y, self.w + 2, TITLE_H)
     }
     fn close_button(&self) -> Rect {
-        Rect::new(self.x + self.w + 2 - 26, self.y + 7, 16, 16)
+        Rect::new(self.x + self.w + 2 - 32, self.y + (TITLE_H - 18) / 2, 18, 18)
     }
     fn minimize_button(&self) -> Rect {
-        Rect::new(self.x + self.w + 2 - 48, self.y + 7, 16, 16)
+        Rect::new(self.x + self.w + 2 - 60, self.y + (TITLE_H - 18) / 2, 18, 18)
     }
     fn resize_grip(&self) -> Rect {
         let f = self.frame();
@@ -755,18 +755,33 @@ pub fn draw_window_thumb(scene: &mut Canvas, id: usize, r: Rect, radius: i32) ->
 
 fn draw_window(scene: &mut Canvas, w: &Window, focused: bool) {
     let f = w.frame();
-    scene.shadow(f, if focused { 14 } else { 8 });
-    scene.fill_round_rect(f, 8, theme::FRAME);
-    let title = Rect::new(f.x, f.y, f.w, TITLE_H);
-    scene.fill_round_rect(title, 8, if focused { theme::TITLE_ACTIVE } else { theme::TITLE_INACTIVE });
-    scene.fill_rect(Rect::new(f.x, f.y + TITLE_H - 8, f.w, 8), if focused { theme::TITLE_ACTIVE } else { theme::TITLE_INACTIVE });
-    scene.fill_round_rect(Rect::new(f.x + 8, f.y + 6, 18, 18), 5, w.accent);
-    scene.glyph(f.x + 13, f.y + 7, crate::textgrid::glyph(w.icon), 0xFFFFFF, None, 1);
-    scene.text_clipped(f.x + 34, f.y + 7, &w.title, if focused { theme::TEXT } else { theme::TEXT_DIM }, f.w - 100);
+    scene.shadow(f, if focused { 22 } else { 12 });
+    // Translucent header over whatever is behind the window, rounded on top.
+    let header = if focused { 0x2C2E42 } else { 0x23242F };
+    let radius = 14;
+    scene.fill_round_rect(Rect::new(f.x, f.y + TITLE_H / 2, f.w, f.h - TITLE_H / 2), radius, theme::FRAME);
+    for y in 0..TITLE_H {
+        // Rows of the rounded top: inset like fill_round_rect does.
+        let dy = radius - y;
+        let inset = if dy > 0 { radius - crate::gfx::isqrt(radius * radius - dy * dy) } else { 0 };
+        scene.blend_rect(Rect::new(f.x + inset, f.y + y, f.w - 2 * inset, 1), header, if focused { 236 } else { 220 });
+    }
+    scene.fill_rect(Rect::new(f.x, f.y + TITLE_H - 1, f.w, 1), if focused { 0x3A3D58 } else { 0x2C2E3C });
+    crate::icons::draw(scene, w.icon, w.accent, Rect::new(f.x + 12, f.y + (TITLE_H - 24) / 2, 24, 24));
+    let title_color = if focused { theme::TEXT } else { theme::TEXT_DIM };
+    crate::font::draw_clipped(scene, f.x + 46, f.y + (TITLE_H - 20) / 2, &w.title, 15, crate::font::Weight::Bold, title_color, f.w - 130);
     let close = w.close_button();
-    scene.fill_circle(close.x + 8, close.y + 8, 7, if focused { theme::CLOSE } else { 0x55586E });
+    scene.fill_circle(close.x + 9, close.y + 9, 9, if focused { 0xE5596A } else { 0x45475A });
     let min = w.minimize_button();
-    scene.fill_circle(min.x + 8, min.y + 8, 7, if focused { theme::MINIMIZE } else { 0x55586E });
+    scene.fill_circle(min.x + 9, min.y + 9, 9, if focused { 0x5A5D78 } else { 0x45475A });
+    // A minus on minimize, a cross on close (focused windows only).
+    if focused {
+        scene.fill_rect(Rect::new(min.x + 5, min.y + 8, 8, 2), 0xE8E8F2);
+        for i in 0..7 {
+            scene.fill_rect(Rect::new(close.x + 5 + i, close.y + 5 + i, 2, 2), 0xFFFFFF);
+            scene.fill_rect(Rect::new(close.x + 11 - i, close.y + 5 + i, 2, 2), 0xFFFFFF);
+        }
+    }
 
     let (ox, oy) = w.client_origin();
     match &w.content {

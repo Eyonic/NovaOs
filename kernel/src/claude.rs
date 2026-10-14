@@ -295,6 +295,12 @@ impl Config {
     }
 }
 
+/// Short sign-in state without any part of a key (for Home, which people screenshot).
+pub fn short_status() -> String {
+    let c = Config::load();
+    if c.logged_in() { format!("Signed in with {}, model {}.", c.provider.name(), c.model) } else { "Not signed in yet.".into() }
+}
+
 /// One line for the Settings app.
 pub fn status_line() -> String {
     let c = Config::load();

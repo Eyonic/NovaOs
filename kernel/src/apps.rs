@@ -244,12 +244,21 @@ fn make_engine(ctx: Arc<AppCtx>) -> Engine {
     e.register_fn("text", |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT| g.with(|cv| cv.text(x as i32, y as i32, s, color(c)) as INT));
     e.register_fn("text_big", |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT| g.with(|cv| cv.text_scaled(x as i32, y as i32, s, color(c), 2) as INT));
     e.register_fn("text_scaled", |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT, scale: INT| g.with(|cv| cv.text_scaled(x as i32, y as i32, s, color(c), (scale as i32).clamp(1, 8)) as INT));
+    // Smooth (anti-aliased, proportional) text in the UI font: label(x, y, s, color[, size]).
+    use crate::font::{self, Weight};
+    let size_of = |size: INT| (size.clamp(8, 96)) as u16;
+    e.register_fn("label", |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT| g.with(|cv| font::draw(cv, x as i32, y as i32, s, 15, Weight::Regular, color(c)) as INT));
+    e.register_fn("label", move |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT, size: INT| g.with(|cv| font::draw(cv, x as i32, y as i32, s, size_of(size), Weight::Regular, color(c)) as INT));
+    e.register_fn("label_bold", |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT| g.with(|cv| font::draw(cv, x as i32, y as i32, s, 15, Weight::Bold, color(c)) as INT));
+    e.register_fn("label_bold", move |g: &mut Gfx, x: INT, y: INT, s: &str, c: INT, size: INT| g.with(|cv| font::draw(cv, x as i32, y as i32, s, size_of(size), Weight::Bold, color(c)) as INT));
+    e.register_fn("label_width", |s: &str| font::width(s, 15, Weight::Regular) as INT);
+    e.register_fn("label_width", move |s: &str, size: INT| font::width(s, size_of(size), Weight::Regular) as INT);
     let button = |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, label: &str, bg: INT| {
         g.with(|cv| {
             let r = Rect::new(x as i32, y as i32, w as i32, h as i32);
-            cv.fill_round_rect(r, 6, color(bg));
-            let tw = label.chars().count() as i32 * 8;
-            cv.text(r.x + (r.w - tw) / 2, r.y + (r.h - 16) / 2, label, 0xFFFFFF);
+            cv.fill_round_rect(r, (r.h / 2).min(10), color(bg));
+            let tw = font::width(label, 14, Weight::Bold);
+            font::draw(cv, r.x + (r.w - tw) / 2, r.y + (r.h - font::line_height(14)) / 2, label, 14, Weight::Bold, 0xFFFFFF);
         })
     };
     e.register_fn("button", move |g: &mut Gfx, x: INT, y: INT, w: INT, h: INT, label: &str| button(g, x, y, w, h, label, 0x5B5FC7));

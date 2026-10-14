@@ -90,7 +90,7 @@ fn draw(g) {
     this.w = g.width;
     g.clear(0x1A1B26);
     g.rect(0, 0, g.width, 30, 0x232536);
-    g.text(10, 7, this.path + if this.dirty { " *" } else { "" }, 0xE8E8F2);
+    g.label_bold(10, 6, this.path + if this.dirty { " *" } else { "" }, 0xE8E8F2);
     g.button(g.width - 90, 3, 80, 24, "Save");
     let visible = (g.height - 60) / 18;
     if this.row < this.top { this.top = this.row; }
@@ -105,5 +105,5 @@ fn draw(g) {
         y += 18;
     }
     g.rect(0, g.height - 22, g.width, 22, 0x232536);
-    g.text(10, g.height - 19, `line ${this.row + 1}, col ${this.col + 1}   ${this.msg}`, 0x9A9CB0);
+    g.label(10, g.height - 20, `line ${this.row + 1}, col ${this.col + 1}   ${this.msg}`, 0x9A9CB0);
 }

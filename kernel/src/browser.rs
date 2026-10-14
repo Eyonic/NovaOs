@@ -26,9 +26,9 @@ use crate::wm::{self, Content, Event, WindowRef};
 use crate::{fs, ipc, linux, pit, process, task};
 
 const ENGINE: &str = "opt/chromium/chrome-headless-shell";
-const HOME: &str = "https://example.com";
-const TOOLBAR: i32 = 44;
-const STATUS: i32 = 24;
+const HOME: &str = "https://duckduckgo.com";
+const TOOLBAR: i32 = 54;
+const STATUS: i32 = 26;
 
 pub fn engine_installed() -> bool {
     fs::exists(ENGINE)
@@ -142,11 +142,51 @@ struct Browser {
     loaded_hosts: Vec<String>,
     probe_at: u64,
     probe_text: String,
+    /// Pointer x over the toolbar (button highlight).
+    hover_x: Option<i32>,
     loading: bool,
     panel: bool,
     viewport: (i32, i32),
     error: Option<String>,
     dirty: bool,
+}
+
+/// Toolbar geometry (shared by drawing and clicks).
+fn button_rect(i: usize) -> Rect {
+    Rect::new(10 + i as i32 * 44, 9, 36, 36)
+}
+
+fn address_rect(w: i32) -> Rect {
+    Rect::new(10 + 4 * 44 + 6, 9, w - (10 + 4 * 44 + 6) - 72, 36)
+}
+
+fn shields_rect(w: i32) -> Rect {
+    Rect::new(w - 56, 8, 38, 38)
+}
+
+enum ToolbarHit {
+    Back,
+    Forward,
+    Reload,
+    Home,
+    Address,
+    Shields,
+}
+
+fn toolbar_hit(x: i32, w: i32) -> Option<ToolbarHit> {
+    const BUTTONS: [ToolbarHit; 4] = [ToolbarHit::Back, ToolbarHit::Forward, ToolbarHit::Reload, ToolbarHit::Home];
+    for (i, hit) in BUTTONS.into_iter().enumerate() {
+        let b = button_rect(i);
+        if b.x <= x && x < b.x + b.w {
+            return Some(hit);
+        }
+    }
+    let a = address_rect(w);
+    if a.x <= x && x < a.x + a.w {
+        return Some(ToolbarHit::Address);
+    }
+    let sb = shields_rect(w);
+    (sb.x - 4 <= x && x < sb.x + sb.w + 4).then_some(ToolbarHit::Shields)
 }
 
 fn log_loads() -> bool {
@@ -176,6 +216,7 @@ pub fn launch(url: Option<String>) {
             loaded_hosts: Vec::new(),
             probe_at: 0,
             probe_text: String::new(),
+            hover_x: None,
             loading: true,
             panel: false,
             viewport: (w, h - TOOLBAR - STATUS),
@@ -453,16 +494,14 @@ impl Browser {
             Event::Key(k) => self.key_event(k),
             Event::MouseDown { x, y, .. } if y < TOOLBAR => {
                 self.panel = false;
-                if (8..40).contains(&x) {
-                    self.history_go(-1);
-                } else if (44..76).contains(&x) {
-                    self.history_go(1);
-                } else if (80..112).contains(&x) {
-                    self.cdp_send("Page.reload", json!({}));
-                } else if x >= w - 60 && x < w - 14 {
-                    self.panel = true;
-                } else if x >= 120 && x < w - 70 {
-                    self.editing = Some(String::new());
+                match toolbar_hit(x, w) {
+                    Some(ToolbarHit::Back) => self.history_go(-1),
+                    Some(ToolbarHit::Forward) => self.history_go(1),
+                    Some(ToolbarHit::Reload) => self.cdp_send("Page.reload", json!({})),
+                    Some(ToolbarHit::Home) => self.navigate(HOME),
+                    Some(ToolbarHit::Shields) => self.panel = true,
+                    Some(ToolbarHit::Address) => self.editing = Some(String::new()),
+                    None => {}
                 }
             }
             Event::MouseDown { x, y, .. } if self.panel => {
@@ -484,6 +523,11 @@ impl Browser {
                 self.cdp_send("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "x": x, "y": y - TOOLBAR, "button": "left", "clickCount": 1}));
             }
             Event::MouseMove { x, y } => {
+                let over = (y < TOOLBAR).then_some(x);
+                if over != self.hover_x {
+                    self.hover_x = over;
+                    self.dirty = true;
+                }
                 self.cdp_send("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x, "y": y - TOOLBAR, "button": "left"}));
             }
             Event::Wheel(n) => {
@@ -577,43 +621,60 @@ impl Browser {
                 c.text(w / 2 - (self.status.len() as i32 * 4), h / 2 + 40, &self.status, 0xC8C8D0);
             }
         }
-        // Toolbar.
-        c.fill_rect(Rect::new(0, 0, w, TOOLBAR), 0x2B2C31);
-        for (i, label) in ["\u{2190}", "\u{2192}", "\u{25cb}"].iter().enumerate() {
-            let x = 8 + i as i32 * 36;
-            c.fill_round_rect(Rect::new(x, 8, 32, 28), 6, 0x3A3B41);
-            c.text(x + 12, 14, label, 0xE8E8EE);
+        // Toolbar: round glyph buttons, a light pill address bar, the Shields button.
+        c.gradient(Rect::new(0, 0, w, TOOLBAR), 0x2E3040, 0x252634);
+        c.fill_rect(Rect::new(0, TOOLBAR - 1, w, 1), 0x3A3D52);
+        let hover = self.hover_x;
+        for (i, name) in ["back", "forward", "reload", "home"].iter().enumerate() {
+            let b = button_rect(i);
+            let over = hover.is_some_and(|x| b.x <= x && x < b.x + b.w);
+            c.fill_circle(b.x + b.w / 2, b.y + b.h / 2, b.w / 2, if over { 0x4A4D66 } else { 0x363849 });
+            if !crate::icons::glyph(&mut c, name, 0xEDEDF5, Rect::new(b.x + 9, b.y + 9, b.w - 18, b.h - 18)) {
+                crate::font::draw(&mut c, b.x + 12, b.y + 7, ["\u{2190}", "\u{2192}", "\u{21bb}", "\u{2302}"][i], 16, crate::font::Weight::Bold, 0xEDEDF5);
+            }
         }
-        let bar = Rect::new(120, 7, w - 120 - 70, 30);
+        let bar = address_rect(w);
         let editing = self.editing.is_some();
-        c.fill_round_rect(bar, 15, if editing { 0x4A4B53 } else { 0x3A3B41 });
+        c.fill_round_rect(bar, bar.h / 2, if editing { 0xFFFFFF } else { 0xEEEFF5 });
+        if editing {
+            c.stroke_round_rect(Rect::new(bar.x - 2, bar.y - 2, bar.w + 4, bar.h + 4), bar.h / 2 + 2, 0xFB542B);
+        }
         let shown = self.editing.clone().unwrap_or_else(|| self.url.clone());
         let secure = self.url.starts_with("https://");
-        let mut tx = bar.x + 14;
+        let mut tx = bar.x + 16;
         if !editing {
-            c.text(tx, bar.y + 7, if secure { "\u{25a0}" } else { "!" }, if secure { 0x7BD88F } else { 0xFFB86C });
-            tx += 16;
+            if secure {
+                crate::icons::glyph(&mut c, "lock", 0x2E9E5B, Rect::new(tx, bar.y + 9, 18, 18));
+            } else {
+                crate::font::draw(&mut c, tx + 4, bar.y + 7, "!", 16, crate::font::Weight::Bold, 0xE8833A);
+            }
+            tx += 26;
         }
-        c.text_clipped(tx, bar.y + 7, &shown, 0xF2F2F5, bar.w - (tx - bar.x) - 12);
+        let shown_text = if shown.is_empty() && editing { String::new() } else { shown.trim_start_matches("https://").into() };
+        let end = crate::font::draw_clipped(&mut c, tx, bar.y + 8, &shown_text, 16, crate::font::Weight::Regular, 0x202230, bar.w - (tx - bar.x) - 16);
         if editing {
-            let cx = tx + shown.chars().count() as i32 * 8;
-            c.fill_rect(Rect::new(cx.min(bar.x + bar.w - 12), bar.y + 6, 2, 18), 0xFB542B);
+            c.fill_rect(Rect::new(end.min(bar.x + bar.w - 14) + 1, bar.y + 8, 2, 20), 0xFB542B);
         }
-        // Shields button: a shield with the blocked count.
+        // Shields button: the shield glyph with a red badge counting blocked requests.
         let host = self.page_host();
         let up = !self.shields.site_allowed(&host);
-        let sx = w - 58;
-        let col = if up { 0xFB542B } else { 0x6B6C75 };
-        c.fill_round_rect(Rect::new(sx, 8, 26, 22), 5, col);
-        for i in 0..8 {
-            c.fill_rect(Rect::new(sx + 3 + i, 30 + i, 20 - 2 * i, 1), col);
+        let sb = shields_rect(w);
+        c.fill_circle(sb.x + sb.w / 2, sb.y + sb.h / 2, sb.w / 2, 0x363849);
+        let col = if up { 0xFB542B } else { 0x8A8C9E };
+        if !crate::icons::glyph(&mut c, "shield", col, Rect::new(sb.x + 8, sb.y + 8, sb.w - 16, sb.h - 16)) {
+            c.fill_round_rect(Rect::new(sb.x + 10, sb.y + 10, sb.w - 20, sb.h - 20), 5, col);
         }
-        let n = self.blocked.len().to_string();
-        c.text(sx + 13 - n.len() as i32 * 4, 11, &n, 0xFFFFFF);
+        if !self.blocked.is_empty() {
+            let n = self.blocked.len().to_string();
+            let bw = (crate::font::width(&n, 11, crate::font::Weight::Bold) + 10).max(18);
+            let badge = Rect::new(sb.x + sb.w - bw + 4, sb.y - 2, bw, 18);
+            c.fill_round_rect(badge, 9, 0xE5394B);
+            crate::font::draw(&mut c, badge.x + (bw - crate::font::width(&n, 11, crate::font::Weight::Bold)) / 2, badge.y + 2, &n, 11, crate::font::Weight::Bold, 0xFFFFFF);
+        }
         // Status bar.
-        c.fill_rect(Rect::new(0, h - STATUS, w, STATUS), 0x2B2C31);
+        c.fill_rect(Rect::new(0, h - STATUS, w, STATUS), 0x252634);
         let status = if self.loading { format!("{} ...", self.status) } else { self.status.clone() };
-        c.text_clipped(10, h - STATUS + 4, &status, 0xB0B0BA, w - 20);
+        crate::font::draw_clipped(&mut c, 14, h - STATUS + 5, &status, 13, crate::font::Weight::Regular, 0xB4B5C4, w - 28);
         // Shields panel.
         if self.panel {
             let p = self.panel_rect(w);

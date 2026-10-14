@@ -314,6 +314,13 @@ when no window has the focus. Posters come from `usr/share/nova/home/*.png` (gen
 from `assets/home/`, copied in by `build.sh`). Items without artwork get a procedural poster.
 Posters and the hero are rendered once per item and cached.
 
+UI text is anti-aliased Noto Sans (Regular and Bold, `font.rs`, rasterised with fontdue and
+cached per size and weight). Home, window titles, Nova Browser's toolbar and app labels
+(`g.label`) use it, while terminals keep the 8x16 bitmap font for their character grid. Without the
+font files everything falls back to the bitmap font. App icons and toolbar glyphs (`icons.rs`)
+are generated images from `assets/` (see assets/README.md). Glyphs are white-on-black masks,
+tinted when drawn (`Canvas::draw_mask`).
+
 Window content is a `gfx::Canvas` handed over by the app (`wm::present`) or a terminal grid.
 Apps receive `wm::Event`s (keys, mouse down/up/move, wheel, resize, close).
 

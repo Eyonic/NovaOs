@@ -7,9 +7,11 @@ drivers (the assistant drafts ports for anything without a driver), offers to in
 disk, and then drops you into a desktop. On the desktop, the assistant is the app creator: ask
 for an app and it writes, checks and opens it.
 
-![Nova Home: a hero banner and rows of poster cards with generated artwork](docs/screenshots/home.png)
+![Nova Home: hero banner with a live app preview and rows of poster cards with generated artwork](docs/screenshots/home.png)
 
-![Nova Browser (Chromium engine with Shields) showing DuckDuckGo](docs/screenshots/browser.png)
+![An app window (System Monitor) in Nova's window style over Home](docs/screenshots/app-window.png)
+
+![Nova Browser: the Chromium engine with Shields, glyph toolbar and blocked-request badge](docs/screenshots/browser.png)
 
 **Milestone 0.4.** Everything runs in QEMU. Nothing here writes to your real disks, ESP or host
 bootloader; the "disks" are files under `build/`.
@@ -148,7 +150,8 @@ compares `check_app` screenshots against the mockup. Put the server's address in
 `NOVA_COMFYUI_URL` or `~/.config/nova/comfyui-url` (outside the repository); `run.sh` passes it
 in. The workflow is Z-Image Turbo (8 steps); the server needs `z_image_turbo_bf16.safetensors`,
 `qwen_3_4b.safetensors` and `ae.safetensors`. Without a server, apps are built from drawing
-calls only. Home's own posters and wallpaper (`assets/home/`) were made the same way.
+calls only. Home's posters and wallpaper, the app icons and the browser's toolbar glyphs (`assets/`, see
+[assets/README.md](assets/README.md)) were made the same way.
 
 ## About the assistant
 

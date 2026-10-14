@@ -42,6 +42,17 @@ mkdir -p "$SYSROOT"
 # Home screen artwork (assets/home/, generated images; see assets/home/README.md).
 mkdir -p "$SYSROOT/usr/share/nova/home"
 cp "$ROOT"/assets/home/*.png "$SYSROOT/usr/share/nova/home/"
+mkdir -p "$SYSROOT/usr/share/nova/icons"
+cp "$ROOT"/assets/icons/*.png "$SYSROOT/usr/share/nova/icons/"
+mkdir -p "$SYSROOT/usr/share/nova/glyphs"
+cp "$ROOT"/assets/glyphs/*.png "$SYSROOT/usr/share/nova/glyphs/"
+# The desktop's UI font (Noto Sans, SIL Open Font License), rendered by kernel/src/font.rs.
+mkdir -p "$SYSROOT/usr/share/fonts/noto"
+for f in NotoSans-Regular.ttf NotoSans-Bold.ttf; do
+    src="$(fc-match -f '%{file}' "Noto Sans:style=${f#NotoSans-}" 2>/dev/null)"
+    [[ -f "/usr/share/fonts/noto/$f" ]] && src="/usr/share/fonts/noto/$f"
+    if [[ "$(basename "${src:-}")" == "$f" ]]; then cp -L "$src" "$SYSROOT/usr/share/fonts/noto/$f"; else log "warning: UI font $f not found (install Noto Sans); the desktop falls back to the bitmap font"; fi
+done
 # Shields filter lists (scripts/fetch-filters.sh), if downloaded.
 if compgen -G "$BUILD/filters/*.txt" >/dev/null; then
     mkdir -p "$SYSROOT/usr/share/nova/shields"

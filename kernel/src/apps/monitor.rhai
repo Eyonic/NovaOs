@@ -31,7 +31,7 @@ fn fmt_bytes(b) {
 
 fn card(g, x, y, w, h, title) {
     g.round_rect(x, y, w, h, 10, 0x262838);
-    g.text(x + 14, y + 10, title, 0x9A9CB0);
+    g.label_bold(x + 14, y + 10, title, 0x9A9CB0, 13);
 }
 
 fn clip(s, n) {
@@ -44,8 +44,8 @@ fn draw(g) {
 
     // CPU with a load graph.
     card(g, 12, 12, 300, 176, "CPU");
-    g.text_big(26, 34, `${i.cpu}%`, 0xFFFFFF);
-    g.text(26, 74, clip(i.cpu_name, 34), 0x9A9CB0);
+    g.label_bold(24, 30, `${i.cpu}%`, 0xFFFFFF, 34);
+    g.label(26, 74, clip(i.cpu_name, 34), 0x9A9CB0);
     let gx = 26; let gy = 176; let gh = 72; let gw = 272;
     g.frame(gx - 1, gy - gh - 1, gw + 2, gh + 2, 0x34364A);
     let n = this.hist.len();
@@ -59,24 +59,24 @@ fn draw(g) {
     // Memory.
     card(g, 324, 12, 304, 84, "Memory");
     let pct = i.mem_used * 100 / max(1, i.mem_total);
-    g.text(338, 38, `${fmt_bytes(i.mem_used)} of ${fmt_bytes(i.mem_total)} (${pct}%)`, 0xFFFFFF);
+    g.label(338, 38, `${fmt_bytes(i.mem_used)} of ${fmt_bytes(i.mem_total)} (${pct}%)`, 0xFFFFFF);
     g.progress(338, 66, 276, 12, pct, 0x8B7CF6);
 
     // Storage.
     card(g, 324, 104, 304, 84, "Storage");
     if i.disk_total != () {
         let dp = i.disk_used * 100 / max(1, i.disk_total);
-        g.text(338, 130, `${fmt_bytes(i.disk_used)} of ${fmt_bytes(i.disk_total)} used`, 0xFFFFFF);
+        g.label(338, 130, `${fmt_bytes(i.disk_used)} of ${fmt_bytes(i.disk_total)} used`, 0xFFFFFF);
         g.progress(338, 158, 276, 12, dp, 0xE5A84B);
     } else {
-        g.text(338, 130, "no filesystem", 0xFFFFFF);
+        g.label(338, 130, "no filesystem", 0xFFFFFF);
     }
 
     // Network and system.
     card(g, 12, 196, 616, 72, "Network & system");
-    g.text(26, 222, `IP ${i.ip}   gateway ${i.gateway}   rx ${fmt_bytes(i.net_rx)}   tx ${fmt_bytes(i.net_tx)}`, 0xFFFFFF);
+    g.label(26, 222, `IP ${i.ip}   gateway ${i.gateway}   rx ${fmt_bytes(i.net_rx)}   tx ${fmt_bytes(i.net_tx)}`, 0xFFFFFF);
     let up = i.uptime;
-    g.text(26, 242, `uptime ${up / 3600}h ${(up / 60) % 60}m ${up % 60}s   tasks ${i.tasks}`, 0xCDD3DE);
+    g.label(26, 242, `uptime ${up / 3600}h ${(up / 60) % 60}m ${up % 60}s   tasks ${i.tasks}`, 0xCDD3DE);
 
     // Devices and drivers.
     card(g, 12, 276, 616, g.height - 288, "Hardware (PCI) and drivers");
@@ -86,9 +86,9 @@ fn draw(g) {
         if rows < this.scroll { rows += 1; continue; }
         if y > g.height - 30 { break; }
         let c = if d.driver == "missing" { 0xEF5B6B } else if d.driver == "built in" { 0x9A9CB0 } else if d.driver == "port drafted" { 0xE5C07B } else { 0x4FC08D };
-        g.text(26, y, d.id, 0x9A9CB0);
-        g.text(110, y, clip(d.name, 44), 0xFFFFFF);
-        g.text(480, y, clip(d.driver, 17), c);
+        g.label(26, y, d.id, 0x9A9CB0);
+        g.label(110, y, clip(d.name, 44), 0xFFFFFF);
+        g.label(480, y, clip(d.driver, 17), c);
         y += 18;
         rows += 1;
     }

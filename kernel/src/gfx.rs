@@ -294,6 +294,31 @@ impl Canvas {
         }
     }
 
+    /// Draw a mask image (white = opaque, black = transparent, e.g. a toolbar glyph)
+    /// scaled into `dst`, tinted `color`. Shrinking averages 2x2 samples for smooth edges.
+    pub fn draw_mask(&mut self, mask: &Canvas, dst: Rect, color: u32) {
+        let Some(vis) = dst.intersect(&self.bounds()) else { return };
+        if mask.width == 0 || mask.height == 0 {
+            return;
+        }
+        let (mw, mh) = (mask.width as i64, mask.height as i64);
+        for y in vis.y..vis.y + vis.h {
+            let ry = (y - dst.y) as i64;
+            let sy0 = (ry * mh / dst.h as i64) as usize;
+            let sy1 = (((ry * 2 + 1) * mh / (dst.h as i64 * 2)) as usize).min(mask.height - 1);
+            for x in vis.x..vis.x + vis.w {
+                let rx = (x - dst.x) as i64;
+                let sx0 = (rx * mw / dst.w as i64) as usize;
+                let sx1 = (((rx * 2 + 1) * mw / (dst.w as i64 * 2)) as usize).min(mask.width - 1);
+                let a = [(sy0, sx0), (sy0, sx1), (sy1, sx0), (sy1, sx1)].iter().map(|&(yy, xx)| (mask.pixels[yy * mask.width + xx] >> 8) & 0xFF).sum::<u32>() / 4;
+                if a > 8 {
+                    let i = y as usize * self.width + x as usize;
+                    self.pixels[i] = blend(self.pixels[i], color, a);
+                }
+            }
+        }
+    }
+
     /// Vertical gradient from `top` to `bottom`.
     pub fn gradient(&mut self, r: Rect, top: u32, bottom: u32) {
         for dy in 0..r.h {

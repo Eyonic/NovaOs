@@ -19,6 +19,7 @@ use crate::gfx::{blend, Canvas, Rect};
 use crate::input::Key;
 use crate::sync::SpinLock;
 use crate::wm::{self, Action};
+use crate::font::{self, Weight};
 use crate::{apps, fs, pit, rtc, task};
 
 const CARD_W: i32 = 224;
@@ -29,8 +30,8 @@ const GAP: i32 = 18;
 const MARGIN: i32 = 44;
 const TOP_BAR: i32 = 52;
 const HERO_H: i32 = 300;
-const ROW_H: i32 = 186;
-const ROW_TITLE: i32 = 28;
+const ROW_H: i32 = 198;
+const ROW_TITLE: i32 = 40;
 /// Hover time before a card's preview starts (ticks).
 const PREVIEW_DELAY: u64 = pit::HZ * 6 / 10;
 
@@ -200,29 +201,6 @@ fn scrim(c: &mut Canvas, from: i32, strength: u32) {
     }
 }
 
-fn wrap(text: &str, max_chars: usize, max_lines: usize) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for word in text.split_whitespace() {
-        if !cur.is_empty() && cur.chars().count() + 1 + word.chars().count() > max_chars {
-            lines.push(core::mem::take(&mut cur));
-            if lines.len() == max_lines {
-                if let Some(l) = lines.last_mut() {
-                    l.push_str("...");
-                }
-                return lines;
-            }
-        }
-        if !cur.is_empty() {
-            cur.push(' ');
-        }
-        cur.push_str(word);
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
 
 /// A poster for an item: its artwork, or a generated design (gradient, pattern, big
 /// icon), with the title on a scrim.
@@ -266,10 +244,11 @@ fn make_poster(item: &Item, w: i32, h: i32) -> Canvas {
         }
     };
     scrim(&mut c, h / 3, 230);
-    let scale = if item.title.chars().count() as i32 * 16 <= w - 24 { 2 } else { 1 };
-    let ty = h - 16 * scale - 12;
-    c.text_scaled(13, ty + 1, &item.title, 0x000000, scale);
-    c.text_scaled(12, ty, &item.title, TEXT, scale);
+    let size: u16 = if w > CARD_W { 22 } else { 19 };
+    let size = if font::width(&item.title, size, Weight::Bold) <= w - 28 { size } else { size - 4 };
+    let ty = h - font::line_height(size) - 10;
+    font::draw_clipped(&mut c, 15, ty + 1, &item.title, size, Weight::Bold, 0x000000, w - 28);
+    font::draw_clipped(&mut c, 14, ty, &item.title, size, Weight::Bold, TEXT, w - 28);
     c
 }
 
@@ -354,7 +333,7 @@ impl Home {
                 Item {
                     title: assistant.into(),
                     category: "Create with AI",
-                    about: format!("Your AI assistant. Ask it to build apps, explain this computer, write files or port drivers. {}", crate::claude::status_line()),
+                    about: format!("Your AI assistant. Ask it to build apps, explain this computer, write files or port drivers. {}", crate::claude::short_status()),
                     meta: "Builds apps with generated artwork".into(),
                     icon: '*',
                     color: 0xD97757,
@@ -523,7 +502,7 @@ impl Home {
     }
 
     fn open_button(&self) -> Rect {
-        Rect::new(MARGIN, TOP_BAR + HERO_H - 66, 132, 40)
+        Rect::new(MARGIN, TOP_BAR + HERO_H - 70, 140, 44)
     }
 
     fn chevrons(&self, r: usize) -> Option<(Rect, Rect)> {
@@ -745,39 +724,42 @@ impl Home {
         }
 
         // Top bar: wordmark, date and time.
-        scene.text_scaled(MARGIN, 12, "nova", ACCENT, 2);
-        scene.text(MARGIN + 74, 22, "home", DIM);
+        let end = font::draw(scene, MARGIN, 10, "nova", 28, Weight::Bold, ACCENT);
+        font::draw(scene, end + 10, 20, "home", 15, Weight::Regular, DIM);
         let (_, mo, d, ..) = rtc::now();
         let when = format!("{} {} {}", weekday(rtc::unix_time()), d, MONTHS[(mo as usize).clamp(1, 12) - 1]);
-        let right = w - MARGIN - (when.len() + 3 + self.status.len()) as i32 * 8;
-        scene.text(right, 20, &self.status, DIM);
-        scene.text(w - MARGIN - when.len() as i32 * 8, 20, &when, TEXT);
+        let when_w = font::width(&when, 15, Weight::Bold);
+        font::draw(scene, w - MARGIN - when_w, 18, &when, 15, Weight::Bold, TEXT);
+        let status_w = font::width(&self.status, 14, Weight::Regular);
+        font::draw(scene, w - MARGIN - when_w - 28 - status_w, 19, &self.status, 14, Weight::Regular, DIM);
 
         // Hero text.
         let tx = MARGIN;
         let chip = item.category.to_uppercase();
-        scene.fill_round_rect(Rect::new(tx, TOP_BAR + 30, chip.len() as i32 * 8 + 20, 22), 11, ACCENT);
-        scene.text(tx + 10, TOP_BAR + 33, &chip, 0xFFFFFF);
-        let scale = if item.title.chars().count() <= 18 { 4 } else { 3 };
-        scene.text_scaled(tx + 2, TOP_BAR + 66 + 2, &item.title, 0x000000, scale);
-        scene.text_scaled(tx, TOP_BAR + 66, &item.title, TEXT, scale);
-        let mut ty = TOP_BAR + 70 + 16 * scale;
-        for line in wrap(&item.about, 64, 3) {
-            scene.text(tx, ty, &line, 0xD8D8E4);
-            ty += 18;
+        let chip_w = font::width(&chip, 12, Weight::Bold) + 22;
+        scene.fill_round_rect(Rect::new(tx, TOP_BAR + 28, chip_w, 24), 12, ACCENT);
+        font::draw(scene, tx + 11, TOP_BAR + 32, &chip, 12, Weight::Bold, 0xFFFFFF);
+        let tmax = w * 11 / 20;
+        let tsize: u16 = if font::width(&item.title, 52, Weight::Bold) <= tmax { 52 } else { 40 };
+        font::draw_clipped(scene, tx + 2, TOP_BAR + 60 + 2, &item.title, tsize, Weight::Bold, 0x000000, tmax);
+        font::draw_clipped(scene, tx, TOP_BAR + 60, &item.title, tsize, Weight::Bold, TEXT, tmax);
+        let mut ty = TOP_BAR + 66 + font::line_height(tsize);
+        for line in font::wrap(&item.about, 17, Weight::Regular, w * 9 / 20, 3) {
+            font::draw(scene, tx, ty, &line, 17, Weight::Regular, 0xDCDCE6);
+            ty += 24;
         }
         if !item.meta.is_empty() {
-            scene.text_clipped(tx, ty + 4, &item.meta, DIM, 560);
+            font::draw_clipped(scene, tx, ty + 4, &item.meta, 14, Weight::Regular, DIM, w * 9 / 20);
         }
         let open = self.open_button();
-        scene.fill_round_rect(open, 8, 0xFFFFFF);
+        scene.fill_round_rect(open, open.h / 2, 0xFFFFFF);
         // Play triangle.
-        for i in 0..14 {
-            let half = if i < 7 { i } else { 13 - i };
-            scene.fill_rect(Rect::new(open.x + 24, open.y + 13 + i, half + 1, 1), 0x111111);
+        for i in 0..16 {
+            let half = if i < 8 { i } else { 15 - i };
+            scene.fill_rect(Rect::new(open.x + 26, open.y + 12 + i, half + 1, 1), 0x111111);
         }
-        scene.text(open.x + 42, open.y + 12, "Open", 0x111111);
-        scene.text(open.x + open.w + 18, open.y + 12, "Enter to open, arrows to browse", DIM);
+        font::draw(scene, open.x + 46, open.y + 10, "Open", 17, Weight::Bold, 0x111111);
+        font::draw(scene, open.x + open.w + 20, open.y + 12, "Enter to open  \u{00b7}  arrows to browse  \u{00b7}  Windows key: Home", 14, Weight::Regular, DIM);
 
         // Live preview panel on the right of the hero.
         let pw = (w * 7 / 20).min(448);
@@ -789,7 +771,7 @@ impl Home {
                 let i = self.poster(&item, true);
                 scene.blit_scaled(&self.posters[i].2, panel, 10, 255);
             }
-            scene.text(panel.x, panel.y + panel.h + 10, if matches!(item.kind, Kind::Window(_)) { "Live window" } else { "Live preview" }, DIM);
+            font::draw(scene, panel.x + 2, panel.y + panel.h + 10, if matches!(item.kind, Kind::Window(_)) { "Live window" } else { "Live preview" }, 14, Weight::Regular, DIM);
         }
 
         // Rows.
@@ -801,8 +783,8 @@ impl Home {
                 break;
             }
             let title = self.rows[r].title;
-            scene.text_scaled(MARGIN, ry, title, TEXT, 1);
-            scene.text(MARGIN + title.len() as i32 * 8 + 10, ry, &format!("{}", self.rows[r].items.len()), DIM);
+            let end = font::draw(scene, MARGIN, ry - 2, title, 19, Weight::Bold, TEXT);
+            font::draw(scene, end + 10, ry + 1, &format!("{}", self.rows[r].items.len()), 15, Weight::Regular, DIM);
             for c in 0..self.rows[r].items.len() {
                 let Some(rect) = self.card_rect(r, c) else { continue };
                 if (r, c) == self.sel && zoomed {
@@ -812,26 +794,27 @@ impl Home {
                 let it = self.rows[r].items[c].clone();
                 scene.shadow(rect, 6);
                 if matches!(it.kind, Kind::Window(_)) {
-                    scene.fill_round_rect(rect, 8, 0x1A1B26);
-                    Self::draw_live(scene, &it, Rect::new(rect.x, rect.y, rect.w, rect.h - 26), 8);
-                    scene.text_clipped(rect.x + 10, rect.y + rect.h - 21, &it.title, TEXT, rect.w - 20);
+                    scene.fill_round_rect(rect, 12, 0x1A1B26);
+                    Self::draw_live(scene, &it, Rect::new(rect.x, rect.y, rect.w, rect.h - 30), 12);
+                    crate::icons::draw(scene, it.icon, it.color, Rect::new(rect.x + 10, rect.y + rect.h - 27, 22, 22));
+                    font::draw_clipped(scene, rect.x + 40, rect.y + rect.h - 26, &it.title, 15, Weight::Bold, TEXT, rect.w - 52);
                 } else {
                     let i = self.poster(&it, false);
-                    blit_round(scene, &self.posters[i].2, rect.x, rect.y, 8);
+                    blit_round(scene, &self.posters[i].2, rect.x, rect.y, 12);
                 }
                 if (r, c) == self.sel {
                     // Keyboard selection without zoom: an outline.
-                    scene.stroke_round_rect(Rect::new(rect.x - 3, rect.y - 3, rect.w + 6, rect.h + 6), 10, 0xFFFFFF);
+                    scene.stroke_round_rect(Rect::new(rect.x - 4, rect.y - 4, rect.w + 8, rect.h + 8), 15, 0xFFFFFF);
                 }
             }
             let vis = self.visible_cards();
             let row = &self.rows[r];
             if let Some((left, right)) = self.chevrons(r) {
                 if row.scroll > 0 {
-                    scene.glyph(left.x + 8, left.y + CARD_H / 2 - 16, crate::textgrid::glyph('<'), TEXT, None, 2);
+                    font::draw(scene, left.x + 6, left.y + CARD_H / 2 - 22, "\u{2039}", 40, Weight::Bold, TEXT);
                 }
                 if row.scroll + vis < row.items.len() {
-                    scene.glyph(right.x + 6, right.y + CARD_H / 2 - 16, crate::textgrid::glyph('>'), TEXT, None, 2);
+                    font::draw(scene, right.x + 8, right.y + CARD_H / 2 - 22, "\u{203a}", 40, Weight::Bold, TEXT);
                 }
             }
         }
@@ -842,15 +825,20 @@ impl Home {
             let it = self.rows[r].items[c].clone();
             let z = Rect::new(rect.x - (ZOOM_W - CARD_W) / 2, rect.y - (ZOOM_H - CARD_H) / 2, ZOOM_W, ZOOM_H);
             let z = Rect::new(z.x.max(4), z.y, z.w, z.h);
+            // Soft white glow around the focused card.
+            for i in (4..=14).rev() {
+                let a = (14 - i) as u32 * 5;
+                scene.blend_rect(Rect::new(z.x - i, z.y - i + 6, z.w + 2 * i, z.h + 2 * i - 12), 0xFFFFFF, a / 3);
+            }
             scene.shadow(z, 18);
-            scene.fill_round_rect(Rect::new(z.x - 3, z.y - 3, z.w + 6, z.h + 6), 12, 0xFFFFFF);
-            let live = self.preview_on && Self::draw_live(scene, &it, z, 10);
+            scene.fill_round_rect(Rect::new(z.x - 4, z.y - 4, z.w + 8, z.h + 8), 16, 0xFFFFFF);
+            let live = self.preview_on && Self::draw_live(scene, &it, z, 13);
             if !live {
                 let i = self.poster(&it, true);
-                blit_round(scene, &self.posters[i].2, z.x, z.y, 10);
+                blit_round(scene, &self.posters[i].2, z.x, z.y, 13);
             } else {
-                scene.blend_rect(Rect::new(z.x, z.y + z.h - 28, z.w, 28), 0, 160);
-                scene.text_clipped(z.x + 10, z.y + z.h - 22, &it.title, TEXT, z.w - 20);
+                scene.blend_rect(Rect::new(z.x, z.y + z.h - 32, z.w, 32), 0, 170);
+                font::draw_clipped(scene, z.x + 12, z.y + z.h - 27, &it.title, 16, Weight::Bold, TEXT, z.w - 24);
             }
         }
 
@@ -858,15 +846,15 @@ impl Home {
         if let Some(menu) = &self.menu {
             let r = menu.rect();
             scene.shadow(r, 12);
-            scene.fill_round_rect(r, 10, 0x1C1D2A);
-            scene.text_clipped(r.x + 14, r.y + 12, &menu.title, DIM, r.w - 28);
+            scene.fill_round_rect(r, 12, 0x1C1D2A);
+            font::draw_clipped(scene, r.x + 14, r.y + 10, &menu.title, 14, Weight::Regular, DIM, r.w - 28);
             for (i, (label, _)) in menu.entries.iter().enumerate() {
                 let e = Rect::new(r.x + 6, r.y + 36 + i as i32 * MENU_ROW, r.w - 12, MENU_ROW - 2);
                 if menu.entry_at(self.cursor.0, self.cursor.1) == Some(i) {
                     scene.fill_round_rect(e, 6, 0x34364C);
                 }
                 let color = if *label == "Stop running" { 0xFF7A85 } else { TEXT };
-                scene.text(e.x + 10, e.y + 6, label, color);
+                font::draw(scene, e.x + 10, e.y + 4, label, 15, Weight::Bold, color);
             }
         }
     }

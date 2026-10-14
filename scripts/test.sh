@@ -41,7 +41,8 @@ CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
 # Step mode: if INPUT contains "wait:TEXT" entries, inputs are not paced by shell prompts. Each wait
 # step blocks until TEXT has appeared once more than at the previous wait for the same TEXT; other
 # steps are sent immediately ("raw:..." sends without Enter, "sleep:N" waits N seconds,
-# "dump:FILE" saves a screenshot of the display to the log directory).
+# "dump:FILE" saves a screenshot of the display to the log directory, "key:NAME" presses
+# a key through the QEMU monitor).
 # QEMU_EXTRA: extra QEMU arguments. EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
 # MOCK=1: run with the mock Anthropic API and fail on any protocol violation it logs.
 define_case() {
@@ -156,10 +157,14 @@ define_case() {
                 CONTAINS=("bytes written to file /tmp/t.png" "tmp/t.png")
                 FORBID=("$PANIC" "$EXC" "FATAL") ;;
         browser) # Desktop: Claude opens a page in Nova Browser; Chromium loads it, Shields blocks its tracker.
-                CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1
+                # Then screenshots: the browser, Home (Windows key), an app preview and the app.
+                CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1; CASE_TIMEOUT=$(( TIMEOUT > 90 ? TIMEOUT : 90 ))
                 [[ -d "$BUILD/sysroot/opt/chromium" ]] || SKIP="Chromium not downloaded (scripts/fetch-chromium.sh)"
                 INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:> " "ser:open the test page" "wait:shields: blocked www.google-analytics.com"
-                       "wait:The test page is open in Nova Browser." "sleep:8" "dump:browser.ppm")
+                       "wait:The test page is open in Nova Browser." "sleep:8" "dump:browser.ppm"
+                       "key:meta_l" "sleep:3" "dump:home.ppm"
+                       "key:down" "key:right" "key:right" "key:right" "key:right" "sleep:4" "dump:home-preview.ppm"
+                       "key:ret" "sleep:4" "dump:app.ppm")
                 EXPECT=("$EXPECTED_BANNER" "⏺ OpenUrl(http://10.0.2.2:$MOCK_PORT/test-page)" "  ⎿  Opened in Nova Browser")
                 CONTAINS=("[nova] shields: blocked www.google-analytics.com" "The test page is open in Nova Browser.")
                 FORBID=("$PANIC" "$EXC" "API error" "engine stopped") ;;
@@ -320,6 +325,9 @@ run_case() {
                 printf '%s' "${step#raw:}" >&"$SERIAL_FD"; sent=$(( sent + 1 )); continue
             elif [[ $step == sleep:* ]]; then
                 sleep "${step#sleep:}"; sent=$(( sent + 1 )); continue
+            elif [[ $step == key:* ]]; then
+                # A key press through the QEMU monitor (e.g. key:meta_l, the Windows key).
+                printf 'sendkey %s\n' "${step#key:}" >&"$MONITOR_FD"; sleep 1; sent=$(( sent + 1 )); continue
             elif [[ $step == dump:* ]]; then
                 # Screenshot of the VM's display (PPM) into the log directory.
                 printf 'screendump %s\n' "$run_dir/${step#dump:}" >&"$MONITOR_FD"; sleep 1; sent=$(( sent + 1 )); continue

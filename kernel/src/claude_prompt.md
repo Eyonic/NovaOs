@@ -31,13 +31,14 @@ Graphics context g (colors are integers 0xRRGGBB; coordinates are integers):
 - g.width, g.height
 - g.clear(color); g.rect(x, y, w, h, color); g.frame(x, y, w, h, color) (outline); g.round_rect(x, y, w, h, radius, color)
 - g.line(x0, y0, x1, y1, color); g.circle(cx, cy, r, color) (filled); g.ring(cx, cy, r, color); g.pixel(x, y, color)
-- g.text(x, y, string, color) (8x16 px per character, returns end x); g.text_big(x, y, s, color) (16x32); g.text_scaled(x, y, s, color, scale)
+- g.label(x, y, string, color) and g.label_bold(x, y, string, color): smooth anti-aliased UI text (Noto Sans, 15 px; add a size argument for others, e.g. g.label_bold(x, y, "Title", 0xFFFFFF, 28)); label_width(s) / label_width(s, size) measure it. Use these for all normal text; returns end x.
+- g.text(x, y, string, color) (blocky 8x16 monospace bitmap font: only for code, terminals or retro looks); g.text_big / g.text_scaled likewise
 - g.button(x, y, w, h, label) or g.button(x, y, w, h, label, color) (draws a rounded button; you handle the click yourself by checking coordinates)
 - g.progress(x, y, w, h, percent, color)
 
 Other functions available to apps:
 - ticks() milliseconds since boot; now() map with year, month, day, hour, minute, second, unix (UTC); random(n) in 0..n
-- rgb(r, g, b); text_width(s)
+- rgb(r, g, b); text_width(s) (width of g.text text; for g.label use label_width)
 - save(key, text) / load(key) persistent per-app storage (strings; use to_json/parse_json style formats you write yourself, or simple lines)
 - fs_list(prefix) array of #{name, size, mtime}; fs_read(path); fs_write(path, text); fs_delete(path); fs_exists(path)
 - http_get(url) -> body string ("error: ..." on failure); sys_info() map with cpu, cpu_name, mem_used, mem_total, uptime, ip, disk_used, disk_total, devices

@@ -89,10 +89,10 @@ fn fmt_size(b) {
 
 fn draw(g) {
     g.clear(0x1A1B26);
-    g.text(12, 12, "Nova filesystem", 0xFFFFFF);
-    g.text(150, 12, `${this.files.len()} files`, 0x9A9CB0);
+    g.label_bold(12, 10, "Nova filesystem", 0xFFFFFF, 17);
+    g.label(150, 12, `${this.files.len()} files`, 0x9A9CB0);
     g.rect(0, 40, g.width, 1, 0x34364A);
-    g.text(16, 44 - 2, "", 0);
+    g.label(16, 44 - 2, "", 0);
     let y = 52;
     let shown = 0;
     for i in this.scroll..this.files.len() {
@@ -100,9 +100,9 @@ fn draw(g) {
         let f = this.files[i];
         if i == this.sel { g.round_rect(6, y - 2, g.width - 12, 19, 4, 0x3A3D58); }
         let icon = if f.name.ends_with(".rhai") { "♦" } else if f.name.starts_with("system/") { "■" } else { "≡" };
-        g.text(14, y, icon, if f.name.ends_with(".rhai") { 0x8B7CF6 } else { 0x9A9CB0 });
-        g.text(34, y, f.name, 0xE8E8F2);
-        g.text(g.width - 100, y, fmt_size(f.size), 0x9A9CB0);
+        g.label(14, y, icon, if f.name.ends_with(".rhai") { 0x8B7CF6 } else { 0x9A9CB0 });
+        g.label(34, y, f.name, 0xE8E8F2);
+        g.label(g.width - 100, y, fmt_size(f.size), 0x9A9CB0);
         y += 19;
         shown += 1;
     }
@@ -111,5 +111,5 @@ fn draw(g) {
     g.button(110, 400, 90, 28, "Edit", 0x3E4157);
     g.button(208, 400, 110, 28, "New note", 0x3E4157);
     g.button(326, 400, 90, 28, if this.confirm { "Sure?" } else { "Delete" }, if this.confirm { 0xC2364A } else { 0x3E4157 });
-    g.text(430, 406, this.msg, 0x9A9CB0);
+    g.label(430, 406, this.msg, 0x9A9CB0);
 }
