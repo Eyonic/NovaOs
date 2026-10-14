@@ -350,6 +350,14 @@ fn flush(f: &mut OpenFile) {
     }
 }
 
+/// The last reference to an open file can go away in many ways (close, dup2 over it,
+/// execve's close-on-exec, process exit): written data reaches the file system then.
+impl Drop for OpenFile {
+    fn drop(&mut self) {
+        flush(self);
+    }
+}
+
 impl Drop for FdTable {
     fn drop(&mut self) {
         for f in self.fds.drain(..).flatten() {
@@ -959,7 +967,7 @@ fn syscall_name(nr: u64) -> String {
         8 => "lseek", 9 => "mmap", 10 => "mprotect", 11 => "munmap", 12 => "brk", 13 => "rt_sigaction",
         14 => "rt_sigprocmask", 16 => "ioctl", 17 => "pread64", 19 => "readv", 20 => "writev", 21 => "access",
         22 => "pipe", 23 => "select", 24 => "sched_yield", 25 => "mremap", 28 => "madvise", 32 => "dup", 33 => "dup2",
-        39 => "getpid", 77 => "ftruncate", 87 => "unlink", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
+ 39 => "getpid", 40 => "sendfile", 57 => "fork", 58 => "vfork", 59 => "execve", 61 => "wait4", 62 => "kill", 77 => "ftruncate", 87 => "unlink", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
         42 => "connect", 49 => "bind", 53 => "socketpair", 307 => "sendmmsg", 56 => "clone", 60 => "exit", 63 => "uname", 72 => "fcntl", 79 => "getcwd",
         89 => "readlink", 96 => "gettimeofday", 97 => "getrlimit", 99 => "sysinfo", 137 => "statfs", 138 => "fstatfs",
         157 => "prctl", 158 => "arch_prctl", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
@@ -1985,6 +1993,23 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 v.len() as i64
             }
             334 => return Err(ENOSYS), // rseq: glibc copes without it
+            40 | 326 => {
+                // sendfile(out, in, offset*, count), copy_file_range(in, off_in*, out, off_out*, len, flags)
+                let (out_fd, in_fd, in_off, out_off, count) = if nr == 40 { (a0, a1, a2, 0, a3) } else { (a2, a0, a1, a3, a4) };
+                let (src, dst) = (fds().get(in_fd as i64)?, fds().get(out_fd as i64)?);
+                let count = (count as usize).min(1 << 20);
+                let at_in = if in_off != 0 { Some(read_u64(in_off)? as usize) } else { None };
+                let at_out = if out_off != 0 { Some(read_u64(out_off)? as usize) } else { None };
+                let data = do_read(&src, count, at_in)?;
+                let n = if data.is_empty() { 0 } else { do_write(&dst, &data, at_out)? };
+                if let Some(p) = at_in {
+                    write_u64(in_off, (p + data.len()) as u64)?;
+                }
+                if let Some(p) = at_out {
+                    write_u64(out_off, (p + n) as u64)?;
+                }
+                n as i64
+            }
             57 | 58 => process::fork(f, nr == 58, 0, None)? as i64, // fork, vfork
             59 | 322 => {
                 // execve(path, argv, envp), execveat(dirfd, path, argv, envp, flags)

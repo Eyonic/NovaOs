@@ -20,7 +20,8 @@ log "Creating disk image $image${cmdline:+ (cmdline: $cmdline)}"
 mkdir -p "$(dirname "$image")"
 rm -f "$image"
 # 64 MiB, or more when the image carries large files (the Chromium engine).
-payload_mb=$(( ( $(du -sbL "$KERNEL_ELF" "$BUILD/userland" "$BUILD/sysroot" 2>/dev/null | awk '{s+=$1} END {print s+0}') >> 20 ) ))
+# Links in the sysroot (BusyBox tools) are not counted: mkpak.py stores them as aliases.
+payload_mb=$(( ( $( (du -sbL "$KERNEL_ELF" "$BUILD/userland"; du -sb "$BUILD/sysroot") 2>/dev/null | awk '{s+=$1} END {print s+0}') >> 20 ) ))
 image_mb=$(( payload_mb + 64 > 64 ? payload_mb + 64 : 64 ))
 truncate -s "${image_mb}M" "$image"   # sparse: uses only the space actually written
 sfdisk --quiet "$image" <<'PART' >>"$BUILD_LOG" 2>&1 || fail "sfdisk failed (log: $BUILD_LOG)"

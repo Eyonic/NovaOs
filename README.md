@@ -33,7 +33,7 @@ for an app and it writes, checks and opens it.
 | Core apps | Native Rust apps in Nova's style: **Terminal** (smooth monospace font, 2,000 lines of scrollback on the wheel, command blocks, block cursor), **Text Editor** (file explorer, tabs, syntax colours, mouse selection, clipboard, undo/redo, Ctrl-F find, Ctrl-P quick open), **Files** (places, breadcrumbs, search, grid with thumbnails or list, preview pane, open/duplicate/copy path/delete), **System Monitor** (live CPU/memory/storage/network graphs, apps and tasks with End, hardware and drivers), **Settings** (assistant, network, storage and install, privacy and Shields, about) |
 | Assistant | Nova Assistant on DeepSeek (or Claude Code on Anthropic); sign-in from the host's key or Anthropic CLI login, streaming agent loop with tools (files, shell, HTTP, hardware, web search), app creation with screenshot checks |
 | Apps | Rhai scripts with a drawing API (including PNG images); the assistant designs them with a generated mockup, builds them with generated artwork, and they appear on Home |
-| Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory; processes (fork, vfork, posix_spawn, execve with `#!` scripts, wait) and signals (handlers, masks, kill, SIGCHLD) |
+| Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory; processes (fork, vfork, posix_spawn, execve with `#!` scripts, wait) and signals (handlers, masks, kill, SIGCHLD); with BusyBox, a Unix shell and ~400 tools (`sh`, then pipelines, loops, `tar`, `awk`, ...) |
 | Browser | Nova Browser: the Chromium engine (rendering, JavaScript, TLS) driven by a Rust shell with Shields (ad/tracker blocking, HTTPS upgrades, tracking-parameter removal) |
 
 ## Quick start
@@ -43,6 +43,7 @@ scripts/check-prereqs.sh   # see docs/setup.md
 scripts/fetch-chromium.sh  # optional: the browser engine (about 100 MB download)
 scripts/fetch-filters.sh   # optional: EasyList + EasyPrivacy for Shields (recommended)
 scripts/fetch-linux.sh     # optional: Linux source for FEATURES=linux-drivers (docs/linux-drivers.md)
+scripts/fetch-busybox.sh   # optional: BusyBox, a Unix userland (sh, coreutils, tar, ...) in bin/
 scripts/build.sh           # kernel, user programs, build/nova.img
 scripts/run.sh             # boot like a real machine: installer image + empty 2 GiB disk
 ```

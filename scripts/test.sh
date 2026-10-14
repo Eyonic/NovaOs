@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -140,6 +140,20 @@ define_case() {
                         "  ok   posix_spawn(/bin/hello)" "  ok   kill(child, SIGTERM): WIFSIGNALED, WTERMSIG == SIGTERM"
                         "proctest: 15 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall") ;;
+        busybox) # A Unix userland on Nova: BusyBox's shell runs pipelines, loops, subshells and
+                # command substitution, which fork, execve, wait and pipes underneath.
+                CMDLINE="nova.mode=shell"
+                [[ -x "$BUILD/busybox/busybox" ]] || SKIP="BusyBox not built (scripts/fetch-busybox.sh)"
+                INPUT=("wait:$PROMPT" "ser:sh" "sleep:1" "ser:echo \$((6*7))" "wait:42"
+                       "ser:for i in a b c; do echo item-\$i; done" "wait:item-c"
+                       "ser:x=\$(echo sub | tr a-z A-Z); echo got-\$x" "wait:got-SUB"
+                       "ser:(echo inner; exit 3); echo status=\$?" "wait:status="
+                       "ser:echo saved > /tmp/t.txt; cat /tmp/t.txt" "wait:saved"
+                       "ser:seq 1 5 | awk '{s+=\$1} END {print \"sum=\" s}'" "wait:sum="
+                       "ser:exit" "wait:$PROMPT")
+                EXPECT=("${shell[@]}" "42" "item-a" "item-b" "item-c" "got-SUB" "inner" "status=3" "saved" "sum=15")
+                CONTAINS=("Unix tools (BusyBox: sh, ls, tar, ...)")
+                FORBID=("$PANIC" "$EXC" "NESTED" "unimplemented Linux syscall" "segmentation fault") ;;
         net)    # Linux sockets: glibc DNS (UDP) and TCP, against the local mock server.
                 CMDLINE="nova.mode=shell"; MOCK=1
                 INPUT=("wait:$PROMPT" "ser:nettest 10.0.2.2:$MOCK_PORT" "wait:bytes")

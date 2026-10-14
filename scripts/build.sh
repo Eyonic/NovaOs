@@ -110,6 +110,15 @@ if [[ -x "$CHROMIUM/chrome-headless-shell" ]]; then
         [[ -f "/usr/share/fonts/$f" ]] && { mkdir -p "$SYSROOT/usr/share/fonts/$(dirname "$f")"; cp -L "/usr/share/fonts/$f" "$SYSROOT/usr/share/fonts/$f"; }
     done
 fi
+# BusyBox (scripts/fetch-busybox.sh), if built: bin/busybox plus one link per tool.
+if [[ -x "$BUILD/busybox/busybox" ]]; then
+    log "Including BusyBox $(cat "$BUILD/busybox/VERSION") ($(wc -l < "$BUILD/busybox/applets") tools)"
+    mkdir -p "$SYSROOT/bin"
+    cp "$BUILD/busybox/busybox" "$SYSROOT/bin/busybox"
+    while read -r tool; do
+        [[ -n "$tool" && "$tool" != busybox && ! -e "$SYSROOT/bin/$tool" ]] && ln -s busybox "$SYSROOT/bin/$tool"
+    done < "$BUILD/busybox/applets"
+fi
 # The dynamic loader looks in /usr/lib: make sure every library is there.
 if [[ -d "$SYSROOT/usr/lib64" ]]; then mkdir -p "$SYSROOT/usr/lib"; cp -n "$SYSROOT"/usr/lib64/* "$SYSROOT/usr/lib/" 2>/dev/null || true; fi
 

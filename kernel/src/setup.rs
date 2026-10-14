@@ -51,14 +51,18 @@ pub fn hardware() {
     println!("  {GREEN}\u{2713}{RESET} storage: {}", install::mount_system());
     apps::install_bundled();
     let installed = crate::process::install_bundled_programs();
-    let (programs, libs): (Vec<String>, Vec<String>) = installed.into_iter().partition(|p| !p.contains('/'));
+    let (programs, files): (Vec<String>, Vec<String>) = installed.into_iter().partition(|p| !p.contains('/'));
+    // System files under bin/ are Unix tools (BusyBox); shared libraries live in usr/lib.
+    let (tools, files): (Vec<String>, Vec<String>) = files.into_iter().partition(|p| p.starts_with("bin/"));
+    let libs = files.iter().filter(|p| p.contains(".so")).count();
     if !programs.is_empty() {
+        let tools = if tools.is_empty() { String::new() } else { format!(", {} Unix tools (BusyBox: sh, ls, tar, ...)", tools.len()) };
         println!(
-            "  {GREEN}\u{2713}{RESET} C/C++ compatibility: Linux x86-64 ABI ({}), {} programs in bin/ ({}), {} shared libraries",
+            "  {GREEN}\u{2713}{RESET} C/C++ compatibility: Linux x86-64 ABI ({}), {} programs in bin/ ({}){tools}, {} shared libraries",
             crate::process::simd_summary(),
             programs.len(),
             programs.join(", "),
-            libs.len()
+            libs
         );
     }
     // Devices whose driver Claude already ported on an earlier boot.
