@@ -118,7 +118,7 @@ fn fmt_time(t: u64) -> String {
 
 /// Paths hidden from the file manager: the read-only system libraries and engine.
 fn hidden(path: &str) -> bool {
-    ["usr/", "lib/", "lib64/", "opt/", "etc/", "bin/"].iter().any(|h| path.starts_with(h))
+    ["usr/", "lib/", "lib64/", "opt/", "etc/", "bin/", "var/", "tmp/", "appdata/"].iter().any(|h| path.starts_with(h)) || path.split('/').any(|p| p.starts_with('.'))
 }
 
 struct Files {
@@ -649,7 +649,7 @@ impl Files {
         c.fill_rect(Rect::new(px, TOP_H, 1, h - TOP_H - STATUS_H), ui::BORDER);
         match self.selected_entry().cloned() {
             None => {
-                let msg = format!("{} items", self.entries.len());
+                let msg = items(self.entries.len());
                 font::draw(&mut c, px + 20, TOP_H + 24, &msg, 15, Weight::Bold, ui::TEXT);
                 for (i, line) in ["Select a file to preview it.", "Double-click or Enter opens.", "Ctrl-F search, Ctrl-L view,", "Ctrl-N new note."].iter().enumerate() {
                     font::draw(&mut c, px + 20, TOP_H + 56 + i as i32 * 22, line, 13, Weight::Regular, ui::DIM);
@@ -704,7 +704,8 @@ impl Files {
             format!("{} results for \u{201c}{}\u{201d}", self.entries.len(), self.search)
         } else {
             let files = self.entries.iter().filter(|e| !e.folder).count();
-            format!("{} folders, {} files", self.entries.len() - files, files)
+            let folders = self.entries.len() - files;
+            format!("{} folder{}, {} file{}", folders, if folders == 1 { "" } else { "s" }, files, if files == 1 { "" } else { "s" })
         };
         font::draw(&mut c, sb.x + 14, sb.y + 6, &left, 13, Weight::Regular, if self.message.is_empty() { ui::DIM } else { ui::TEXT });
         wm::present(&self.win, &c);

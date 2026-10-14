@@ -7,14 +7,17 @@ drivers (the assistant drafts ports for anything without a driver), offers to in
 disk, and then drops you into a desktop. On the desktop, the assistant is the app creator: ask
 for an app and it writes, checks and opens it.
 
-![Nova Home: hero banner with a live app preview and rows of poster cards with generated artwork](docs/screenshots/home.png)
+![Nova Home: tabs, portrait covers and the focused app's artwork as the backdrop](docs/screenshots/home.png)
 
-![An app window (System Monitor) in Nova's window style over Home](docs/screenshots/app-window.png)
+![The assistant's chat panel opened from the bubble (F1), over Home's Continue shelf of live windows](docs/screenshots/assistant.png)
+
+| | |
+|---|---|
+| ![Library: every app as a cover](docs/screenshots/library.png) | ![Files: places, breadcrumbs, preview pane](docs/screenshots/files.png) |
+| ![Text Editor: explorer, tabs, syntax colours](docs/screenshots/editor.png) | ![Terminal: smooth monospace text and command blocks](docs/screenshots/terminal.png) |
+| ![System Monitor: live graphs](docs/screenshots/monitor.png) | ![Settings: sections and cards](docs/screenshots/settings.png) |
 
 ![Nova Browser: the Chromium engine with Shields, glyph toolbar and blocked-request badge](docs/screenshots/browser.png)
-
-**Milestone 0.4.** Everything runs in QEMU. Nothing here writes to your real disks, ESP or host
-bootloader; the "disks" are files under `build/`.
 
 ## What works
 
@@ -26,8 +29,8 @@ bootloader; the "disks" are files under `build/`.
 | Drivers | Intel e1000 Ethernet, AHCI SATA, PS/2 keyboard and mouse (absolute pointer via vmmouse), serial, framebuffer, RTC |
 | Internet | DHCP, DNS, TCP (smoltcp); HTTPS with certificate verification (rustls + RustCrypto + Mozilla roots) |
 | Storage | GPT, NovaFS (Nova's filesystem), installer that copies Nova onto a second disk |
-| Desktop | Nova Home: a full-screen launcher with a hero banner and rows of poster cards (open windows with live thumbnails, AI app ideas, your apps, apps, web favourites, system), live previews on hover, mouse/wheel/arrow-key navigation; no taskbar: the Windows key always brings back Home, right-click a running window's poster to stop it; System Monitor, Settings |
-| Core apps | Native Rust apps in Nova's style: **Terminal** (smooth monospace font, 2,000 lines of scrollback on the wheel, command blocks, block cursor), **Text Editor** (file explorer, tabs, syntax colours, mouse selection, clipboard, undo/redo, Ctrl-F find, Ctrl-P quick open), **Files** (places, breadcrumbs, search, grid with thumbnails or list, preview pane, open/duplicate/copy path/delete) |
+| Desktop | Nova Home, in the style of TV/console launchers: Home, Library and Web tabs, shelves of portrait covers (open windows as live thumbnails, your apps, apps, sites, system), the focused item's artwork as a full-screen backdrop, live app previews, keyboard hints; no taskbar: the Windows key brings back Home, right-click a running window's cover to stop it. The assistant is a chat bubble in the bottom-right corner (click it or press F1) |
+| Core apps | Native Rust apps in Nova's style: **Terminal** (smooth monospace font, 2,000 lines of scrollback on the wheel, command blocks, block cursor), **Text Editor** (file explorer, tabs, syntax colours, mouse selection, clipboard, undo/redo, Ctrl-F find, Ctrl-P quick open), **Files** (places, breadcrumbs, search, grid with thumbnails or list, preview pane, open/duplicate/copy path/delete), **System Monitor** (live CPU/memory/storage/network graphs, apps and tasks with End, hardware and drivers), **Settings** (assistant, network, storage and install, privacy and Shields, about) |
 | Assistant | Nova Assistant on DeepSeek (or Claude Code on Anthropic); sign-in from the host's key or Anthropic CLI login, streaming agent loop with tools (files, shell, HTTP, hardware, web search), app creation with screenshot checks |
 | Apps | Rhai scripts with a drawing API (including PNG images); the assistant designs them with a generated mockup, builds them with generated artwork, and they appear on Home |
 | Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory |

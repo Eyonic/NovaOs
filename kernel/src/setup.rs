@@ -237,8 +237,9 @@ pub fn run() -> ! {
             crate::shell::run();
         }
     }
-    // Claude Code opens on the desktop; its terminal also mirrors the serial line.
-    wm::spawn_terminal(claude::app_name(), '*', 0xD97757, true, |_| claude::run_cli());
+    // Its terminal also mirrors the serial line.
+    // The assistant waits behind its bubble (bottom-right) until clicked.
+    wm::spawn_assistant(true, false, None);
     loop {
         task::wait_event();
     }

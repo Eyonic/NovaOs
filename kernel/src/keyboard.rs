@@ -120,6 +120,7 @@ impl Decoder {
             (true, 0x49) => return Some(Key::PageUp),
             (true, 0x51) => return Some(Key::PageDown),
             (true, 0x53) => return Some(Key::Delete),
+            (false, 0x3B) => return Some(Key::F1),
             (true, 0x1C) => return Some(Key::Char(b'\n')), // keypad Enter
             (true, 0x35) => return Some(Key::Char(b'/')),  // keypad /
             (false, m) if (m as usize) < NORMAL.len() => {

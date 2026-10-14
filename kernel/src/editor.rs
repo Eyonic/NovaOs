@@ -526,8 +526,8 @@ impl Editor {
     /// Files shown in the sidebar and quick open: the user's files and the bundled
     /// apps (not the read-only libraries and engine).
     fn files() -> Vec<String> {
-        let hidden = ["usr/", "lib/", "lib64/", "opt/", "etc/", "bin/", "appdata/", "system/shields/"];
-        fs::list("").into_iter().map(|(n, ..)| n).filter(|n| !hidden.iter().any(|h| n.starts_with(h))).collect()
+        let hidden = ["usr/", "lib/", "lib64/", "opt/", "etc/", "bin/", "var/", "tmp/", "appdata/", "system/shields/"];
+        fs::list("").into_iter().map(|(n, ..)| n).filter(|n| !hidden.iter().any(|h| n.starts_with(h)) && !n.split('/').any(|p| p.starts_with('.'))).collect()
     }
 
     // ----- layout -----
@@ -837,7 +837,15 @@ impl Editor {
     }
 
     fn quick_open_list(&self) -> Vec<String> {
-        let mut scored: Vec<(i32, String)> = Self::files().into_iter().filter_map(|f| ui::fuzzy(&self.query, &f).map(|s| (s, f))).collect();
+        // Matches inside the file name rank well above matches spread over the path.
+        let mut scored: Vec<(i32, String)> = Self::files()
+            .into_iter()
+            .filter_map(|f| {
+                let name = f.rsplit('/').next().unwrap_or(&f);
+                let s = ui::fuzzy(&self.query, name).map(|s| s + 100).or_else(|| ui::fuzzy(&self.query, &f))?;
+                Some((s, f))
+            })
+            .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         scored.into_iter().take(12).map(|(_, f)| f).collect()
     }

@@ -136,13 +136,17 @@ define_case() {
                 CONTAINS=("nettest: HTTP/1.1 404 Not Found" "nettest: MSG_PEEK kept the data")
                 FORBID=("$PANIC" "$EXC" "segmentation fault" "illegal instruction") ;;
         apps)   # Native apps on the desktop: the Text Editor with a sample file (quick open,
-                # find) and Files (grid, preview, list), with screenshots for review.
-                CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1; CASE_TIMEOUT=120
+                # find), Files (grid, preview, list), System Monitor, Settings and Home (Home and
+                # Library tabs), with screenshots for review.
+                CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1; CASE_TIMEOUT=180
                 INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:> " "ser:show the editor" "wait:The editor is open."
                        "sleep:2" "dump:editor.ppm" "key:ctrl-p" "key:h" "key:e" "sleep:1" "dump:editor-open.ppm"
                        "key:esc" "key:ctrl-f" "key:w" "key:o" "key:r" "key:d" "key:ret" "sleep:1" "dump:editor-find.ppm"
-                       "key:esc" "ser:/clear" "wait:conversation cleared" "ser:show the files" "wait:Files is open." "sleep:2" "dump:files.ppm"
-                       "key:right" "key:right" "sleep:1" "dump:files-preview.ppm" "key:ctrl-l" "sleep:1" "dump:files-list.ppm")
+                       "key:esc" "ser:/clear" "wait:conversation cleared" "ser:open app system/apps/files.rhai" "wait:The app is open." "sleep:2" "dump:files.ppm"
+                       "key:right" "key:right" "sleep:1" "dump:files-preview.ppm" "key:ctrl-l" "sleep:1" "dump:files-list.ppm"
+                       "ser:/clear" "wait:conversation cleared" "ser:open app system/apps/monitor.rhai" "wait:The app is open." "sleep:4" "dump:monitor.ppm"
+                       "ser:/clear" "wait:conversation cleared" "ser:open app system/apps/settings.rhai" "wait:The app is open." "sleep:2" "dump:settings.ppm"
+                       "key:meta_l" "sleep:2" "dump:home.ppm" "key:tab" "sleep:2" "dump:library.ppm")
                 EXPECT=("$EXPECTED_BANNER" "⏺ Launch(notes/hello.rs)")
                 CONTAINS=("The editor is open.")
                 FORBID=("$PANIC" "$EXC" "API error") ;;

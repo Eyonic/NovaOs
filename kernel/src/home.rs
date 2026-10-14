@@ -1,9 +1,11 @@
-//! Nova Home: the desktop's full-screen launcher.
+//! Nova Home: the desktop's full-screen launcher (in the design language of TV and
+//! console launchers such as Steam Big Picture, implemented for Nova).
 //!
-//! A hero banner at the top shows the selected item large (artwork, title, description,
-//! an Open button and a live preview); below it, rows of poster cards by category:
-//! open windows (live thumbnails), the assistant and app ideas, apps, favourite web
-//! sites, and system actions. Hovering a card enlarges it and, after a moment, plays a
+//! Tabs in the header (Home, Library, Web); the focused item's artwork fills the
+//! screen behind everything; its title, description, an Open button and a live preview
+//! sit at the top; below, shelves of portrait covers: open windows (live thumbnails),
+//! your apps, apps, all apps in the Library grid, web sites, and system actions. The
+//! assistant is not here: it is the chat bubble in the corner. Hovering a card enlarges it and, after a moment, plays a
 //! live preview (apps are run headlessly and re-rendered every second). Mouse, wheel and
 //! arrow keys + Enter all work.
 //!
@@ -22,16 +24,17 @@ use crate::wm::{self, Action};
 use crate::font::{self, Weight};
 use crate::{apps, fs, pit, rtc, task};
 
-const CARD_W: i32 = 224;
-const CARD_H: i32 = 126;
-const ZOOM_W: i32 = 264;
-const ZOOM_H: i32 = 148;
-const GAP: i32 = 18;
+// Portrait covers (2:3-ish), like game capsules.
+const CARD_W: i32 = 150;
+const CARD_H: i32 = 214;
+const ZOOM_W: i32 = 172;
+const ZOOM_H: i32 = 246;
+const GAP: i32 = 20;
 const MARGIN: i32 = 44;
-const TOP_BAR: i32 = 52;
-const HERO_H: i32 = 300;
-const ROW_H: i32 = 198;
-const ROW_TITLE: i32 = 40;
+const TOP_BAR: i32 = 68;
+const HERO_H: i32 = 232;
+const ROW_H: i32 = 292;
+const ROW_TITLE: i32 = 42;
 /// Hover time before a card's preview starts (ticks).
 const PREVIEW_DELAY: u64 = pit::HZ * 6 / 10;
 
@@ -68,6 +71,7 @@ impl Item {
     }
 }
 
+#[derive(Clone)]
 struct Row {
     title: &'static str,
     items: Vec<Item>,
@@ -86,7 +90,11 @@ pub struct OpenWindow {
 pub struct Home {
     width: i32,
     height: i32,
+    /// The current tab's rows.
     rows: Vec<Row>,
+    tab: usize,
+    tab_names: Vec<&'static str>,
+    tab_rows: Vec<Vec<Row>>,
     sel: (usize, usize),
     top_row: usize,
     /// The selection follows the mouse (zoom + preview) rather than the keyboard.
@@ -94,7 +102,8 @@ pub struct Home {
     sel_since: u64,
     preview_on: bool,
     posters: Vec<(String, bool, Canvas)>,
-    hero: Option<(String, Canvas)>,
+    /// Full-screen backdrop for the focused item (cached by item).
+    backdrop: Option<(String, Canvas)>,
     background: Canvas,
     /// Network, CPU, memory and clock, shown in the header.
     status: String,
@@ -279,16 +288,29 @@ impl Home {
             }
             None => background.gradient(background.bounds(), 0x161827, BG),
         }
-        Self { width, height, rows: Vec::new(), sel: (0, 0), top_row: 0, hovering: false, sel_since: 0, preview_on: false, posters: Vec::new(), hero: None, background, status: String::new(), cursor: (-1, -1), menu: None }
+        Self {
+            width,
+            height,
+            rows: Vec::new(),
+            tab: 0,
+            tab_names: Vec::new(),
+            tab_rows: Vec::new(),
+            sel: (0, 0),
+            top_row: 0,
+            hovering: false,
+            sel_since: 0,
+            preview_on: false,
+            posters: Vec::new(),
+            backdrop: None,
+            background,
+            status: String::new(),
+            cursor: (-1, -1),
+            menu: None,
+        }
     }
 
     pub fn set_status(&mut self, status: &str) {
         self.status = status.into();
-    }
-
-    /// The static page background (drawn under everything).
-    pub fn background(&self) -> &Canvas {
-        &self.background
     }
 
     /// Rebuild the rows from the installed apps and open windows.
@@ -315,39 +337,7 @@ impl Home {
             rows.push(Row { title: "Continue", items, scroll: 0 });
         }
 
-        let assistant = crate::claude::app_name();
-        let idea = |title: &str, art: &'static str, about: &str, prompt: &str, color: u32| Item {
-            title: title.into(),
-            category: "Create with AI",
-            about: about.into(),
-            meta: format!("Opens {assistant} with this request"),
-            icon: '*',
-            color,
-            art: Some(art),
-            kind: Kind::Other,
-            action: Action::Ask(prompt.into()),
-        };
-        rows.push(Row {
-            title: "Create with AI",
-            items: alloc::vec![
-                Item {
-                    title: assistant.into(),
-                    category: "Create with AI",
-                    about: format!("Your AI assistant. Ask it to build apps, explain this computer, write files or port drivers. {}", crate::claude::short_status()),
-                    meta: "Builds apps with generated artwork".into(),
-                    icon: '*',
-                    color: 0xD97757,
-                    art: Some("assistant"),
-                    kind: Kind::Other,
-                    action: Action::Claude,
-                },
-                idea("Build a game", "idea_game", "A small arcade game with generated artwork, made for you in a minute or two.", "Make me a fun little arcade game app with generated artwork and a high score.", 0x3FA7D6),
-                idea("Weather app", "idea_weather", "A weather dashboard for your city, with illustrations for each kind of weather.", "Make me a weather app that shows the current weather and forecast for my city, with generated illustrations.", 0x4CAF7A),
-                idea("Day planner", "idea_planner", "Plan your day: tasks, times and a progress bar, saved on this computer.", "Make me a day planner app where I can add tasks with times and check them off. Save them.", 0xC9A227),
-                idea("Light show", "idea_music", "An animated, colourful visualiser to leave running.", "Make me an animated light show app with flowing neon waves.", 0x9C5BD6),
-            ],
-            scroll: 0,
-        });
+        // The assistant has no row: it is the bubble in the bottom-right corner.
 
         let mut user_apps = Vec::new();
         let mut system_apps = Vec::new();
@@ -448,6 +438,26 @@ impl Home {
             scroll: 0,
         });
 
+        // Tabs: Home (what you use), Library (everything, as a grid), Web.
+        let per_row = self.visible_cards();
+        let grid = |title: &'static str, items: Vec<Item>| -> Vec<Row> {
+            items.chunks(per_row).enumerate().map(|(i, chunk)| Row { title: if i == 0 { title } else { "" }, items: chunk.to_vec(), scroll: 0 }).collect()
+        };
+        let take = |t: &str| rows.iter().find(|r| r.title == t).map(|r| r.items.clone()).unwrap_or_default();
+        let mut library_items = take("Apps");
+        library_items.extend(take("Your apps"));
+        let mut library = grid("All apps", library_items);
+        library.push(Row { title: "System", items: take("System"), scroll: 0 });
+        let home: Vec<Row> = rows.iter().filter(|r| matches!(r.title, "Continue" | "Your apps" | "Apps")).cloned().collect();
+        self.tab_names = alloc::vec!["Home", "Library"];
+        self.tab_rows = alloc::vec![home, library];
+        if browser {
+            self.tab_names.push("Web");
+            self.tab_rows.push(grid("Sites", take("Web")));
+        }
+        self.tab = self.tab.min(self.tab_rows.len() - 1);
+        let mut rows = self.tab_rows[self.tab].clone();
+
         // Keep the scroll positions and the selection where possible.
         for row in rows.iter_mut() {
             if let Some(old) = self.rows.iter().find(|r| r.title == row.title) {
@@ -460,8 +470,33 @@ impl Home {
         });
         self.sel = found.unwrap_or((self.sel.0.min(self.rows.len() - 1), 0));
         self.sel.1 = self.sel.1.min(self.rows[self.sel.0].items.len().saturating_sub(1));
-        let keys: Vec<String> = self.rows.iter().flat_map(|r| r.items.iter().map(|i| i.key())).collect();
+        let keys: Vec<String> = self.tab_rows.iter().flatten().flat_map(|r| r.items.iter().map(|i| i.key())).collect();
         self.posters.retain(|(k, ..)| keys.contains(k));
+        self.ensure_visible();
+    }
+
+    fn switch_tab(&mut self, tab: usize) {
+        if tab >= self.tab_rows.len() || tab == self.tab {
+            return;
+        }
+        self.tab = tab;
+        self.rows = self.tab_rows[tab].clone();
+        self.top_row = 0;
+        self.select((0, 0));
+        self.menu = None;
+    }
+
+    fn tab_rects(&self) -> Vec<Rect> {
+        let widths: Vec<i32> = self.tab_names.iter().map(|t| font::width(t, 16, Weight::Bold) + 36).collect();
+        let mut x = MARGIN + font::width("nova", 28, Weight::Bold) + 36;
+        widths
+            .iter()
+            .map(|tw| {
+                let r = Rect::new(x, 16, *tw, 36);
+                x += tw + 8;
+                r
+            })
+            .collect()
     }
 
     fn selected(&self) -> Option<&Item> {
@@ -475,13 +510,17 @@ impl Home {
         self.sel = sel;
         self.sel_since = pit::ticks();
         self.preview_on = false;
+        // Keyboard and programmatic moves scroll; the mouse only picks what is visible.
+        if !self.hovering {
+            self.ensure_visible();
+        }
         true
     }
 
     // ----- layout -----
 
     fn rows_y(&self) -> i32 {
-        TOP_BAR + HERO_H + 14
+        TOP_BAR + HERO_H + 10
     }
 
     fn visible_cards(&self) -> usize {
@@ -502,7 +541,7 @@ impl Home {
     }
 
     fn open_button(&self) -> Rect {
-        Rect::new(MARGIN, TOP_BAR + HERO_H - 70, 140, 44)
+        Rect::new(MARGIN, TOP_BAR + HERO_H - 54, 140, 44)
     }
 
     fn chevrons(&self, r: usize) -> Option<(Rect, Rect)> {
@@ -520,7 +559,7 @@ impl Home {
                 row.scroll = c + 1 - vis;
             }
         }
-        let fits = (((self.height - wm::TASKBAR_H - self.rows_y()) / ROW_H).max(1)) as usize;
+        let fits = (((self.height - 60 - self.rows_y()) / ROW_H).max(1)) as usize;
         if r < self.top_row {
             self.top_row = r;
         } else if r >= self.top_row + fits {
@@ -583,6 +622,10 @@ impl Home {
         if let Some(menu) = self.menu.take() {
             return menu.entry_at(x, y).map(|i| menu.entries[i].1.clone());
         }
+        if let Some(t) = self.tab_rects().iter().position(|r| r.contains(x, y)) {
+            self.switch_tab(t);
+            return None;
+        }
         if self.open_button().contains(x, y) {
             return self.selected().map(|i| i.action.clone());
         }
@@ -622,6 +665,12 @@ impl Home {
         }
         let (r, c) = self.sel;
         match key {
+            Key::Char(b'\t') => {
+                // Tab: next section.
+                let next = (self.tab + 1) % self.tab_rows.len().max(1);
+                self.switch_tab(next);
+                return None;
+            }
             Key::Left => {
                 self.select((r, c.saturating_sub(1)));
             }
@@ -696,36 +745,45 @@ impl Home {
         let (w, h) = (self.width, self.height);
         let Some(item) = self.selected().cloned() else { return };
 
-        // Hero: full-width artwork with scrims, cached per item.
+        // Backdrop: the focused item's artwork across the whole screen, darkened, with a
+        // fade to the shelves and a darker left side under the hero text.
         let key = item.key();
-        if self.hero.as_ref().is_none_or(|(k, _)| *k != key) {
+        if self.backdrop.as_ref().is_none_or(|(k, _)| *k != key) {
             let mut c = match item.art.and_then(art) {
-                Some(a) => cover(&a, w, HERO_H),
+                Some(a) => cover(&a, w, h),
+                // No artwork: the wallpaper, tinted towards the item's colour.
                 None => {
-                    let mut c = Canvas::new(w as usize, HERO_H as usize);
-                    c.gradient(c.bounds(), darken(item.color, 90), darken(item.color, 200));
+                    let mut c = self.background.clone();
+                    c.blend_rect(c.bounds(), darken(item.color, 100), 60);
                     c
                 }
             };
+            c.blend_rect(c.bounds(), BG, 120);
             for x in 0..w * 3 / 5 {
-                let t = 235 - (x * 235 / (w * 3 / 5)) as u32;
-                c.blend_rect(Rect::new(x, 0, 1, HERO_H), BG, t);
+                let t = 200 - (x * 200 / (w * 3 / 5)) as u32;
+                c.blend_rect(Rect::new(x, 0, 1, h), BG, t);
             }
-            scrim(&mut c, HERO_H - 90, 255);
-            self.hero = Some((key, c));
+            scrim(&mut c, TOP_BAR + HERO_H / 2, 250);
+            self.backdrop = Some((key, c));
         }
-        if let Some((_, c)) = &self.hero {
-            scene.blit(c, c.bounds(), 0, TOP_BAR);
+        if let Some((_, c)) = &self.backdrop {
+            scene.blit(c, c.bounds(), 0, 0);
         }
-        // Blend the hero's top edge into the top bar.
-        for y in 0..TOP_BAR + 30 {
-            let t = if y < TOP_BAR { 255 } else { (255 - (y - TOP_BAR) * 255 / 30) as u32 };
-            scene.blend_rect(Rect::new(0, y, w, 1), BG, t * 3 / 5);
+        scene.gradient(Rect::new(0, 0, w, TOP_BAR), 0x08090E, 0x0B0C12);
+        scene.blend_rect(Rect::new(0, 0, w, TOP_BAR), BG, 60);
+
+        // Tabs.
+        for (i, (r, name)) in self.tab_rects().iter().zip(self.tab_names.iter()).enumerate() {
+            let active = i == self.tab;
+            if active {
+                scene.fill_round_rect(*r, r.h / 2, 0xF2F2F7);
+            }
+            let tw = font::width(name, 16, Weight::Bold);
+            font::draw(scene, r.x + (r.w - tw) / 2, r.y + 7, name, 16, Weight::Bold, if active { 0x12131A } else { DIM });
         }
 
         // Top bar: wordmark, date and time.
-        let end = font::draw(scene, MARGIN, 10, "nova", 28, Weight::Bold, ACCENT);
-        font::draw(scene, end + 10, 20, "home", 15, Weight::Regular, DIM);
+        font::draw(scene, MARGIN, 14, "nova", 28, Weight::Bold, ACCENT);
         let (_, mo, d, ..) = rtc::now();
         let when = format!("{} {} {}", weekday(rtc::unix_time()), d, MONTHS[(mo as usize).clamp(1, 12) - 1]);
         let when_w = font::width(&when, 15, Weight::Bold);
@@ -737,19 +795,19 @@ impl Home {
         let tx = MARGIN;
         let chip = item.category.to_uppercase();
         let chip_w = font::width(&chip, 12, Weight::Bold) + 22;
-        scene.fill_round_rect(Rect::new(tx, TOP_BAR + 28, chip_w, 24), 12, ACCENT);
-        font::draw(scene, tx + 11, TOP_BAR + 32, &chip, 12, Weight::Bold, 0xFFFFFF);
+        scene.fill_round_rect(Rect::new(tx, TOP_BAR + 14, chip_w, 24), 12, ACCENT);
+        font::draw(scene, tx + 11, TOP_BAR + 18, &chip, 12, Weight::Bold, 0xFFFFFF);
         let tmax = w * 11 / 20;
-        let tsize: u16 = if font::width(&item.title, 52, Weight::Bold) <= tmax { 52 } else { 40 };
-        font::draw_clipped(scene, tx + 2, TOP_BAR + 60 + 2, &item.title, tsize, Weight::Bold, 0x000000, tmax);
-        font::draw_clipped(scene, tx, TOP_BAR + 60, &item.title, tsize, Weight::Bold, TEXT, tmax);
-        let mut ty = TOP_BAR + 66 + font::line_height(tsize);
-        for line in font::wrap(&item.about, 17, Weight::Regular, w * 9 / 20, 3) {
-            font::draw(scene, tx, ty, &line, 17, Weight::Regular, 0xDCDCE6);
-            ty += 24;
+        let tsize: u16 = if font::width(&item.title, 46, Weight::Bold) <= tmax { 46 } else { 34 };
+        font::draw_clipped(scene, tx + 2, TOP_BAR + 44 + 2, &item.title, tsize, Weight::Bold, 0x000000, tmax);
+        font::draw_clipped(scene, tx, TOP_BAR + 44, &item.title, tsize, Weight::Bold, TEXT, tmax);
+        let mut ty = TOP_BAR + 50 + font::line_height(tsize);
+        for line in font::wrap(&item.about, 16, Weight::Regular, w * 9 / 20, 2) {
+            font::draw(scene, tx, ty, &line, 16, Weight::Regular, 0xDCDCE6);
+            ty += 22;
         }
-        if !item.meta.is_empty() {
-            font::draw_clipped(scene, tx, ty + 4, &item.meta, 14, Weight::Regular, DIM, w * 9 / 20);
+        if !item.meta.is_empty() && ty + 18 < self.open_button().y {
+            font::draw_clipped(scene, tx, ty + 2, &item.meta, 13, Weight::Regular, DIM, w * 9 / 20);
         }
         let open = self.open_button();
         scene.fill_round_rect(open, open.h / 2, 0xFFFFFF);
@@ -759,11 +817,11 @@ impl Home {
             scene.fill_rect(Rect::new(open.x + 26, open.y + 12 + i, half + 1, 1), 0x111111);
         }
         font::draw(scene, open.x + 46, open.y + 10, "Open", 17, Weight::Bold, 0x111111);
-        font::draw(scene, open.x + open.w + 20, open.y + 12, "Enter to open  \u{00b7}  arrows to browse  \u{00b7}  Windows key: Home", 14, Weight::Regular, DIM);
+
 
         // Live preview panel on the right of the hero.
-        let pw = (w * 7 / 20).min(448);
-        let panel = Rect::new(w - MARGIN - pw, TOP_BAR + 26, pw, pw * 9 / 16);
+        let pw = (w * 3 / 10).min(384);
+        let panel = Rect::new(w - MARGIN - pw, TOP_BAR + 14, pw, pw * 9 / 16);
         if matches!(item.kind, Kind::Window(_) | Kind::App(_)) {
             scene.shadow(panel, 14);
             scene.fill_round_rect(Rect::new(panel.x - 2, panel.y - 2, panel.w + 4, panel.h + 4), 12, 0x2A2C3E);
@@ -771,7 +829,10 @@ impl Home {
                 let i = self.poster(&item, true);
                 scene.blit_scaled(&self.posters[i].2, panel, 10, 255);
             }
-            font::draw(scene, panel.x + 2, panel.y + panel.h + 10, if matches!(item.kind, Kind::Window(_)) { "Live window" } else { "Live preview" }, 14, Weight::Regular, DIM);
+            let badge = if matches!(item.kind, Kind::Window(_)) { "LIVE WINDOW" } else { "LIVE PREVIEW" };
+            let bw = font::width(badge, 11, Weight::Bold) + 16;
+            scene.fill_round_rect(Rect::new(panel.x + 10, panel.y + 10, bw, 20), 10, 0xE5394B);
+            font::draw(scene, panel.x + 18, panel.y + 12, badge, 11, Weight::Bold, 0xFFFFFF);
         }
 
         // Rows.
@@ -783,8 +844,11 @@ impl Home {
                 break;
             }
             let title = self.rows[r].title;
-            let end = font::draw(scene, MARGIN, ry - 2, title, 19, Weight::Bold, TEXT);
-            font::draw(scene, end + 10, ry + 1, &format!("{}", self.rows[r].items.len()), 15, Weight::Regular, DIM);
+            if !title.is_empty() {
+                let end = font::draw(scene, MARGIN, ry - 2, title, 20, Weight::Bold, TEXT);
+                let count: usize = if self.tab == 1 && title == "All apps" { self.rows.iter().filter(|r| r.title != "System").map(|r| r.items.len()).sum() } else { self.rows[r].items.len() };
+                font::draw(scene, end + 10, ry + 1, &format!("{count}"), 15, Weight::Regular, DIM);
+            }
             for c in 0..self.rows[r].items.len() {
                 let Some(rect) = self.card_rect(r, c) else { continue };
                 if (r, c) == self.sel && zoomed {
@@ -840,6 +904,18 @@ impl Home {
                 scene.blend_rect(Rect::new(z.x, z.y + z.h - 32, z.w, 32), 0, 170);
                 font::draw_clipped(scene, z.x + 12, z.y + z.h - 27, &it.title, 16, Weight::Bold, TEXT, z.w - 24);
             }
+        }
+
+        // Key hints, bottom-left (no bar).
+        let mut hx = MARGIN;
+        let hy = h - 40;
+        scene.blend_rect(Rect::new(0, h - 60, w, 60), BG, 120);
+        for (key, label) in [("Enter", "Open"), ("Tab", "Section"), ("Arrows", "Move"), ("Windows key", "Home"), ("F1", "Assistant"), ("Right-click", "Options")] {
+            let kw = font::width(key, 12, Weight::Bold) + 16;
+            scene.fill_round_rect(Rect::new(hx, hy, kw, 24), 7, 0x2C2E40);
+            font::draw(scene, hx + 8, hy + 4, key, 12, Weight::Bold, TEXT);
+            hx += kw + 8;
+            hx = font::draw(scene, hx, hy + 3, label, 13, Weight::Regular, DIM) + 22;
         }
 
         // Context menu.

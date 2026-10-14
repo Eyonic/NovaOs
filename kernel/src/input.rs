@@ -27,6 +27,8 @@ pub enum Key {
     PageUp,
     PageDown,
     Delete,
+    /// F1: opens or tucks away the assistant's chat panel.
+    F1,
 }
 
 const RING_SIZE: usize = 256; // power of two

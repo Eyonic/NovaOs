@@ -157,6 +157,7 @@ fn key_name(k: Key) -> String {
         Key::PageUp => "PageUp".into(),
         Key::PageDown => "PageDown".into(),
         Key::Delete => "Delete".into(),
+        Key::F1 => "F1".into(),
     }
 }
 
@@ -473,6 +474,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 /// entries Home lists and other apps launch).
 const NATIVE_EDITOR: &str = "system/apps/editor.rhai";
 const NATIVE_FILES: &str = "system/apps/files.rhai";
+const NATIVE_MONITOR: &str = "system/apps/monitor.rhai";
+const NATIVE_SETTINGS: &str = "system/apps/settings.rhai";
 
 pub fn launch(path: &str) -> Result<(), String> {
     if path == NATIVE_EDITOR {
@@ -484,6 +487,14 @@ pub fn launch(path: &str) -> Result<(), String> {
     }
     if path == NATIVE_FILES {
         crate::files::open("");
+        return Ok(());
+    }
+    if path == NATIVE_MONITOR {
+        crate::monitor::open();
+        return Ok(());
+    }
+    if path == NATIVE_SETTINGS {
+        crate::settings::open();
         return Ok(());
     }
     if !path.ends_with(".rhai") {
@@ -592,7 +603,7 @@ pub fn check(path: &str, events: &[String]) -> Result<CheckReport, String> {
 /// Render an app's current frame without a window (for desktop previews): load it,
 /// run init, `ticks` ticks and draw. None if it fails.
 pub fn snapshot(path: &str, ticks: u32) -> Option<Canvas> {
-    if path == NATIVE_EDITOR || path == NATIVE_FILES {
+    if [NATIVE_EDITOR, NATIVE_FILES, NATIVE_MONITOR, NATIVE_SETTINGS].contains(&path) {
         return None; // native app: Home shows its poster
     }
     let src = fs::read_string(path).ok()?;

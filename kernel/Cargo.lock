@@ -658,7 +658,7 @@ dependencies = [
 
 [[package]]
 name = "nova-kernel"
-version = "0.4.0"
+version = "0.8.0"
 dependencies = [
  "fontdue",
  "getrandom",

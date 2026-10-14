@@ -36,16 +36,10 @@ const TERM_PAD: i32 = 14;
 const TERM_FONT: u16 = 15;
 
 pub mod theme {
-    pub const WALL_TOP: u32 = 0x1B1D33;
-    pub const WALL_BOTTOM: u32 = 0x3A2459;
     pub const ACCENT: u32 = 0x8B7CF6;
     pub const FRAME: u32 = 0x262837;
-    pub const TITLE_ACTIVE: u32 = 0x343750;
-    pub const TITLE_INACTIVE: u32 = 0x2A2C3C;
     pub const TEXT: u32 = 0xE8E8F2;
     pub const TEXT_DIM: u32 = 0x9A9CB0;
-    pub const TASKBAR: u32 = 0x12131D;
-    pub const PANEL: u32 = 0x1E2030;
     pub const HOVER: u32 = 0x3A3D58;
     pub const CLOSE: u32 = 0xEF5B6B;
     pub const MINIMIZE: u32 = 0xF2C14E;
@@ -244,8 +238,6 @@ pub enum Action {
     Url(String),
     /// Bring an open window to the front.
     Focus(usize),
-    /// Open the assistant with a first request.
-    Ask(String),
     /// Close an open window (stop the program running in it).
     Close(usize),
     Reboot,
@@ -257,9 +249,7 @@ pub fn launch(action: &Action) {
         Action::Terminal => {
             spawn_terminal("Terminal", '>', 0x3B4252, false, |_| crate::shell::run());
         }
-        Action::Claude => {
-            spawn_terminal(crate::claude::app_name(), '*', 0xD97757, false, |_| crate::claude::run_cli());
-        }
+        Action::Claude => toggle_assistant(),
         Action::Browser => crate::browser::launch(None),
         Action::Url(url) => crate::browser::launch(Some(url.clone())),
         Action::Focus(id) => {
@@ -280,10 +270,6 @@ pub fn launch(action: &Action) {
             }
             request_redraw();
         }
-        Action::Ask(prompt) => {
-            let p = prompt.clone();
-            spawn_terminal(crate::claude::app_name(), '*', 0xD97757, false, move |_| crate::claude::run_cli_with(Some(p)));
-        }
         Action::Script(path) => {
             if let Err(e) = apps::launch(path) {
                 crate::log::warn(&format!("could not start {path}: {e}"));
@@ -291,6 +277,56 @@ pub fn launch(action: &Action) {
         }
         Action::Reboot => crate::power::reboot(),
         Action::Shutdown => crate::power::shutdown(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The assistant: a chat panel docked bottom-right, behind a bubble that is always on
+// screen (like a chat widget on a website), so it never takes space until wanted.
+
+/// Window id of the assistant's chat panel (0 = not running).
+static ASSISTANT: AtomicUsize = AtomicUsize::new(0);
+const BUBBLE_R: i32 = 30;
+
+fn bubble_center() -> (i32, i32) {
+    let (w, h) = *SCREEN_SIZE.lock();
+    (w - 28 - BUBBLE_R, h - 28 - BUBBLE_R)
+}
+
+/// Start the assistant in its chat panel (`visible` false: behind the bubble).
+pub fn spawn_assistant(mirror_serial: bool, visible: bool, prompt: Option<String>) {
+    let win = spawn_terminal_sized(crate::claude::app_name(), '*', 0xD97757, mirror_serial, 64, 25, move |_| crate::claude::run_cli_with(prompt));
+    let (sw, sh) = *SCREEN_SIZE.lock();
+    let id = {
+        let mut w = win.lock();
+        w.x = (sw - w.w - 2 - 24).max(0);
+        w.y = (sh - w.h - TITLE_H - 28 - 2 * BUBBLE_R - 16).max(0);
+        w.minimized = !visible;
+        w.id
+    };
+    ASSISTANT.store(id, Ordering::Relaxed);
+    if visible {
+        launch(&Action::Focus(id));
+    } else if FOCUS.load(Ordering::Relaxed) == id {
+        FOCUS.store(0, Ordering::Relaxed);
+    }
+    request_redraw();
+}
+
+/// The bubble: show the assistant's panel, or tuck it away again.
+pub fn toggle_assistant() {
+    let id = ASSISTANT.load(Ordering::Relaxed);
+    let Some(win) = (id != 0).then(|| window_by_id(id)).flatten() else {
+        spawn_assistant(false, true, None);
+        return;
+    };
+    let showing = !win.lock().minimized && FOCUS.load(Ordering::Relaxed) == id;
+    if showing {
+        win.lock().minimized = true;
+        FOCUS.store(0, Ordering::Relaxed);
+        request_redraw();
+    } else {
+        launch(&Action::Focus(id));
     }
 }
 
@@ -302,7 +338,10 @@ fn term_cell() -> (i32, i32) {
 }
 
 pub fn spawn_terminal(title: &str, icon: char, accent: u32, mirror_serial: bool, f: impl FnOnce(&TtyRef) + Send + 'static) -> WindowRef {
-    let (cols, rows) = (96usize, 30usize);
+    spawn_terminal_sized(title, icon, accent, mirror_serial, 96, 30, f)
+}
+
+fn spawn_terminal_sized(title: &str, icon: char, accent: u32, mirror_serial: bool, cols: usize, rows: usize, f: impl FnOnce(&TtyRef) + Send + 'static) -> WindowRef {
     let tty = crate::tty::new(cols, rows, title, mirror_serial);
     let (cw, ch) = term_cell();
     let w = cols as i32 * cw + 2 * TERM_PAD;
@@ -461,8 +500,10 @@ impl Desktop {
     // ----- input -----
 
     fn refresh_home(&mut self) {
+        let assistant = ASSISTANT.load(Ordering::Relaxed);
         let list: Vec<crate::home::OpenWindow> = taskbar_order(&WINDOWS.lock())
             .iter()
+            .filter(|w| w.lock().id != assistant)
             .map(|w| {
                 let w = w.lock();
                 crate::home::OpenWindow { id: w.id, title: w.title.clone(), icon: w.icon, accent: w.accent }
@@ -479,6 +520,10 @@ impl Desktop {
     fn key(&mut self, key: Key) {
         // The Windows key always brings back Home: every window steps aside (minimized;
         // they stay in Home's Continue row).
+        if key == Key::F1 {
+            toggle_assistant();
+            return;
+        }
         if key == Key::Super {
             for w in WINDOWS.lock().iter() {
                 w.lock().minimized = true;
@@ -618,6 +663,11 @@ impl Desktop {
 
     fn press(&mut self, x: i32, y: i32, button: u8) -> bool {
         let sw = self.screen.width as i32;
+        let (bx, by) = bubble_center();
+        if (x - bx) * (x - bx) + (y - by) * (y - by) <= (BUBBLE_R + 4) * (BUBBLE_R + 4) {
+            toggle_assistant();
+            return true;
+        }
         // Windows, top to bottom.
         if let Some(win) = self.window_at(x, y) {
             let id = win.lock().id;
@@ -653,9 +703,7 @@ impl Desktop {
     // ----- drawing -----
 
     fn compose(&mut self) {
-        let bg = self.home.background();
-        self.scene.blit(bg, bg.bounds(), 0, 0);
-        self.home.draw(&mut self.scene);
+        self.home.draw(&mut self.scene); // includes the full-screen backdrop
 
         let focus = FOCUS.load(Ordering::Relaxed);
         let list: Vec<WindowRef> = WINDOWS.lock().clone();
@@ -664,6 +712,36 @@ impl Desktop {
             if !w.minimized {
                 draw_window(&mut self.scene, &w, w.id == focus);
             }
+        }
+        self.draw_bubble();
+    }
+
+    /// The assistant bubble (bottom-right, above everything).
+    fn draw_bubble(&mut self) {
+        let (cx, cy) = bubble_center();
+        let id = ASSISTANT.load(Ordering::Relaxed);
+        let win = (id != 0).then(|| window_by_id(id)).flatten();
+        let open = win.as_ref().is_some_and(|w| !w.lock().minimized) && FOCUS.load(Ordering::Relaxed) == id;
+        // New output while tucked away.
+        let unread = win.as_ref().is_some_and(|w| {
+            let w = w.lock();
+            w.minimized && matches!(&w.content, Content::Terminal(t) if t.try_lock().is_some_and(|t| t.grid.dirty))
+        });
+        for i in (1..=10).rev() {
+            self.scene.blend_rect(Rect::new(cx - BUBBLE_R - i + 2, cy - BUBBLE_R - i + 6, 2 * (BUBBLE_R + i) - 4, 2 * (BUBBLE_R + i) - 4), 0, 6);
+        }
+        self.scene.fill_circle(cx, cy, BUBBLE_R + 3, if open { theme::ACCENT } else { 0x2A2C3E });
+        let r = BUBBLE_R - 1;
+        crate::icons::draw(&mut self.scene, '*', 0xD97757, Rect::new(cx - r, cy - r, 2 * r, 2 * r));
+        if open {
+            // A small down chevron: click to tuck the chat away.
+            self.scene.fill_circle(cx + BUBBLE_R - 4, cy - BUBBLE_R + 4, 10, theme::ACCENT);
+            for i in 0..4 {
+                self.scene.fill_rect(Rect::new(cx + BUBBLE_R - 9 + i, cy - BUBBLE_R + 2 + i, 2, 2), 0xFFFFFF);
+                self.scene.fill_rect(Rect::new(cx + BUBBLE_R + 1 - i, cy - BUBBLE_R + 2 + i, 2, 2), 0xFFFFFF);
+            }
+        } else if unread {
+            self.scene.fill_circle(cx + BUBBLE_R - 6, cy - BUBBLE_R + 6, 8, 0xE5394B);
         }
     }
 
@@ -742,6 +820,25 @@ fn taskbar_order(list: &[WindowRef]) -> Vec<WindowRef> {
 
 fn window_by_id(id: usize) -> Option<WindowRef> {
     WINDOWS.lock().iter().find(|w| w.lock().id == id).cloned()
+}
+
+/// An open window, as listed by [`windows`].
+pub struct WindowInfo {
+    pub id: usize,
+    pub title: String,
+    pub icon: char,
+    pub accent: u32,
+}
+
+/// Open windows in opening order (System Monitor's app list).
+pub fn windows() -> Vec<WindowInfo> {
+    taskbar_order(&WINDOWS.lock())
+        .iter()
+        .map(|w| {
+            let w = w.lock();
+            WindowInfo { id: w.id, title: w.title.clone(), icon: w.icon, accent: w.accent }
+        })
+        .collect()
 }
 
 /// Box-drawing characters drawn as lines that fill the whole cell, so frames join up

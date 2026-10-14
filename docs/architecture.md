@@ -341,7 +341,19 @@ for the editor, Finder and Dolphin for files), sharing `ui.rs` (palette, clipboa
 - **Files** (`files.rs`): folders are path prefixes; grid with PNG thumbnails and app icons
   or a list with kind, size and age; preview pane; `system/apps/files.rhai` routes here.
 
-The keyboard driver also decodes Home, End, Page Up/Down and Delete for them.
+- **System Monitor** (`monitor.rs`): one-second samples of CPU, memory, storage and network
+  into 60-sample histories (sparklines and an area chart); open windows with End; tasks;
+  storage and PCI devices with driver status.
+- **Settings** (`settings.rs`): assistant, network, storage and install (runs the installer),
+  Shields (re-enables sites), about.
+
+The keyboard driver also decodes Home, End, Page Up/Down, Delete and F1 for them.
+
+The assistant runs in a compact terminal panel docked bottom-right (`wm::spawn_assistant`),
+normally hidden behind a bubble the compositor draws above everything; clicking the bubble
+or F1 toggles it (`wm::toggle_assistant`), and a red dot marks output that arrived while
+hidden. Home has Home, Library and Web tabs of portrait covers over a full-screen backdrop of
+the focused item's artwork.
 
 ## Apps (0.4)
 

@@ -1,6 +1,6 @@
 [package]
 name = "nova-kernel"
-version = "0.4.0"
+version = "0.8.0"
 edition = "2024"
 description = "Project Nova: minimal x86-64 Rust kernel booted by Limine (UEFI)"
 license = "MIT OR Apache-2.0"

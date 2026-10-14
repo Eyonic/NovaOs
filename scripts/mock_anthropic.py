@@ -318,11 +318,11 @@ def respond(body):
         s.text("Poster image ready." if ok and "Saved a 256x144 PNG" in result_text(result) else "The image failed: " + result_text(result))
         return s.finish("end_turn")
 
-    if "show the files" in first:   # opens the Files app
+    if first.startswith("open app "):   # launches an app by path
         if step == 0:
-            s.tool("toolu_fm_1", "launch_app", {"path": "system/apps/files.rhai"})
+            s.tool("toolu_app_1", "launch_app", {"path": first[len("open app "):].strip()})
             return s.finish("tool_use")
-        s.text("Files is open.")
+        s.text("The app is open.")
         return s.finish("end_turn")
 
     if "show the editor" in first:   # opens a sample file in the Text Editor
