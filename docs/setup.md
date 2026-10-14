@@ -3,7 +3,7 @@
 ## Arch Linux / CachyOS (verified)
 
 ```sh
-sudo pacman -S --needed rustup qemu-system-x86 qemu-ui-gtk edk2-ovmf mtools util-linux limine
+sudo pacman -S --needed rustup qemu-system-x86 qemu-ui-gtk edk2-ovmf mtools util-linux limine gcc binutils python
 rustup default stable        # any toolchain; kernel/rust-toolchain.toml auto-installs 1.99.0
 scripts/check-prereqs.sh
 ```
@@ -17,6 +17,11 @@ host's own bootloader, and the demo must not touch it.
 
 `qemu-ui-gtk` is only needed for the windowed `scripts/run.sh`. The automated test is headless.
 
+`gcc` (with its static glibc `libc.a` and `libstdc++.a`, both part of Arch's `glibc` and `gcc`
+packages) compiles the C/C++ programs in `userland/`; `binutils` provides `objcopy`/`strip`;
+`python` runs the tests' mock Claude API and QMP helper. Building the kernel downloads crates
+from crates.io the first time.
+
 ## Other distributions (not verified)
 
 You need the same pieces. Point the scripts at them if the paths differ:
@@ -27,6 +32,9 @@ You need the same pieces. Point the scripts at them if the paths differ:
 | OVMF firmware (4M split CODE/VARS) | `ovmf` / `edk2-ovmf` | `OVMF_CODE`, `OVMF_VARS_TEMPLATE` |
 | Limine UEFI binary | distro `limine` package, or the official binary release from limine-bootloader.org | `LIMINE_EFI` |
 | mtools, sfdisk | `mtools`, `util-linux`/`fdisk` | - |
+| C/C++ compiler with static libc/libstdc++ | `gcc`, `g++`, `glibc-static`/`libc6-dev`, `libstdc++-static` | `CC`, `CXX` |
+| objcopy, strip | `binutils` | - |
+| Python 3 (tests only) | `python3` | - |
 
 Example (Debian/Ubuntu paths):
 `OVMF_CODE=/usr/share/OVMF/OVMF_CODE_4M.fd OVMF_VARS_TEMPLATE=/usr/share/OVMF/OVMF_VARS_4M.fd scripts/test.sh`

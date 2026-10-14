@@ -9,6 +9,8 @@ PROFILE="${PROFILE:-release}"
 # Cargo names the dev profile's output directory "debug".
 KERNEL_ELF="$KERNEL_DIR/target/x86_64-unknown-none/$([[ $PROFILE == dev ]] && echo debug || echo "$PROFILE")/nova-kernel"
 IMAGE="${IMAGE:-$BUILD/nova.img}"
+USERLAND_SRC="$ROOT/userland"
+USERLAND_OUT="$BUILD/userland"   # statically linked programs, shipped as Limine modules
 
 # Host-provided inputs (override via environment if your distro uses other paths).
 LIMINE_EFI="${LIMINE_EFI:-/usr/share/limine/BOOTX64.EFI}"
@@ -24,7 +26,7 @@ qemu_accel_args() {
     if [[ -r /dev/kvm && -w /dev/kvm && "${NOVA_NO_KVM:-0}" != 1 ]]; then
         echo "-accel kvm -cpu host"
     else
-        echo "-accel tcg -cpu qemu64"
+        echo "-accel tcg -cpu max"
     fi
 }
 
@@ -32,7 +34,7 @@ qemu_accel_args() {
 qemu_base_args() {
     [[ -f "$IMAGE" ]] || fail "missing $IMAGE - run scripts/build.sh first"
     [[ -f "$OVMF_VARS" ]] || cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
-    echo "-machine q35 -m 256M $(qemu_accel_args) -nic none -no-reboot" \
+    echo "-machine q35,vmport=on -m ${NOVA_RAM:-$( [[ -d $BUILD/sysroot/opt/chromium ]] && echo 4G || echo 1G )} $(qemu_accel_args) -nic user,model=e1000 -no-reboot" \
          "-drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
          "-drive if=pflash,format=raw,file=$OVMF_VARS" \
          "-drive format=raw,file=$IMAGE"

@@ -3,24 +3,68 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod apps;
 mod bootcell;
+mod browser;
+mod claude;
+mod console;
+mod cpu;
+mod drivers;
+mod fs;
+mod fwcfg;
 mod gdt;
+mod gfx;
+mod http;
+mod input;
+mod install;
+mod ipc;
 mod interrupts;
+mod keyboard;
 mod limine;
+mod linux;
+mod lineedit;
+mod log;
+mod memory;
+mod mouse;
+mod net;
+mod pci;
+mod pic;
+mod pit;
+mod port;
+mod power;
+mod process;
+mod rand;
+mod rtc;
 mod selftest;
 mod serial;
+mod setup;
+mod shell;
+mod shields;
+mod storage;
+mod sync;
+mod task;
+mod textgrid;
+mod tls;
+mod tty;
+mod wm;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 /// Startup banner printed on the serial console. scripts/test.sh looks for it.
-const BANNER: &str = "PROJECT NOVA KERNEL 0.2";
+const BANNER: &str = "PROJECT NOVA KERNEL 0.4";
 
 /// Entry point; Limine jumps here in 64-bit long mode with paging enabled and IF=0.
 #[unsafe(no_mangle)]
 extern "C" fn kmain() -> ! {
     serial::init();
+    // The heap first (the console needs it), then the console before anything is
+    // printed, so the whole boot log is on screen too.
+    let memory = memory::init();
+    let console = console::init();
 
     println!();
     println!("{BANNER}");
@@ -35,10 +79,26 @@ extern "C" fn kmain() -> ! {
         None => println!("[nova] bootloader: (no info response)"),
     }
 
+    match console {
+        Ok((cols, rows)) => println!("[nova] console: framebuffer, {cols}x{rows} characters"),
+        Err(why) => println!("[nova] console: serial only ({why})"),
+    }
+    match memory {
+        Ok((base, size)) => println!("[nova] memory: heap {} MiB at physical {base:#x}, direct map at {:#x}", size >> 20, memory::hhdm_offset()),
+        Err(why) => panic!("memory init failed: {why}"),
+    }
+    rand::init();
+    task::init();
+    if !limine::STACK_SIZE.granted() {
+        println!("[nova] warning: bootloader ignored the {} KiB stack request", limine::KERNEL_STACK_SIZE / 1024);
+    }
+
     gdt::init();
-    println!("[nova] gdt: loaded (code 0x08, data 0x10, tss 0x18, #DF on IST1)");
+    println!("[nova] gdt: loaded (kernel 0x08/0x10, user 0x23/0x1b, tss 0x28, #DF on IST1)");
     interrupts::init();
-    println!("[nova] idt: loaded, {} exception vectors installed", interrupts::installed_vectors());
+    process::init();
+    let (exceptions, irqs) = interrupts::installed_vectors();
+    println!("[nova] idt: loaded, {exceptions} exception vectors + {irqs} IRQ vectors installed");
 
     let cmdline = limine::EXECUTABLE_CMDLINE.get().unwrap_or("");
     println!("[nova] cmdline: \"{cmdline}\"");
@@ -46,8 +106,26 @@ extern "C" fn kmain() -> ! {
 
     selftest::run(cmdline);
 
-    println!("[nova] entering idle loop");
-    halt_forever()
+    pic::init();
+    pit::init();
+    rtc::init();
+    println!("[nova] pic: remapped to vectors 32-47 (local APIC disabled); pit: {} Hz", pit::HZ);
+    if keyboard::init() {
+        println!("[nova] keyboard: PS/2 port 1 enabled");
+    } else {
+        println!("[nova] keyboard: no response from PS/2 controller, serial input only");
+    }
+    if mouse::init() {
+        println!("[nova] mouse: PS/2 port 2 enabled{}", if mouse::absolute() { ", absolute pointer (vmmouse)" } else { "" });
+    }
+    serial::enable_rx_interrupt();
+    interrupts::enable();
+    println!("[nova] interrupts: enabled (timer, keyboard, mouse, COM1)");
+    println!("[nova] clock: TSC at {} MHz", pit::calibrate() / 1_000_000);
+    if !rand::hardware() {
+        println!("[nova] warning: no RDRAND; random numbers come from timer jitter");
+    }
+    setup::run()
 }
 
 /// Stop the CPU with interrupts disabled. `hlt` may wake on NMI/SMI, hence the loop.
@@ -62,6 +140,8 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    tty::emergency();
+    console::resume();
     if PANICKING.swap(true, Ordering::SeqCst) {
         // Panicked while reporting a panic: don't recurse into formatting again.
         print!("\n!!! NESTED PANIC, halting\n");

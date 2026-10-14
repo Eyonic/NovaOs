@@ -18,7 +18,10 @@ use crate::bootcell::BootCell;
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
-const TSS_SELECTOR: u16 = 0x18;
+/// User segments, in the order SYSRET requires (STAR[63:48] + 8 = SS, + 16 = CS).
+pub const USER_DATA: u16 = 0x18 | 3;
+pub const USER_CODE: u16 = 0x20 | 3;
+const TSS_SELECTOR: u16 = 0x28;
 
 /// IST slot used by the #DF gate (1-based, as encoded in an IDT gate; 0 = no IST).
 pub const DOUBLE_FAULT_IST: u8 = 1;
@@ -51,11 +54,14 @@ struct DescriptorTablePointer {
 //   data: access 0x92 (present, DPL0, data, writable)
 const CODE_DESCRIPTOR: u64 = 0x00AF_9A00_0000_FFFF;
 const DATA_DESCRIPTOR: u64 = 0x00CF_9200_0000_FFFF;
+// Same with DPL 3 (access 0xF2 / 0xFA).
+const USER_DATA_DESCRIPTOR: u64 = 0x00CF_F200_0000_FFFF;
+const USER_CODE_DESCRIPTOR: u64 = 0x00AF_FA00_0000_FFFF;
 /// Access byte for an available 64-bit TSS: present, DPL0, type 0b1001.
 const TSS_ACCESS: u64 = 0x89;
 
-/// null, code, data, TSS (16-byte system descriptor = 2 slots)
-static GDT: BootCell<[u64; 5]> = BootCell::new([0; 5]);
+/// null, kernel code, kernel data, user data, user code, TSS (16-byte system descriptor = 2 slots)
+static GDT: BootCell<[u64; 7]> = BootCell::new([0; 7]);
 static TSS: BootCell<Tss> = BootCell::new(Tss {
     _reserved0: 0,
     rsp: [0; 3],
@@ -101,9 +107,9 @@ pub fn init() {
 
     let gdt = GDT.get();
     // SAFETY: as above; the GDT is not loaded yet.
-    unsafe { gdt.write([0, CODE_DESCRIPTOR, DATA_DESCRIPTOR, tss_low, tss_high]) };
+    unsafe { gdt.write([0, CODE_DESCRIPTOR, DATA_DESCRIPTOR, USER_DATA_DESCRIPTOR, USER_CODE_DESCRIPTOR, tss_low, tss_high]) };
 
-    let pointer = DescriptorTablePointer { limit: (size_of::<[u64; 5]>() - 1) as u16, base: gdt as u64 };
+    let pointer = DescriptorTablePointer { limit: (size_of::<[u64; 7]>() - 1) as u16, base: gdt as u64 };
 
     // SAFETY: the GDT is fully built and 'static. After `lgdt`, CS still caches
     // Limine's descriptor (selector 0x28), so it is reloaded with a far return
@@ -132,4 +138,12 @@ pub fn init() {
             options(preserves_flags),
         );
     }
+}
+
+/// Stack the CPU switches to when an interrupt or exception arrives in user mode
+/// (TSS.RSP0). Set to the running task's kernel stack on every task switch.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: RSP0 is read by the CPU only on a privilege change, which cannot
+    // happen while this (kernel) code runs; the TSS stays loaded.
+    unsafe { core::ptr::write_unaligned(core::ptr::addr_of_mut!((*TSS.get()).rsp[0]), top) };
 }

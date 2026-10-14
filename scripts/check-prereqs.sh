@@ -22,11 +22,15 @@ check "OVMF vars template"        ls "$OVMF_VARS_TEMPLATE"
 check "Limine BOOTX64.EFI"        ls "$LIMINE_EFI"
 check "mtools (mformat/mcopy)"    bash -c "command -v mformat && command -v mcopy && command -v mmd"
 check "sfdisk"                    bash -c "command -v sfdisk"
+check "objcopy (binutils)"        bash -c "command -v objcopy && command -v strip"
+check "gcc -static (C)"           bash -c "echo 'int main(void){return 0;}' | \${CC:-gcc} -static -x c - -o /dev/null && echo ok"
+check "g++ -static (C++)"         bash -c "echo 'int main(){return 0;}' | \${CXX:-g++} -static -x c++ - -o /dev/null && echo ok"
+check "python3 (tests)"           python3 --version
 check "KVM (optional)"            bash -c "[[ -r /dev/kvm && -w /dev/kvm ]] && echo /dev/kvm usable || { echo 'not usable, TCG fallback'; true; }"
 
 if (( missing )); then
     log "Missing prerequisites. On Arch/CachyOS:"
-    echo "    sudo pacman -S --needed rustup qemu-system-x86 edk2-ovmf mtools util-linux limine"
+    echo "    sudo pacman -S --needed rustup qemu-system-x86 edk2-ovmf mtools util-linux limine gcc binutils python"
     echo "    rustup default stable   # kernel/rust-toolchain.toml then pins the exact version"
     exit 1
 fi

@@ -1,28 +1,16 @@
 //! Minimal 16550 UART driver for COM1 (I/O port 0x3F8).
 //!
-//! Output-only and polled; no interrupts. QEMU routes COM1 to `-serial`.
+//! Output is polled. Input arrives through IRQ 4 once [`enable_rx_interrupt`]
+//! has run; the IRQ handler drains the receive buffer into [`crate::input`].
+//! QEMU routes COM1 to `-serial`.
 
-use core::arch::asm;
 use core::fmt;
+
+use crate::port::{inb, outb};
 
 const COM1: u16 = 0x3F8;
 
-/// Write one byte to an I/O port.
-///
-/// SAFETY: port I/O has hardware side effects; callers must only touch ports
-/// belonging to a device they own. Here that is exclusively COM1.
-unsafe fn outb(port: u16, value: u8) {
-    unsafe { asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)) }
-}
-
-/// Read one byte from an I/O port. SAFETY: see [`outb`].
-unsafe fn inb(port: u16) -> u8 {
-    let value: u8;
-    unsafe { asm!("in al, dx", out("al") value, in("dx") port, options(nomem, nostack, preserves_flags)) }
-    value
-}
-
-/// Configure COM1 for 115200 baud, 8N1, FIFO enabled.
+/// Configure COM1 for 115200 baud, 8N1, FIFO enabled, UART interrupts off.
 pub fn init() {
     // SAFETY: standard 16550 init sequence on COM1 only.
     unsafe {
@@ -36,6 +24,24 @@ pub fn init() {
     }
 }
 
+/// Raise IRQ 4 when a byte has been received. Requires the PIC to be set up.
+pub fn enable_rx_interrupt() {
+    // SAFETY: COM1 registers only. OUT2 (MCR bit 3) gates the UART's IRQ line on PCs.
+    unsafe {
+        while inb(COM1 + 5) & 0x01 != 0 {
+            inb(COM1); // discard anything received before we were listening
+        }
+        outb(COM1 + 4, 0x0B); // DTR + RTS + OUT2
+        outb(COM1 + 1, 0x01); // interrupt on received data available
+    }
+}
+
+/// One received byte, if the UART has any.
+pub fn read_byte() -> Option<u8> {
+    // SAFETY: polling the line-status register and reading RBR of COM1.
+    unsafe { (inb(COM1 + 5) & 0x01 != 0).then(|| inb(COM1)) }
+}
+
 fn write_byte(byte: u8) {
     // SAFETY: polling the line-status register and writing THR of COM1.
     unsafe {
@@ -44,7 +50,17 @@ fn write_byte(byte: u8) {
     }
 }
 
-/// Zero-sized handle; all state lives in the UART itself.
+/// Write raw bytes (LF becomes CR LF, as for text).
+pub fn write_bytes(data: &[u8]) {
+    for &b in data {
+        if b == b'\n' {
+            write_byte(b'\r');
+        }
+        write_byte(b);
+    }
+}
+
+/// Zero-sized handle; all state lives in the UART itself, so this is lock-free.
 pub struct Serial;
 
 impl fmt::Write for Serial {
@@ -57,18 +73,4 @@ impl fmt::Write for Serial {
         }
         Ok(())
     }
-}
-
-#[macro_export]
-macro_rules! println {
-    () => { $crate::print!("\n") };
-    ($($arg:tt)*) => { $crate::print!("{}\n", format_args!($($arg)*)) };
-}
-
-#[macro_export]
-macro_rules! print {
-    ($($arg:tt)*) => {{
-        use core::fmt::Write as _;
-        let _ = write!($crate::serial::Serial, $($arg)*);
-    }};
 }

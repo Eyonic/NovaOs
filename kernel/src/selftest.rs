@@ -1,4 +1,5 @@
-//! Boot-time self-tests selected with the kernel command line `nova.test=<case>`.
+//! Self-tests: deliberate faults and panics, selected with the kernel command line
+//! `nova.test=<case>` at boot or with the shell command `crash <case>`.
 //!
 //! Each fault case is a tiny assembly routine with a global label on the exact
 //! instruction expected in the exception report's RIP. The kernel prints that
@@ -33,10 +34,10 @@ core::arch::global_asm!(
 
     .global nova_selftest_gp
     nova_selftest_gp:
-        mov eax, 0x28                   // selector index 5: beyond the 5-entry GDT limit
+        mov eax, 0x40                   // selector index 8: beyond the 7-entry GDT limit
     .global nova_selftest_gp_rip
     nova_selftest_gp_rip:
-        mov ds, ax                      // #GP(0x28)
+        mov ds, ax                      // #GP(0x40)
         ret
 
     .global nova_selftest_pf
@@ -77,11 +78,18 @@ unsafe extern "C" {
     static nova_selftest_bp_rip: u8;
 }
 
+/// Self-test case names, as accepted by [`run_case`].
+pub const CASES: [&str; 8] = ["de", "ud", "gp", "pf", "bp", "df", "nested", "panic"];
+
 /// Run the self-test named by `nova.test=` in `cmdline`, if any. Fault cases do not return.
 pub fn run(cmdline: &str) {
-    let Some(case) = cmdline.split_ascii_whitespace().find_map(|arg| arg.strip_prefix("nova.test=")) else {
-        return;
-    };
+    if let Some(case) = cmdline.split_ascii_whitespace().find_map(|arg| arg.strip_prefix("nova.test=")) {
+        run_case(case);
+    }
+}
+
+/// Run one self-test case. Never returns: every case ends in a report and halt.
+pub fn run_case(case: &str) -> ! {
     println!("[nova] selftest: {case}");
 
     // SAFETY (all arms): each routine deliberately raises the named exception, whose

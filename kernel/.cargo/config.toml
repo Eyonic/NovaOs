@@ -4,4 +4,10 @@ target = "x86_64-unknown-none"
 [target.x86_64-unknown-none]
 # Higher-half kernel at 0xffffffff80000000: needs the kernel code model and a
 # non-PIE (static) relocation model. The linker script is added by build.rs.
-rustflags = ["-C", "code-model=kernel", "-C", "relocation-model=static"]
+# The --cfg flags select the RustCrypto crates' portable backends: the target has no
+# SSE/AVX, and their SIMD backends crash LLVM when compiled for it.
+rustflags = [
+    "-C", "code-model=kernel", "-C", "relocation-model=static",
+    "--cfg", "polyval_force_soft", "--cfg", "aes_force_soft", "--cfg", "poly1305_force_soft",
+    "--cfg", "chacha20_force_soft", "--cfg", 'curve25519_dalek_backend="serial"',
+]

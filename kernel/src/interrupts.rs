@@ -1,7 +1,8 @@
-//! IDT, exception entry stubs, and the exception reporter.
+//! IDT, exception and IRQ entry stubs, and the exception reporter.
 //!
-//! Every exception vector 0-31 gets a gate. Nova does not attempt recovery: the
-//! handler prints a report over serial and halts the CPU.
+//! Every exception vector 0-31 gets a gate. Nova does not attempt recovery from
+//! exceptions: the handler prints a report and halts the CPU. Vectors 32-47 are the
+//! remapped 8259 IRQs (see pic.rs); their handlers do return, via `iretq`.
 //!
 //! References: Intel SDM Vol. 3A, chapter "Interrupt and Exception Handling"
 //! (exception/interrupt vector table, "Error Code", "64-Bit Mode IDT", "64-Bit
@@ -26,17 +27,21 @@
 //! Gates are interrupt gates (IF cleared on entry) at DPL 0. Software `int n` on
 //! an error-code vector would produce a frame without an error code; nothing in
 //! Nova does that, and with no user mode nothing else can.
+//!
+//! IRQ stubs build the same frame (dummy error code, vector, all GPRs), so the
+//! alignment argument above holds for them too. `irq_common` restores every GPR,
+//! drops vector and dummy error code, and returns with `iretq`. Interrupt gates
+//! keep IF clear for the whole handler, so IRQs never nest.
 
 use core::arch::{asm, naked_asm};
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bootcell::BootCell;
-use crate::gdt;
-use crate::println;
+use crate::{gdt, input, keyboard, pic, pit, println, serial};
 
-/// Register state at the time of the exception, as laid out on the stack by
-/// `exception_common` (lowest address first).
+/// Register state at the time of the exception or IRQ, as laid out on the stack
+/// by `exception_common` / `irq_common` (lowest address first).
 #[repr(C)]
 pub struct ExceptionFrame {
     rax: u64, rbx: u64, rcx: u64, rdx: u64, rsi: u64, rdi: u64, rbp: u64,
@@ -67,10 +72,49 @@ unsafe extern "C" fn exception_common() {
         "cld",            // SysV ABI requires DF=0 at calls
         "mov rdi, rsp",   // &ExceptionFrame
         "call {dispatch}",
-        "2:", "cli", "hlt", "jmp 2b", // unreachable: dispatch returns `!`
+        // dispatch returns only for a fault it resolved (a user page fault filled
+        // on demand): resume the interrupted code.
+        "pop rax", "pop rbx", "pop rcx", "pop rdx", "pop rsi", "pop rdi", "pop rbp",
+        "pop r8", "pop r9", "pop r10", "pop r11", "pop r12", "pop r13", "pop r14", "pop r15",
+        "add rsp, 16",
+        "iretq",
         dispatch = sym exception_dispatch,
     )
 }
+
+/// Saves the GPRs, calls the Rust IRQ dispatcher, restores them, and returns
+/// to the interrupted code.
+#[unsafe(naked)]
+unsafe extern "C" fn irq_common() {
+    naked_asm!(
+        "push r15", "push r14", "push r13", "push r12", "push r11", "push r10", "push r9", "push r8",
+        "push rbp", "push rdi", "push rsi", "push rdx", "push rcx", "push rbx", "push rax",
+        "cld",
+        "mov rdi, rsp",   // &ExceptionFrame
+        "call {dispatch}",
+        "pop rax", "pop rbx", "pop rcx", "pop rdx", "pop rsi", "pop rdi", "pop rbp",
+        "pop r8", "pop r9", "pop r10", "pop r11", "pop r12", "pop r13", "pop r14", "pop r15",
+        "add rsp, 16",    // vector + dummy error code
+        "iretq",
+        dispatch = sym irq_dispatch,
+    )
+}
+
+macro_rules! irq_stubs {
+    ($($vector:literal $stub:ident),*) => {
+        $(
+            #[unsafe(naked)]
+            unsafe extern "C" fn $stub() {
+                naked_asm!("push 0", "push {v}", "jmp {common}", v = const $vector, common = sym irq_common)
+            }
+        )*
+        const IRQ_STUBS: [unsafe extern "C" fn(); 16] = [$($stub),*];
+    };
+}
+
+irq_stubs!(32 irq_00, 33 irq_01, 34 irq_02, 35 irq_03, 36 irq_04, 37 irq_05, 38 irq_06, 39 irq_07,
+           40 irq_08, 41 irq_09, 42 irq_10, 43 irq_11, 44 irq_12, 45 irq_13, 46 irq_14, 47 irq_15);
+const _: () = assert!(pic::IRQ_BASE == 32, "irq_stubs! hard-codes vectors 32-47");
 
 /// Generates one entry stub per vector plus the matching info table, so the
 /// "does this vector push an error code" fact has a single source of truth.
@@ -172,7 +216,7 @@ struct DescriptorTablePointer {
     base: u64,
 }
 
-/// Full 256-entry table: vectors >= 32 stay not-present, so a stray interrupt
+/// Full 256-entry table: vectors >= 48 stay not-present, so a stray interrupt
 /// raises #NP (error code names the IDT vector) instead of reading garbage.
 static IDT: BootCell<[Gate; 256]> = BootCell::new([Gate::MISSING; 256]);
 
@@ -188,7 +232,15 @@ pub fn init() {
     for (vector, stub) in STUBS.iter().enumerate() {
         let ist = if vector == 8 { gdt::DOUBLE_FAULT_IST } else { 0 };
         // SAFETY: single-threaded init before `lidt`; index < 32 < 256.
-        unsafe { (*idt)[vector] = Gate::new(*stub as usize as u64, ist) };
+        let mut gate = Gate::new(*stub as usize as u64, ist);
+        if vector == 3 || vector == 4 {
+            gate.attributes = 0xEE; // DPL 3: user programs may execute int3/into
+        }
+        unsafe { (*idt)[vector] = gate };
+    }
+    for (irq, stub) in IRQ_STUBS.iter().enumerate() {
+        // SAFETY: as above; index < 48 < 256.
+        unsafe { (*idt)[pic::IRQ_BASE as usize + irq] = Gate::new(*stub as usize as u64, 0) };
     }
     let pointer = DescriptorTablePointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: idt as u64 };
     // SAFETY: the IDT is 'static, fully initialised, and every present gate points
@@ -196,8 +248,43 @@ pub fn init() {
     unsafe { asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags)) };
 }
 
-pub const fn installed_vectors() -> usize {
-    STUBS.len()
+/// (exception vectors, IRQ vectors) installed by `init`.
+pub const fn installed_vectors() -> (usize, usize) {
+    (STUBS.len(), IRQ_STUBS.len())
+}
+
+/// Enable interrupts. Requires `init` and a configured PIC.
+pub fn enable() {
+    // SAFETY: every vector the PIC can deliver has a gate.
+    unsafe { asm!("sti", options(nomem, nostack)) };
+}
+
+/// Called from `irq_common` with interrupts disabled. Handlers only record data
+/// (tick count, raw input bytes); they never print or take locks.
+extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
+    let irq = (frame.vector as u8).wrapping_sub(pic::IRQ_BASE);
+    if !pic::is_genuine(irq) {
+        return;
+    }
+    crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    match irq {
+        pic::IRQ_TIMER => pit::tick(),
+        pic::IRQ_KEYBOARD => input::SCANCODES.push(keyboard::read_scancode()),
+        pic::IRQ_MOUSE => crate::mouse::BYTES.push(keyboard::read_scancode()),
+        pic::IRQ_COM1 => {
+            while let Some(byte) = serial::read_byte() {
+                input::SERIAL_RX.push(byte);
+            }
+        }
+        _ => {}
+    }
+    pic::end_of_interrupt(irq);
+    // Preempt user programs on the timer, so they cannot monopolise the CPU.
+    if irq == pic::IRQ_TIMER && frame.cs & 3 == 3 {
+        crate::task::yield_now();
+        // A thread spinning in user code learns here that its program is exiting.
+        crate::process::check_exiting();
+    }
 }
 
 fn read_cr2() -> u64 {
@@ -207,10 +294,25 @@ fn read_cr2() -> u64 {
     value
 }
 
-/// Called from `exception_common` with a pointer to the saved state. Never returns.
-extern "C" fn exception_dispatch(frame: &ExceptionFrame) -> ! {
+/// Called from `exception_common` with a pointer to the saved state. Returns only
+/// if the fault was handled and the interrupted code can continue.
+extern "C" fn exception_dispatch(frame: &ExceptionFrame) {
     let cr2 = read_cr2(); // first: a nested #PF would overwrite it
     let info = &INFO[frame.vector as usize & 31];
+
+    // Faults in user programs end the program, not the system.
+    if frame.cs & 3 == 3 {
+        match frame.vector {
+            14 if crate::process::page_fault(cr2, frame.error_code) => return,
+            14 => crate::process::fault("segmentation fault", frame.rip, Some(cr2)),
+            0 => crate::process::fault("division by zero", frame.rip, None),
+            6 => crate::process::fault("illegal instruction", frame.rip, None),
+            13 => crate::process::fault("segmentation fault (general protection)", frame.rip, None),
+            16 | 19 => crate::process::fault("floating point exception", frame.rip, None),
+            3 => crate::process::fault("breakpoint trap", frame.rip, None),
+            _ => crate::process::fault(info.name, frame.rip, None),
+        }
+    }
 
     match DEPTH.fetch_add(1, Ordering::SeqCst) {
         0 => report(frame, info, cr2),
@@ -227,6 +329,8 @@ extern "C" fn exception_dispatch(frame: &ExceptionFrame) -> ! {
 }
 
 fn report(f: &ExceptionFrame, info: &ExceptionInfo, cr2: u64) {
+    crate::tty::emergency();
+    crate::console::resume();
     println!();
     println!("!!! CPU EXCEPTION !!!");
     println!("exception: {} {} (vector {}, {})", info.mnemonic, info.name, f.vector, info.class);

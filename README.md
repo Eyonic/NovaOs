@@ -1,106 +1,177 @@
 # Project Nova
 
-A minimal, real, bootable x86-64 operating-system kernel written in Rust (`no_std`, `no_main`),
-booted via **UEFI → Limine → Nova** inside a **QEMU/OVMF virtual machine**. This is a feasibility
-demo: it proves the edit → build → boot → verify loop, not an OS feature set.
+A small x86-64 operating system written in Rust, with an AI coding agent built in. Nova boots
+from an installation image into a terminal where Nova Assistant runs (on DeepSeek by default, or
+as Claude Code on Anthropic's API). You sign in, Nova detects the hardware and installs its Rust
+drivers (the assistant drafts ports for anything without a driver), offers to install itself to a
+disk, and then drops you into a desktop. On the desktop, the assistant is the app creator: ask
+for an app and it writes, checks and opens it.
 
-**Current milestone: 0.2, CPU exception handling.** Nova loads its own GDT/TSS/IDT and
-reports every CPU exception (vectors 0-31) over serial, then halts. It does not attempt recovery.
+![Nova Assistant built a Pomodoro timer on request and opened it on the desktop](docs/screenshots/assistant-app.png)
 
-Everything runs in a VM. Nothing here writes to your real disks, ESP, or host bootloader;
-the "disk" is the file `build/nova.img`.
+![Nova Browser (Chromium engine with Shields) and a System Monitor app written by the assistant](docs/screenshots/desktop-browser.png)
 
-## What it does
+**Milestone 0.4.** Everything runs in QEMU. Nothing here writes to your real disks, ESP or host
+bootloader; the "disks" are files under `build/`.
 
-On boot, the kernel prints to the emulated serial port (COM1):
+## What works
+
+| Area | What Nova does |
+|---|---|
+| Boot | UEFI (OVMF) → Limine → Nova kernel; GDT/IDT, exception reports, panic handler |
+| CPU | interrupts (8259 PIC), 100 Hz timer, cooperative kernel tasks, preemptive user programs, CPU load |
+| Memory | 1 GiB VM, heap (talc), MMIO mappings, per-process address spaces with demand paging |
+| Drivers | Intel e1000 Ethernet, AHCI SATA, PS/2 keyboard and mouse (absolute pointer via vmmouse), serial, framebuffer, RTC |
+| Internet | DHCP, DNS, TCP (smoltcp); HTTPS with certificate verification (rustls + RustCrypto + Mozilla roots) |
+| Storage | GPT, NovaFS (Nova's filesystem), installer that copies Nova onto a second disk |
+| Desktop | windows, taskbar, start menu, desktop icons, mouse and keyboard; Terminal, Files, Text Editor, System Monitor, Settings |
+| Assistant | Nova Assistant on DeepSeek (or Claude Code on Anthropic); sign-in from the host's key or Anthropic CLI login, streaming agent loop with tools (files, shell, HTTP, hardware, web search), app creation with screenshot checks |
+| Apps | Rhai scripts with a drawing API; Claude writes them, they appear on the desktop |
+| Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory |
+| Browser | Nova Browser: the Chromium engine (rendering, JavaScript, TLS) driven by a Rust shell with Shields (ad/tracker blocking, HTTPS upgrades, tracking-parameter removal) |
+
+## Quick start
+
+```sh
+scripts/check-prereqs.sh   # see docs/setup.md
+scripts/fetch-chromium.sh  # optional: the browser engine (about 100 MB download)
+scripts/build.sh           # kernel, user programs, build/nova.img
+scripts/run.sh             # boot like a real machine: installer image + empty 2 GiB disk
+```
+
+First boot:
+
+1. Nova lists the hardware and the driver it installed for each device.
+2. The assistant signs in. `run.sh` passes your key into the VM, so there is nothing to type:
+   put a DeepSeek API key (https://platform.deepseek.com/api_keys) in `DEEPSEEK_API_KEY` or in
+   the file `~/.config/nova/deepseek-api-key` (outside the repository, `chmod 600`). For Claude
+   instead, log in on the host with the Anthropic CLI (`ant auth login`) and run with
+   `NOVA_AI=anthropic`. Without either, Nova asks for a key; press Enter to skip.
+3. Signed in, the assistant ports drivers for devices Nova does not support yet (saved under `drivers/`
+   for the next kernel build).
+4. Nova offers to install itself on the 2 GiB disk (`build/disk.img`). After installing it
+   restarts, and `scripts/run.sh` boots the installed disk from then on.
+5. The desktop opens with the assistant. Ask it for an app, for example "make me a pomodoro timer".
+
+The serial console is in the terminal that runs `run.sh`; the Claude Code window mirrors it, so
+you can also type there (and paste your API key). Quit QEMU with `Ctrl-A` then `X`.
+
+Options: `scripts/run.sh --fresh` (erase the disk and start over), `--live` (always boot the
+installer image), `--headless` (no window), `--no-host-login` (don't pass your login in).
+
+### Shell and programs
+
+The Terminal app runs Nova's shell (`help` lists commands: `ls`, `cat`, `lspci`, `ifconfig`,
+`fetch https://...`, `disks`, `install`, ...). Programs in `bin/` run like commands:
 
 ```
-PROJECT NOVA KERNEL 0.2
-[nova] arch: x86_64 (long mode, higher-half kernel)
-[nova] boot protocol: Limine base revision 3
-[nova] bootloader: Limine 12.9.0
-[nova] gdt: loaded (code 0x08, data 0x10, tss 0x18, #DF on IST1)
-[nova] idt: loaded, 32 exception vectors installed
-[nova] cmdline: ""
-[nova] status: kernel main path reached, init OK
-[nova] entering idle loop
+nova> hello world
+Hello from C on Nova!
+nova> cxxtest
+cxxtest: C++ runtime checks
+  ok   exception thrown through 50 frames
+  ...
+cxxtest: 17 passed, 0 failed
 ```
 
-and then halts the CPU in a `cli; hlt` loop. A CPU exception produces a report like:
+Add your own: put a `.c` or `.cpp` file in `userland/` (static) or `userland/dynamic/`
+(dynamically linked; its shared libraries are bundled automatically), run `scripts/build.sh`,
+and it shows up as `bin/<name>`. `strace <program>` logs a program's system calls to the serial
+console.
 
-```
-!!! CPU EXCEPTION !!!
-exception: #PF Page Fault (vector 14, fault)
-error code: 0x0000000000000002 (not-present, write, supervisor)
-fault address (CR2): 0x00000deadbeef000
-RIP: 0xffffffff8000101f  CS: 0x0008  RFLAGS: 0x0000000000010086
-RSP: 0xffff80000bfa4f18  SS: 0x0010
-RAX=... (all general-purpose registers)
-[nova] system halted: unrecoverable exception
-```
+### Browser
 
-Panics print `!!! KERNEL PANIC !!!` with location and message, then halt.
+With the engine downloaded (`scripts/fetch-chromium.sh`), the desktop has a **Browser** icon
+(and the shell a `browser [url]` command). Type a URL or a search in the address bar; click,
+scroll and type in pages. The orange shield shows how many ads and trackers Shields blocked on
+the page; click it for the list and to turn Shields down for a site. Add EasyList with
+`download https://easylist.to/easylist/easylist.txt system/shields/easylist.txt` in the Terminal.
+The engine is Chrome for Testing's headless shell; Nova's browser UI and Shields are written in
+Rust (see [docs/architecture.md](docs/architecture.md#nova-browser-and-shields-04)).
+
+## Commands
+
+| Task | Command |
+|---|---|
+| Check prerequisites | `scripts/check-prereqs.sh` |
+| Build kernel + programs + image | `scripts/build.sh` |
+| Boot (installer + disk, then installed system) | `scripts/run.sh` |
+| **All tests** | `scripts/test.sh --all` |
+| One test case / list cases | `scripts/test.sh --case native` / `scripts/test.sh --list` |
+| Download the browser engine | `scripts/fetch-chromium.sh` |
+| Clean generated artifacts | `scripts/clean.sh` |
+
+`scripts/test.sh --all` boots QEMU headless for each of 20 cases and checks the serial output:
+boot, panic and 7 CPU-exception cases; shell and PS/2 keyboard input; native C/C++ programs
+(static, dynamic, threaded); Linux sockets (`net`); the Chromium engine rendering a page
+(`chromium`); Nova Browser opened by Claude with Shields blocking a tracker (`browser`; both
+skipped without the engine); and the full first-boot flow (`setup`: login, driver porting, installation) followed by the installed
+system building an app with Claude (`installed`), first boot signed in with a host login
+token (`hostlogin`), and the same flow on DeepSeek (`deepseek`). The Claude cases use `scripts/mock_anthropic.py`,
+a local stand-in for the Messages API that also checks Nova's requests follow the API rules.
+Logs go to `build/logs/test-<timestamp>/`.
+
+Environment overrides: `LIMINE_EFI`, `OVMF_CODE`, `OVMF_VARS_TEMPLATE` (file locations),
+`NOVA_NO_KVM=1` (software emulation), `PROFILE=dev` (debug build), `TIMEOUT`, `NOVA_CMDLINE`
+(kernel command line baked into `build/nova.img`), `CC`/`CXX` (compilers for `userland/`).
+
+Kernel command line options: `nova.mode=shell` (text shell instead of setup/desktop),
+`nova.install=no` (don't offer installation), `nova.deepseek_api=<url>` (DeepSeek-mode endpoint), `nova.claude_api=<url>` (another API endpoint),
+`nova.test=<case>` (self-tests).
 
 ## Repository layout
 
 | Path | Purpose |
 |---|---|
-| `kernel/` | Rust kernel crate: `src/main.rs` (entry, panic handler), `src/gdt.rs` (GDT + TSS/IST), `src/interrupts.rs` (IDT, entry stubs, exception reports), `src/selftest.rs` (deliberate faults for tests), `src/serial.rs` (UART), `src/limine.rs` (boot-protocol structs), `src/bootcell.rs`, `linker.ld`, pinned `rust-toolchain.toml` |
-| `boot/limine.conf` | Limine bootloader menu/config |
-| `scripts/` | `check-prereqs.sh`, `build.sh`, `mkimage.sh`, `run.sh`, `test.sh`, `clean.sh` (`common.sh` holds shared paths) |
-| `docs/` | [`setup.md`](docs/setup.md) (installing prerequisites), [`architecture.md`](docs/architecture.md) (boot chain, exception handling, tests) |
-| `build/` | Generated: disk image, OVMF vars copy, logs (git-ignored) |
+| `kernel/` | the kernel crate (see [docs/architecture.md](docs/architecture.md) for every module) |
+| `kernel/src/apps/` | bundled desktop apps (Rhai) |
+| `kernel/src/claude_prompt.md` | system prompt of Claude Code for Nova |
+| `userland/` | C and C++ programs shipped in `bin/` (`dynamic/`: dynamically linked) |
+| `boot/limine.conf` | Limine configuration |
+| `scripts/` | build, image, run and test scripts; `fetch-chromium.sh`; `mkpak.py` (system-file pack); the mock Claude API and a QMP input helper |
+| `docs/` | [setup.md](docs/setup.md) (prerequisites), [architecture.md](docs/architecture.md) |
+| `build/` | generated: images, disks, logs (git-ignored) |
 
-## Commands
+## About the assistant
 
-Run from the repository root (scripts are bash; they work from any shell):
+The assistant calls the Messages API directly from the kernel over HTTPS, against one of two
+providers (`/provider` switches):
 
-| Task | Command |
-|---|---|
-| Check prerequisites | `scripts/check-prereqs.sh` |
-| Build kernel + bootable image | `scripts/build.sh` |
-| Boot with a VM window (serial in terminal) | `scripts/run.sh` |
-| Boot headless (serial in terminal) | `scripts/run.sh --headless` (quit: `Ctrl-A` then `X`) |
-| Automated boot (regression) test | `scripts/test.sh` |
-| **All tests** (boot, panic, 7 exception cases) | `scripts/test.sh --all` |
-| One test case / list cases | `scripts/test.sh --case pf` / `scripts/test.sh --list` |
-| Test with a different expected banner | `scripts/test.sh --expect "SOME TEXT"` |
-| Test the panic handler | `scripts/test.sh --panic` |
-| Boot an image with a self-test by hand | `NOVA_CMDLINE="nova.test=gp" scripts/build.sh && scripts/run.sh --headless` |
-| Clean generated artifacts | `scripts/clean.sh` |
+- **DeepSeek** (default): Nova Assistant, model `deepseek-flash` (it reads the app screenshots;
+  `deepseek-v4-pro` is text only), through DeepSeek's Anthropic-compatible endpoint
+  `https://api.deepseek.com/anthropic`. Screenshots go beside tool results, where DeepSeek reads
+  them.
+- **Anthropic**: Claude Code for Nova, `claude-opus-5-5` with adaptive thinking and server-side
+  refusal fallbacks.
 
-`scripts/test.sh` builds the kernel once, then for each case packs an image whose `limine.conf`
-passes `nova.test=<case>` on the kernel command line. It boots QEMU headless with serial captured to
-`build/logs/test-<timestamp>/<case>.serial.log` and waits (default 30 s, `TIMEOUT=` to change) for
-the case's exact expected lines. It then checks that the VM stays up and silent for 2 s
-(controlled halt, no reset), that no forbidden output appeared, and, for fault cases, that the
-reported RIP equals the faulting instruction's address announced by the kernel. Exit code 0 = all
-passed, 1 = something failed. `build/logs/test-latest` links the last run. Test cases are described
-in [`docs/architecture.md`](docs/architecture.md#tests).
-
-Every case boots the **same kernel binary**. Only the command line differs.
-
-Environment overrides: `LIMINE_EFI`, `OVMF_CODE`, `OVMF_VARS_TEMPLATE` (file locations),
-`NOVA_NO_KVM=1` (force software emulation), `PROFILE=dev` (debug build), `TIMEOUT`,
-`NOVA_CMDLINE` (kernel command line baked into `build/nova.img` by `build.sh`).
-
-## Try the edit loop
-
-1. Edit `BANNER` in `kernel/src/main.rs`.
-2. Run `scripts/test.sh --expect "<your new banner>"`. It passes only if the VM prints it.
-3. To make it the default expectation, update `EXPECTED_BANNER` in `scripts/test.sh`.
+Signing in: at every boot `scripts/run.sh` looks for `DEEPSEEK_API_KEY` or
+`~/.config/nova/deepseek-api-key`, then (or first, with `NOVA_AI=anthropic`) runs
+`ant auth print-credentials --access-token` on the host (falling back to `ANTHROPIC_AUTH_TOKEN`,
+then `ANTHROPIC_API_KEY`) and hands the result
+to the VM through QEMU's fw_cfg, from a temporary mode-600 file under `build/` that is deleted
+when QEMU exits. Nova sends it as `Authorization: Bearer` with the `oauth-2025-04-20` beta and
+keeps it only in memory. The token is short-lived: if a session outlives it, restart Nova to get a
+new one. An API key entered with `/login` instead is stored on the Nova disk in `system/claude.json`. Requests cost
+API credits like any other use of the API. Without a key, everything except the assistant works.
 
 ## Tested versions
 
-Verified on 2026-10-13 on CachyOS (Linux 7.2.3, x86_64, KVM, and with `NOVA_NO_KVM=1`):
+Verified on 2026-10-14 on CachyOS (Linux 7.2.9, x86_64, KVM):
 
-| Tool | Version | Source |
-|---|---|---|
-| Rust | 1.99.0 (pinned in `kernel/rust-toolchain.toml`) | rustup |
-| Kernel target | `x86_64-unknown-none` | rustup |
-| QEMU | 11.1.2 (`qemu-system-x86`, `qemu-ui-gtk`) | pacman |
-| OVMF | edk2-ovmf 202608 | pacman |
-| Limine | 12.9.0 (`BOOTX64.EFI`, sha256 `f24efeec…892d629f`) | pacman |
-| mtools / sfdisk | system packages | pacman |
+| Tool | Version |
+|---|---|
+| Rust | 1.99.0 (pinned in `kernel/rust-toolchain.toml`), target `x86_64-unknown-none` |
+| QEMU | 11.1.2, machine `q35,vmport=on`, OVMF edk2 202608 |
+| Limine | 12.9.0 |
+| GCC | 16.2.1 (glibc and libstdc++ for `userland/`) |
+| Chromium | 155.0.8059.79 (Chrome for Testing headless shell) |
 
-Kernel crate dependencies: none.
+Kernel crate dependencies: talc, spin, smoltcp, rustls, rustls-rustcrypto, webpki-roots, getrandom
+(custom backend), sha2, serde_json, rhai, miniz_oxide.
+
+Bundled from the build machine (not in the repository): the shared libraries dynamically linked
+programs need (glibc, libstdc++, ...), and with the browser: Chrome for Testing's
+`chrome-headless-shell` (Chromium, BSD-style license plus third-party notices in its
+`LICENSE.headless_shell`), the libraries it links (glib, NSS, X11 client libraries, ...), and the
+Liberation and Noto fonts (SIL Open Font License). The console font is Spleen 8x16 by Frederic Cambus
+(BSD-2-Clause, `kernel/src/font/LICENSE.spleen`).
