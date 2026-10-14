@@ -8,6 +8,9 @@ mkdir -p "$LOGS"
 BUILD_LOG="$LOGS/build.log"
 : > "$BUILD_LOG"
 
+if [[ ",${FEATURES:-}," == *,linux-drivers,* ]]; then
+    "$ROOT/scripts/build-linux.sh" || fail "Linux driver objects failed"
+fi
 log "Building kernel ($PROFILE${FEATURES:+, features: $FEATURES})"
 cargo_args=(build --manifest-path "$KERNEL_DIR/Cargo.toml")
 [[ "$PROFILE" == release ]] && cargo_args+=(--release)

@@ -34,7 +34,7 @@ qemu_accel_args() {
 qemu_base_args() {
     [[ -f "$IMAGE" ]] || fail "missing $IMAGE - run scripts/build.sh first"
     [[ -f "$OVMF_VARS" ]] || cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
-    echo "-machine q35,vmport=on -m ${NOVA_RAM:-$( [[ -d $BUILD/sysroot/opt/chromium ]] && echo 4G || echo 1G )} $(qemu_accel_args) -nic user,model=e1000 -no-reboot" \
+    echo "-machine q35,vmport=on -m ${NOVA_RAM:-$( [[ -d $BUILD/sysroot/opt/chromium ]] && echo 4G || echo 1G )} $(qemu_accel_args) -nic user,model=${NOVA_NIC:-e1000} -no-reboot" \
          "-drive if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
          "-drive if=pflash,format=raw,file=$OVMF_VARS" \
          "-drive format=raw,file=$IMAGE"

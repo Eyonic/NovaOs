@@ -1,0 +1,33 @@
+# Objects compiled from the Linux source (build/linux, scripts/fetch-linux.sh) and linked
+# into Nova with FEATURES=linux-drivers. Paths are relative to the Linux tree; Kbuild
+# builds them with the configuration from nova.config. lx_emul (nova/) provides the rest.
+
+# Drivers
+drivers/net/ethernet/realtek/8139cp.o
+drivers/net/ethernet/realtek/8139too.o
+drivers/net/mii.o
+
+# Subsystem code used as is
+net/ethernet/eth.o
+drivers/pci/iomap.o
+
+# Library code
+lib/vsprintf.o
+lib/string.o
+lib/string_helpers.o
+lib/ctype.o
+lib/hexdump.o
+lib/kstrtox.o
+lib/cmdline.o
+lib/bitmap.o
+lib/find_bit.o
+lib/hweight.o
+lib/siphash.o
+lib/uuid.o
+lib/bitrev.o
+lib/crc/crc32-main.o
+lib/iomap.o
+arch/x86/lib/iomem.o
+lib/refcount.o
+kernel/time/timeconv.o
+arch/x86/lib/csum-partial_64.o

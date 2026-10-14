@@ -80,12 +80,23 @@ pub fn init() -> Result<(u64, usize), &'static str> {
     let mut total = 0usize;
     // Regions under 1 MiB are not worth the allocator's bookkeeping.
     for region in limine::MEMMAP.entries().filter(|e| e.kind == limine::MEMMAP_USABLE && e.length >= 1 << 20) {
-        let start = (offset + region.base) as *mut u8;
+        #[cfg_attr(not(feature = "linux-drivers"), allow(unused_mut))]
+        let (mut base, mut length) = (region.base, region.length);
+        #[cfg(feature = "linux-drivers")]
+        if DMA32_SIZE.load(Ordering::Relaxed) == 0 && base + length <= 1 << 32 && length >= 4 * DMA32_POOL {
+            // SAFETY: as for the heap below; this slice of the region goes to the pool only.
+            if unsafe { DMA32.lock().claim(Span::from_base_size((offset + base) as *mut u8, DMA32_POOL as usize)) }.is_ok() {
+                DMA32_SIZE.store(DMA32_POOL as usize, Ordering::Relaxed);
+                base += DMA32_POOL;
+                length -= DMA32_POOL;
+            }
+        }
+        let start = (offset + base) as *mut u8;
         // SAFETY: the region is usable RAM per the memory map, mapped by the direct map,
         // and nothing else uses it; each region is claimed exactly once.
-        let claimed = unsafe { ALLOCATOR.lock().claim(Span::from_base_size(start, region.length as usize)) };
+        let claimed = unsafe { ALLOCATOR.lock().claim(Span::from_base_size(start, length as usize)) };
         if claimed.is_ok() {
-            total += region.length as usize;
+            total += length as usize;
             HEAP_REGIONS.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -104,6 +115,34 @@ pub fn init() -> Result<(u64, usize), &'static str> {
         }
     }
     Ok((region.base, region.length as usize))
+}
+
+/// Memory below 4 GiB for devices that can only address 32 bits (Linux's default DMA mask),
+/// carved out of the first suitable RAM region. Only the Linux driver layer uses it.
+#[cfg(feature = "linux-drivers")]
+static DMA32: Talck<spin::Mutex<()>, talc::ErrOnOom> = Talc::new(talc::ErrOnOom).lock();
+#[cfg(feature = "linux-drivers")]
+const DMA32_POOL: u64 = 16 << 20;
+#[cfg(feature = "linux-drivers")]
+static DMA32_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Allocate from the below-4-GiB pool (null when it is exhausted or absent).
+#[cfg(feature = "linux-drivers")]
+pub fn dma32_alloc(layout: Layout, zero: bool) -> *mut u8 {
+    use core::alloc::GlobalAlloc;
+    // SAFETY: non-zero size (callers never ask for 0 bytes).
+    unsafe { if zero { DMA32.alloc_zeroed(layout) } else { DMA32.alloc(layout) } }
+}
+
+/// Free memory from [`dma32_alloc`].
+///
+/// # Safety
+/// `ptr` must come from `dma32_alloc` with the same `layout`.
+#[cfg(feature = "linux-drivers")]
+pub unsafe fn dma32_free(ptr: *mut u8, layout: Layout) {
+    use core::alloc::GlobalAlloc;
+    // SAFETY: per the caller's contract.
+    unsafe { DMA32.dealloc(ptr, layout) }
 }
 
 static KERNEL_CR3: AtomicU64 = AtomicU64::new(0);

@@ -30,6 +30,8 @@ mod interrupts;
 mod keyboard;
 mod limine;
 mod linux;
+#[cfg(feature = "linux-drivers")]
+mod linuxkpi;
 mod lineedit;
 mod log;
 mod memory;

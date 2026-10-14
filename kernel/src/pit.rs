@@ -23,6 +23,8 @@ pub fn init() {
 /// Called from the IRQ 0 handler.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
+    #[cfg(feature = "linux-drivers")]
+    crate::linuxkpi::tick();
 }
 
 /// Ticks since the timer was started.

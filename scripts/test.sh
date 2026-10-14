@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -43,11 +43,11 @@ CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
 # steps are sent immediately ("raw:..." sends without Enter, "sleep:N" waits N seconds,
 # "dump:FILE" saves a screenshot of the display to the log directory, "key:NAME" presses
 # a key through the QEMU monitor).
-# QEMU_EXTRA: extra QEMU arguments. EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
+# QEMU_EXTRA: extra QEMU arguments. NIC: QEMU network card model (default e1000). EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
 # MOCK=1: run with the mock Anthropic API and fail on any protocol violation it logs.
 define_case() {
     EXPECT=() CONTAINS=() FORBID=("$PANIC" "$EXC" "NESTED") CHECK_RIP=0 CMDLINE="nova.test=$1"
-    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET=0 SKIP="" CASE_TIMEOUT=$TIMEOUT
+    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET=0 SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000
     local fault=("$EXC" "$STATUS" "$HALTED")
     local fault_forbid=("$PANIC" "$SHELL_START" "NESTED")
     local shell=("$EXPECTED_BANNER" "$STATUS" "$SHELL_START")
@@ -135,6 +135,15 @@ define_case() {
                 EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
                 CONTAINS=("nettest: HTTP/1.1 404 Not Found" "nettest: MSG_PEEK kept the data")
                 FORBID=("$PANIC" "$EXC" "segmentation fault" "illegal instruction") ;;
+        linuxnet) # The Linux driver layer: Linux's unmodified 8139cp driver (RTL8139C+ card)
+                # brings the network up for Nova's stack; then DNS and TCP through it.
+                CMDLINE="nova.mode=shell"; MOCK=1; NIC=rtl8139
+                [[ ",${FEATURES:-}," == *,linux-drivers,* ]] || SKIP="kernel built without FEATURES=linux-drivers"
+                INPUT=("wait:$PROMPT" "ser:nettest 10.0.2.2:$MOCK_PORT" "wait:bytes")
+                EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
+                CONTAINS=("linux/8139cp  Linux " "[nova] linux: eth0: link up" "network: online, address 10.0.2.15/24"
+                          "nettest: HTTP/1.1 404 Not Found")
+                FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
         apps)   # Native apps on the desktop: the Text Editor with a sample file (quick open,
                 # find), Files (grid, preview, list), System Monitor, Settings and Home (Home and
                 # Library tabs), with screenshots for review.
@@ -303,7 +312,7 @@ run_case() {
     # Opening the input FIFOs read-write never blocks, even if QEMU has died.
     exec {SERIAL_FD}<>"$fifo/serial.in" {MONITOR_FD}<>"$fifo/monitor.in"
     # shellcheck disable=SC2046
-    IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" qemu_base_args) -display none \
+    IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" NOVA_NIC="$NIC" qemu_base_args) -display none \
         -chardev "pipe,id=com1,path=$fifo/serial" -serial chardev:com1 \
         -chardev "pipe,id=mon,path=$fifo/monitor" -mon chardev=mon,mode=readline "${QEMU_EXTRA[@]}" >"$qemu_log" 2>&1 &
     local pid=$!

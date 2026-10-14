@@ -295,6 +295,24 @@ pub static MODULES: Request<ModuleResponse> = Request::new([0x3e7e279702be32af, 
 #[unsafe(link_section = ".limine_requests")]
 pub static EXECUTABLE_FILE: Request<ExecutableFileResponse> = Request::new([0xad97e90e83f1ed67, 0x31eb5d1c5ff23b69]);
 
+#[repr(C)]
+pub struct ExecutableAddressResponse {
+    revision: u64,
+    physical_base: u64,
+    virtual_base: u64,
+}
+
+impl Request<ExecutableAddressResponse> {
+    /// Physical address of the kernel's first byte (linked at `virtual_base`).
+    pub fn physical_base(&self) -> Option<u64> {
+        self.response().map(|r| r.physical_base)
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static EXECUTABLE_ADDRESS: Request<ExecutableAddressResponse> = Request::new([0x71ba76863cc55f63, 0xb2644a48c516a487]);
+
 /// Stack for kmain. Limine's default (64 KiB) is too small for TLS and the script engine.
 pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024;
 

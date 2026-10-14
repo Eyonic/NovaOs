@@ -22,6 +22,11 @@ sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.9", default-features = false, features = ["lock_api", "spin_mutex", "mutex"] }
 fontdue = { version = "0.9.4", default-features = false, features = ["hashbrown"] }
 
+[features]
+# Compile in Linux drivers from the Linux source (scripts/fetch-linux.sh), on top of lx_emul
+# (linuxkpi/). The resulting kernel binary is GPL-2.0; see docs/linux-drivers.md.
+linux-drivers = []
+
 [profile.dev]
 panic = "abort"
 

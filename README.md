@@ -26,7 +26,7 @@ for an app and it writes, checks and opens it.
 | Boot | UEFI (OVMF) → Limine → Nova kernel; GDT/IDT, exception reports, panic handler |
 | CPU | interrupts (8259 PIC), 100 Hz timer, cooperative kernel tasks, preemptive user programs, CPU load |
 | Memory | 1 GiB VM, heap (talc), MMIO mappings, per-process address spaces with demand paging |
-| Drivers | Intel e1000 Ethernet, AHCI SATA, PS/2 keyboard and mouse (absolute pointer via vmmouse), serial, framebuffer, RTC |
+| Drivers | Intel e1000 Ethernet, AHCI SATA, PS/2 keyboard and mouse (absolute pointer via vmmouse), serial, framebuffer, RTC; optionally unmodified Linux drivers on a Linux-API layer (RealTek 8139/8139C+ so far, see [docs/linux-drivers.md](docs/linux-drivers.md)) |
 | Internet | DHCP, DNS, TCP (smoltcp); HTTPS with certificate verification (rustls + RustCrypto + Mozilla roots) |
 | Storage | GPT, NovaFS (Nova's filesystem), installer that copies Nova onto a second disk |
 | Desktop | Nova Home, in the style of TV/console launchers: Home, Library and Web tabs, shelves of portrait covers (open windows as live thumbnails, your apps, apps, sites, system), the focused item's artwork as a full-screen backdrop, live app previews, keyboard hints; no taskbar: the Windows key brings back Home, right-click a running window's cover to stop it. The assistant is a chat bubble in the bottom-right corner (click it or press F1) |
@@ -42,6 +42,7 @@ for an app and it writes, checks and opens it.
 scripts/check-prereqs.sh   # see docs/setup.md
 scripts/fetch-chromium.sh  # optional: the browser engine (about 100 MB download)
 scripts/fetch-filters.sh   # optional: EasyList + EasyPrivacy for Shields (recommended)
+scripts/fetch-linux.sh     # optional: Linux source for FEATURES=linux-drivers (docs/linux-drivers.md)
 scripts/build.sh           # kernel, user programs, build/nova.img
 scripts/run.sh             # boot like a real machine: installer image + empty 2 GiB disk
 ```
