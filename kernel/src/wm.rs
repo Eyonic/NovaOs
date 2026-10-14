@@ -31,7 +31,9 @@ use crate::{apps, fs, net, pit, rtc, task};
 pub const TITLE_H: i32 = 40;
 /// No taskbar: Home and full-screen windows use the whole screen.
 pub const TASKBAR_H: i32 = 0;
-const TERM_PAD: i32 = 6;
+const TERM_PAD: i32 = 14;
+/// Terminal text size (px) in the monospace font.
+const TERM_FONT: u16 = 15;
 
 pub mod theme {
     pub const WALL_TOP: u32 = 0x1B1D33;
@@ -294,11 +296,17 @@ pub fn launch(action: &Action) {
 
 /// Open a terminal window and run `f` attached to it in a new task. The window
 /// closes when `f` returns.
+/// Size of one terminal character cell: the monospace font's, else the bitmap font's.
+fn term_cell() -> (i32, i32) {
+    crate::font::mono_cell(TERM_FONT).unwrap_or((FONT_WIDTH as i32, FONT_HEIGHT as i32))
+}
+
 pub fn spawn_terminal(title: &str, icon: char, accent: u32, mirror_serial: bool, f: impl FnOnce(&TtyRef) + Send + 'static) -> WindowRef {
     let (cols, rows) = (96usize, 30usize);
     let tty = crate::tty::new(cols, rows, title, mirror_serial);
-    let w = cols as i32 * FONT_WIDTH as i32 + 2 * TERM_PAD;
-    let h = rows as i32 * FONT_HEIGHT as i32 + 2 * TERM_PAD;
+    let (cw, ch) = term_cell();
+    let w = cols as i32 * cw + 2 * TERM_PAD;
+    let h = rows as i32 * ch + 2 * TERM_PAD;
     let win = open(title, icon, accent, w, h, Content::Terminal(tty.clone()));
     let win2 = win.clone();
     let tty2 = tty.clone();
@@ -551,8 +559,9 @@ impl Desktop {
                             w.h = nh;
                             match &w.content {
                                 Content::Terminal(t) => {
-                                    let cols = ((nw - 2 * TERM_PAD) / FONT_WIDTH as i32).max(10) as usize;
-                                    let rows = ((nh - 2 * TERM_PAD) / FONT_HEIGHT as i32).max(3) as usize;
+                                    let (cw, ch) = term_cell();
+                                    let cols = ((nw - 2 * TERM_PAD) / cw).max(10) as usize;
+                                    let rows = ((nh - 2 * TERM_PAD) / ch).max(3) as usize;
                                     t.lock().grid.resize(cols, rows);
                                 }
                                 Content::Canvas(_) => w.push(Event::Resized),
@@ -573,7 +582,16 @@ impl Desktop {
         let over_window = self.window_at(x, y);
         if r.wheel != 0 {
             match &over_window {
-                Some(w) => w.lock().push(Event::Wheel(r.wheel)),
+                Some(w) => {
+                    let mut w = w.lock();
+                    match &w.content {
+                        Content::Terminal(t) => {
+                            t.lock().grid.scroll_view(r.wheel * -3);
+                            changed = true;
+                        }
+                        Content::Canvas(_) => w.push(Event::Wheel(r.wheel)),
+                    }
+                }
                 None if y < sh - TASKBAR_H => {
                     self.home.wheel(r.wheel);
                     changed = true;
@@ -726,6 +744,40 @@ fn window_by_id(id: usize) -> Option<WindowRef> {
     WINDOWS.lock().iter().find(|w| w.lock().id == id).cloned()
 }
 
+/// Box-drawing characters drawn as lines that fill the whole cell, so frames join up
+/// across rows (font glyphs are shorter than the line height). True if `c` was one.
+fn draw_box_char(scene: &mut Canvas, c: char, r: Rect, color: u32) -> bool {
+    // (left, right, up, down) arms; double-line characters are drawn as single lines.
+    let (l, rt, u, d) = match c {
+        '\u{2500}' | '\u{2550}' => (true, true, false, false),
+        '\u{2502}' | '\u{2551}' => (false, false, true, true),
+        '\u{250c}' | '\u{2554}' | '\u{256d}' | '\u{2552}' | '\u{2553}' => (false, true, false, true),
+        '\u{2510}' | '\u{2557}' | '\u{256e}' | '\u{2555}' | '\u{2556}' => (true, false, false, true),
+        '\u{2514}' | '\u{255a}' | '\u{2570}' | '\u{2558}' | '\u{2559}' => (false, true, true, false),
+        '\u{2518}' | '\u{255d}' | '\u{256f}' | '\u{255b}' | '\u{255c}' => (true, false, true, false),
+        '\u{251c}' | '\u{2560}' | '\u{255e}' | '\u{255f}' => (false, true, true, true),
+        '\u{2524}' | '\u{2563}' | '\u{2561}' | '\u{2562}' => (true, false, true, true),
+        '\u{252c}' | '\u{2566}' | '\u{2564}' | '\u{2565}' => (true, true, false, true),
+        '\u{2534}' | '\u{2569}' | '\u{2567}' | '\u{2568}' => (true, true, true, false),
+        '\u{253c}' | '\u{256c}' | '\u{256a}' | '\u{256b}' => (true, true, true, true),
+        _ => return false,
+    };
+    let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+    if l {
+        scene.fill_rect(Rect::new(r.x, cy, cx - r.x + 1, 1), color);
+    }
+    if rt {
+        scene.fill_rect(Rect::new(cx, cy, r.x + r.w - cx, 1), color);
+    }
+    if u {
+        scene.fill_rect(Rect::new(cx, r.y, 1, cy - r.y + 1), color);
+    }
+    if d {
+        scene.fill_rect(Rect::new(cx, cy, 1, r.y + r.h - cy), color);
+    }
+    true
+}
+
 /// Draw a small live picture of window `id` into `r` (for Home). False if it is gone.
 pub fn draw_window_thumb(scene: &mut Canvas, id: usize, r: Rect, radius: i32) -> bool {
     let Some(win) = window_by_id(id) else { return false };
@@ -793,24 +845,71 @@ fn draw_window(scene: &mut Canvas, w: &Window, focused: bool) {
             scene.fill_rect(Rect::new(ox, oy, w.w, w.h), PALETTE[0]);
             let mut t = t.lock();
             let g = &mut t.grid;
-            let cursor = g.cursor_index();
-            for (i, cell) in g.cells.iter().enumerate() {
-                let (col, row) = ((i % g.cols) as i32, (i / g.cols) as i32);
-                let x = ox + TERM_PAD + col * FONT_WIDTH as i32;
-                let y = oy + TERM_PAD + row * FONT_HEIGHT as i32;
-                if x + FONT_WIDTH as i32 > ox + w.w || y + FONT_HEIGHT as i32 > oy + w.h {
-                    continue;
+            let (cw, ch) = term_cell();
+            let mono = crate::font::mono_cell(TERM_FONT).is_some();
+            let (cur_col, cur_row) = (g.col.min(g.cols - 1), g.row);
+            let back = g.view_offset.min(g.history.len());
+            for row in 0..g.rows {
+                let y = oy + TERM_PAD + row as i32 * ch;
+                if y + ch > oy + w.h {
+                    break;
                 }
-                let bg = PALETTE[cell.bg as usize & 15];
-                if cell.bg != 0 {
-                    scene.fill_rect(Rect::new(x, y, FONT_WIDTH as i32, FONT_HEIGHT as i32), bg);
+                let line = g.view_row(row);
+                // Warp-style command blocks: a prompt line ("nova> " / the assistant's "> ")
+                // starts a block: a hairline above it and the prompt in the accent colour.
+                let prompt_len = if line.len() >= 6 && line[..6].iter().map(|c| c.ch).eq(*b"nova> ") {
+                    5
+                } else if line.len() >= 2 && line[0].ch == b'>' && line[1].ch == b' ' {
+                    1
+                } else {
+                    0
+                };
+                if prompt_len > 0 && row > 0 {
+                    scene.fill_rect(Rect::new(ox + TERM_PAD - 4, y - 3, w.w - 2 * TERM_PAD + 8, 1), 0x2A2C3E);
                 }
-                if cell.ch != b' ' {
-                    scene.glyph(x, y, cell.ch, PALETTE[cell.fg as usize & 15], None, 1);
+                for (col, cell) in line.iter().enumerate() {
+                    let x = ox + TERM_PAD + col as i32 * cw;
+                    if x + cw > ox + w.w - TERM_PAD + cw {
+                        break;
+                    }
+                    if cell.bg != 0 {
+                        scene.fill_rect(Rect::new(x, y, cw, ch), PALETTE[cell.bg as usize & 15]);
+                    }
+                    let is_cursor = focused && back == 0 && row == cur_row && col == cur_col;
+                    if is_cursor {
+                        scene.fill_round_rect(Rect::new(x, y + 1, cw, ch - 2), 2, theme::ACCENT);
+                    }
+                    if cell.ch == b' ' {
+                        continue;
+                    }
+                    let mut fg = PALETTE[cell.fg as usize & 15];
+                    if col < prompt_len {
+                        fg = theme::ACCENT;
+                    }
+                    if is_cursor {
+                        fg = PALETTE[0];
+                    }
+                    let c = crate::textgrid::char_of(cell.ch);
+                    if mono && draw_box_char(scene, c, Rect::new(x, y, cw, ch), fg) {
+                        continue;
+                    }
+                    if mono {
+                        let mut buf = [0u8; 4];
+                        let text = c.encode_utf8(&mut buf);
+                        let weight = if col < prompt_len || cell.fg >= 8 { crate::font::Weight::MonoBold } else { crate::font::Weight::Mono };
+                        crate::font::draw(scene, x, y + 1, text, TERM_FONT, weight, fg);
+                    } else {
+                        scene.glyph(x, y, cell.ch, fg, None, 1);
+                    }
                 }
-                if i == cursor && focused {
-                    scene.fill_rect(Rect::new(x, y + FONT_HEIGHT as i32 - 2, FONT_WIDTH as i32, 2), theme::ACCENT);
-                }
+            }
+            // Scrollback position indicator.
+            if back > 0 {
+                let label = alloc::format!("{back} lines up  \u{00b7}  scroll down for live output");
+                let lw = crate::font::width(&label, 13, crate::font::Weight::Bold) + 24;
+                let pill = Rect::new(ox + w.w - lw - 16, oy + 10, lw, 26);
+                scene.fill_round_rect(pill, 13, theme::ACCENT);
+                crate::font::draw(scene, pill.x + 12, pill.y + 5, &label, 13, crate::font::Weight::Bold, 0xFFFFFF);
             }
             g.dirty = false;
         }

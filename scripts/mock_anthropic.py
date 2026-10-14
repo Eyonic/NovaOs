@@ -49,6 +49,30 @@ def betas(headers):
     return [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
 LOG = None
 LOCK = threading.Lock()
+SAMPLE_RS = """// A small Rust program for the editor test.
+use std::collections::HashMap;
+
+/// Count how often each word appears.
+fn word_counts(text: &str) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    for word in text.split_whitespace() {
+        *counts.entry(word.to_lowercase()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn main() {
+    let text = "the quick brown fox jumps over the lazy dog";
+    let counts = word_counts(text);
+    let mut words: Vec<_> = counts.iter().collect();
+    words.sort_by(|a, b| b.1.cmp(a.1)); /* most common first */
+    for (word, n) in words.iter().take(3) {
+        println!("{word}: {n}");
+    }
+    let total: usize = counts.values().sum();
+    println!("{} words, {} distinct", total, counts.len());
+}
+"""
 COMFY_JOBS = set()
 SIGNATURES = {}  # thinking text -> signature we sent
 ATTEMPTS = {}
@@ -292,6 +316,23 @@ def respond(body):
         ok = bool(images) and base64.b64decode(images[0]["source"]["data"]).startswith(b"\x89PNG")
         log(f"generate_image result: {result_text(result)!r}, png ok: {ok}")
         s.text("Poster image ready." if ok and "Saved a 256x144 PNG" in result_text(result) else "The image failed: " + result_text(result))
+        return s.finish("end_turn")
+
+    if "show the files" in first:   # opens the Files app
+        if step == 0:
+            s.tool("toolu_fm_1", "launch_app", {"path": "system/apps/files.rhai"})
+            return s.finish("tool_use")
+        s.text("Files is open.")
+        return s.finish("end_turn")
+
+    if "show the editor" in first:   # opens a sample file in the Text Editor
+        if step == 0:
+            s.tool("toolu_ed_1", "write_file", {"path": "notes/hello.rs", "content": SAMPLE_RS})
+            return s.finish("tool_use")
+        if step == 1:
+            s.tool("toolu_ed_2", "launch_app", {"path": "notes/hello.rs"})
+            return s.finish("tool_use")
+        s.text("The editor is open.")
         return s.finish("end_turn")
 
     if first.startswith("open url "):   # diagnostic: a real site in Nova Browser

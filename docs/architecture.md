@@ -324,6 +324,25 @@ tinted when drawn (`Canvas::draw_mask`).
 Window content is a `gfx::Canvas` handed over by the app (`wm::present`) or a terminal grid.
 Apps receive `wm::Event`s (keys, mouse down/up/move, wheel, resize, close).
 
+## Core apps (0.7)
+
+The Terminal, Text Editor and Files are native Rust programs (clean-room designs after the
+best-regarded apps of their kind: Ghostty/Kitty and Warp for the terminal, Zed and Sublime Text
+for the editor, Finder and Dolphin for files), sharing `ui.rs` (palette, clipboard, widgets).
+
+- **Terminal** (wm.rs rendering, textgrid.rs): cells drawn in the monospace font (Adwaita
+  Mono, else DejaVu Sans Mono) with box-drawing characters drawn as lines so frames join;
+  2,000 lines of scrollback (`TextGrid::history`, the wheel scrolls, output snaps back);
+  prompt lines start "command blocks" with a hairline and an accent prompt.
+- **Text Editor** (`editor.rs`): one window, documents in tabs; explorer tree from path
+  prefixes; per-line syntax colouring (with /* */ state) for Rust, C-like, Rhai, Python,
+  shell/config, Markdown and JSON; undo groups typing; auto-indent and bracket pairs.
+  `apps::launch` opens non-app files in it; `system/apps/editor.rhai` routes here.
+- **Files** (`files.rs`): folders are path prefixes; grid with PNG thumbnails and app icons
+  or a list with kind, size and age; preview pane; `system/apps/files.rhai` routes here.
+
+The keyboard driver also decodes Home, End, Page Up/Down and Delete for them.
+
 ## Apps (0.4)
 
 Apps are Rhai scripts (`apps.rs`), each in its own task and window. Header comments give title,

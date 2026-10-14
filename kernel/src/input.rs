@@ -22,6 +22,11 @@ pub enum Key {
     Right,
     /// The Windows (Super) key: always brings back Home.
     Super,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Delete,
 }
 
 const RING_SIZE: usize = 256; // power of two

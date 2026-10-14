@@ -21,11 +21,17 @@ pub static FONT: &[u8; 256 * FONT_HEIGHT] = include_bytes!("font/spleen-8x16.bin
 const CP437: [char; 256] = ['\u{0000}', '\u{263a}', '\u{263b}', '\u{2665}', '\u{2666}', '\u{2663}', '\u{2660}', '\u{2022}', '\u{25d8}', '\u{25cb}', '\u{25d9}', '\u{2642}', '\u{2640}', '\u{266a}', '\u{266b}', '\u{263c}', '\u{25ba}', '\u{25c4}', '\u{2195}', '\u{203c}', '\u{00b6}', '\u{00a7}', '\u{25ac}', '\u{21a8}', '\u{2191}', '\u{2193}', '\u{2192}', '\u{2190}', '\u{221f}', '\u{2194}', '\u{25b2}', '\u{25bc}', '\u{0020}', '\u{0021}', '\u{0022}', '\u{0023}', '\u{0024}', '\u{0025}', '\u{0026}', '\u{0027}', '\u{0028}', '\u{0029}', '\u{002a}', '\u{002b}', '\u{002c}', '\u{002d}', '\u{002e}', '\u{002f}', '\u{0030}', '\u{0031}', '\u{0032}', '\u{0033}', '\u{0034}', '\u{0035}', '\u{0036}', '\u{0037}', '\u{0038}', '\u{0039}', '\u{003a}', '\u{003b}', '\u{003c}', '\u{003d}', '\u{003e}', '\u{003f}', '\u{0040}', '\u{0041}', '\u{0042}', '\u{0043}', '\u{0044}', '\u{0045}', '\u{0046}', '\u{0047}', '\u{0048}', '\u{0049}', '\u{004a}', '\u{004b}', '\u{004c}', '\u{004d}', '\u{004e}', '\u{004f}', '\u{0050}', '\u{0051}', '\u{0052}', '\u{0053}', '\u{0054}', '\u{0055}', '\u{0056}', '\u{0057}', '\u{0058}', '\u{0059}', '\u{005a}', '\u{005b}', '\u{005c}', '\u{005d}', '\u{005e}', '\u{005f}', '\u{0060}', '\u{0061}', '\u{0062}', '\u{0063}', '\u{0064}', '\u{0065}', '\u{0066}', '\u{0067}', '\u{0068}', '\u{0069}', '\u{006a}', '\u{006b}', '\u{006c}', '\u{006d}', '\u{006e}', '\u{006f}', '\u{0070}', '\u{0071}', '\u{0072}', '\u{0073}', '\u{0074}', '\u{0075}', '\u{0076}', '\u{0077}', '\u{0078}', '\u{0079}', '\u{007a}', '\u{007b}', '\u{007c}', '\u{007d}', '\u{007e}', '\u{2302}', '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}', '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}', '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}', '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}', '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}', '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}', '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}', '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}', '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}', '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}', '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}', '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}', '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}', '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}', '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}', '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}'];
 /// VGA-style 16-color palette as 0xRRGGBB, indexed by ANSI color number (8-15 = bright).
 pub const PALETTE: [u32; 16] = [
-    0x1E1E2E, 0xE06C75, 0x98C379, 0xE5C07B, 0x61AFEF, 0xC678DD, 0x56B6C2, 0xCDD3DE,
-    0x5C6370, 0xFF7B85, 0xB5E890, 0xFFD787, 0x82C4FF, 0xDDA0F0, 0x7FDBE6, 0xFFFFFF,
+    // Nova's terminal theme: deep ink background, soft pastels tuned to the desktop.
+    0x14151F, 0xF0717E, 0x8FD694, 0xF2C46D, 0x7AA8FF, 0xB89CFF, 0x5FD3D0, 0xD5D7E5,
+    0x6A6E85, 0xFF8B95, 0xA9F0AD, 0xFFD991, 0x9CC0FF, 0xCDB8FF, 0x86E8E4, 0xFFFFFF,
 ];
 pub const DEFAULT_FG: u8 = 7;
 pub const DEFAULT_BG: u8 = 0;
+
+/// The Unicode character a cell's CP437 byte stands for (for TrueType rendering).
+pub fn char_of(b: u8) -> char {
+    CP437[b as usize]
+}
 
 /// The font glyph for a character: exact CP437 match, else a look-alike, else '?'.
 pub fn glyph(c: char) -> u8 {
@@ -86,14 +92,21 @@ pub struct TextGrid {
     /// Partial UTF-8 sequence: (code point so far, continuation bytes still expected).
     utf8: (u32, u8),
     pub cells: Vec<Cell>,
+    /// Lines that scrolled off the top (oldest first), at most SCROLLBACK.
+    pub history: alloc::collections::VecDeque<Vec<Cell>>,
+    /// How many lines the view is scrolled back (0 = live).
+    pub view_offset: usize,
     /// Set by every change; renderers clear it.
     pub dirty: bool,
 }
 
+/// Lines of scrollback kept per terminal.
+pub const SCROLLBACK: usize = 2000;
+
 impl TextGrid {
     pub fn new(cols: usize, rows: usize) -> Self {
         let (cols, rows) = (cols.max(1), rows.max(1));
-        Self { cols, rows, col: 0, row: 0, fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false, parser: Parser::Normal, utf8: (0, 0), cells: vec![BLANK; cols * rows], dirty: true }
+        Self { cols, rows, col: 0, row: 0, fg: DEFAULT_FG, bg: DEFAULT_BG, bold: false, parser: Parser::Normal, utf8: (0, 0), cells: vec![BLANK; cols * rows], history: alloc::collections::VecDeque::new(), view_offset: 0, dirty: true }
     }
 
     /// Change the size, keeping the bottom-most text.
@@ -117,6 +130,28 @@ impl TextGrid {
         self.dirty = true;
     }
 
+    /// Scroll the view back (positive) or forward (negative) through the scrollback.
+    pub fn scroll_view(&mut self, lines: i32) {
+        let max = self.history.len() as i32;
+        let new = (self.view_offset as i32 + lines).clamp(0, max) as usize;
+        if new != self.view_offset {
+            self.view_offset = new;
+            self.dirty = true;
+        }
+    }
+
+    /// The cells of screen row `r` as currently viewed (scrollback or live).
+    pub fn view_row(&self, r: usize) -> &[Cell] {
+        let back = self.view_offset.min(self.history.len());
+        if r < back {
+            let line = &self.history[self.history.len() - back + r];
+            &line[..line.len().min(self.cols)]
+        } else {
+            let lr = r - back;
+            &self.cells[lr * self.cols..(lr + 1) * self.cols]
+        }
+    }
+
     /// Index of the cursor cell.
     pub fn cursor_index(&self) -> usize {
         self.row * self.cols + self.col.min(self.cols - 1)
@@ -133,6 +168,10 @@ impl TextGrid {
             return;
         }
         let (cols, len) = (self.cols, self.rows * self.cols);
+        if self.history.len() >= SCROLLBACK {
+            self.history.pop_front();
+        }
+        self.history.push_back(self.cells[..cols].to_vec());
         self.cells.copy_within(cols..len, 0);
         let blank = self.blank();
         self.cells[len - cols..len].fill(blank);
@@ -211,6 +250,9 @@ impl TextGrid {
     }
 
     pub fn write_byte(&mut self, byte: u8) {
+        if self.view_offset != 0 {
+            self.view_offset = 0;
+        }
         self.dirty = true;
         // UTF-8 continuation of a multi-byte character.
         if self.utf8.1 > 0 {

@@ -19,11 +19,16 @@ use crate::sync::SpinLock;
 pub enum Weight {
     Regular,
     Bold,
+    /// Monospace (terminals, code): Adwaita Mono, else DejaVu Sans Mono.
+    Mono,
+    MonoBold,
 }
 
 struct Fonts {
     regular: Option<Font>,
     bold: Option<Font>,
+    mono: Option<Font>,
+    mono_bold: Option<Font>,
     /// (weight, size in px, char) -> (advance, x offset, y offset from baseline, w, h, coverage)
     glyphs: BTreeMap<(Weight, u16, char), Glyph>,
 }
@@ -49,9 +54,20 @@ fn with_fonts<R>(f: impl FnOnce(&mut Fonts) -> R) -> R {
     let fonts = guard.get_or_insert_with(|| Fonts {
         regular: load("usr/share/fonts/noto/NotoSans-Regular.ttf"),
         bold: load("usr/share/fonts/noto/NotoSans-Bold.ttf"),
+        mono: load("usr/share/fonts/mono/Mono-Regular.ttf"),
+        mono_bold: load("usr/share/fonts/mono/Mono-Bold.ttf"),
         glyphs: BTreeMap::new(),
     });
     f(fonts)
+}
+
+/// Cell size (width, height) of the monospace font at `size`, if it is installed.
+pub fn mono_cell(size: u16) -> Option<(i32, i32)> {
+    with_fonts(|f| {
+        f.mono.as_ref()?;
+        let w = f.glyph(Weight::Mono, size, 'M').map(|g| g.advance)?;
+        Some((rnd(w).max(1), line_height(size)))
+    })
 }
 
 /// True when the UI font is installed (otherwise text uses the bitmap font).
@@ -64,6 +80,8 @@ impl Fonts {
         match weight {
             Weight::Bold => self.bold.as_ref().or(self.regular.as_ref()),
             Weight::Regular => self.regular.as_ref(),
+            Weight::Mono => self.mono.as_ref(),
+            Weight::MonoBold => self.mono_bold.as_ref().or(self.mono.as_ref()),
         }
     }
 

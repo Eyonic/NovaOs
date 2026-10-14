@@ -53,6 +53,13 @@ for f in NotoSans-Regular.ttf NotoSans-Bold.ttf; do
     [[ -f "/usr/share/fonts/noto/$f" ]] && src="/usr/share/fonts/noto/$f"
     if [[ "$(basename "${src:-}")" == "$f" ]]; then cp -L "$src" "$SYSROOT/usr/share/fonts/noto/$f"; else log "warning: UI font $f not found (install Noto Sans); the desktop falls back to the bitmap font"; fi
 done
+# The terminal and code font: Adwaita Mono (SIL Open Font License), else DejaVu Sans Mono.
+mkdir -p "$SYSROOT/usr/share/fonts/mono"
+for style in Regular Bold; do
+    for src in "/usr/share/fonts/Adwaita/AdwaitaMono-$style.ttf" "/usr/share/fonts/TTF/DejaVuSansMono${style/Regular/}.ttf"; do
+        if [[ -f "$src" ]]; then cp -L "$src" "$SYSROOT/usr/share/fonts/mono/Mono-$style.ttf"; break; fi
+    done
+done
 # Shields filter lists (scripts/fetch-filters.sh), if downloaded.
 if compgen -G "$BUILD/filters/*.txt" >/dev/null; then
     mkdir -p "$SYSROOT/usr/share/nova/shields"

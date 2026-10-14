@@ -115,6 +115,11 @@ impl Decoder {
             (true, 0x4B) => return Some(Key::Left),
             (true, 0x4D) => return Some(Key::Right),
             (true, 0x5B | 0x5C) => return Some(Key::Super), // left/right Windows key
+            (true, 0x47) => return Some(Key::Home),
+            (true, 0x4F) => return Some(Key::End),
+            (true, 0x49) => return Some(Key::PageUp),
+            (true, 0x51) => return Some(Key::PageDown),
+            (true, 0x53) => return Some(Key::Delete),
             (true, 0x1C) => return Some(Key::Char(b'\n')), // keypad Enter
             (true, 0x35) => return Some(Key::Char(b'/')),  // keypad /
             (false, m) if (m as usize) < NORMAL.len() => {

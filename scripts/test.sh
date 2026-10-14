@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net chromium browser setup installed hostlogin deepseek oom)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -80,7 +80,8 @@ define_case() {
         installed) # Boot the disk the setup case installed: desktop, Claude Code builds an app.
                 CMDLINE=""; MOCK=1; BOOT_IMAGE="${run_dir:-}/target.img"
                 QEMU_EXTRA=(-device ich9-intel-hda)
-                INPUT=("wait:$CLAUDE_BOX" "wait:> " "ser:make me a clock app" "wait:Your clock app is ready")
+                INPUT=("wait:$CLAUDE_BOX" "wait:> " "ser:make me a clock app" "wait:Your clock app is ready"
+                       "sleep:2" "key:meta_l" "sleep:1" "key:up" "key:up" "key:up" "key:ret" "sleep:3" "dump:terminal.ppm")
                 EXPECT=("$EXPECTED_BANNER" "$CLAUDE_BOX" "> make me a clock app" "⏺ Write(apps/clock.rhai)"
                         "⏺ CheckApp(apps/clock.rhai)" "  ⎿  OK, screenshot attached" "⏺ Launch(apps/clock.rhai)")
                 CONTAINS=("storage: installed system, NovaFS on sata0" "Rust port drafted by Claude (drivers/intel_hda.rs)"
@@ -134,6 +135,17 @@ define_case() {
                 EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
                 CONTAINS=("nettest: HTTP/1.1 404 Not Found" "nettest: MSG_PEEK kept the data")
                 FORBID=("$PANIC" "$EXC" "segmentation fault" "illegal instruction") ;;
+        apps)   # Native apps on the desktop: the Text Editor with a sample file (quick open,
+                # find) and Files (grid, preview, list), with screenshots for review.
+                CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1; CASE_TIMEOUT=120
+                INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:> " "ser:show the editor" "wait:The editor is open."
+                       "sleep:2" "dump:editor.ppm" "key:ctrl-p" "key:h" "key:e" "sleep:1" "dump:editor-open.ppm"
+                       "key:esc" "key:ctrl-f" "key:w" "key:o" "key:r" "key:d" "key:ret" "sleep:1" "dump:editor-find.ppm"
+                       "key:esc" "ser:/clear" "wait:conversation cleared" "ser:show the files" "wait:Files is open." "sleep:2" "dump:files.ppm"
+                       "key:right" "key:right" "sleep:1" "dump:files-preview.ppm" "key:ctrl-l" "sleep:1" "dump:files-list.ppm")
+                EXPECT=("$EXPECTED_BANNER" "⏺ Launch(notes/hello.rs)")
+                CONTAINS=("The editor is open.")
+                FORBID=("$PANIC" "$EXC" "API error") ;;
         webpage) # Diagnostic (needs internet, not in --all): Nova Browser opens WEB_URL (default
                 # DuckDuckGo), logs every host that served it, and saves a screenshot.
                 CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no nova.browser_log"; MOCK=1; CASE_TIMEOUT=180

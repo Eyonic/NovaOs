@@ -152,6 +152,11 @@ fn key_name(k: Key) -> String {
         Key::Left => "Left".into(),
         Key::Right => "Right".into(),
         Key::Super => "Super".into(),
+        Key::Home => "Home".into(),
+        Key::End => "End".into(),
+        Key::PageUp => "PageUp".into(),
+        Key::PageDown => "PageDown".into(),
+        Key::Delete => "Delete".into(),
     }
 }
 
@@ -464,7 +469,28 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Start the app at `path` in a new window and task.
+/// Bundled apps that are native Rust programs now (their .rhai files remain as the
+/// entries Home lists and other apps launch).
+const NATIVE_EDITOR: &str = "system/apps/editor.rhai";
+const NATIVE_FILES: &str = "system/apps/files.rhai";
+
 pub fn launch(path: &str) -> Result<(), String> {
+    if path == NATIVE_EDITOR {
+        // Files hands the document over in system/editor-open.
+        let doc = fs::read_string("system/editor-open").ok().filter(|p| !p.trim().is_empty());
+        let _ = fs::delete("system/editor-open");
+        crate::editor::open(doc.map(|p| p.trim().into()));
+        return Ok(());
+    }
+    if path == NATIVE_FILES {
+        crate::files::open("");
+        return Ok(());
+    }
+    if !path.ends_with(".rhai") {
+        // A document: open it in the Text Editor.
+        crate::editor::open(Some(path.into()));
+        return Ok(());
+    }
     let src = fs::read_string(path)?;
     let meta = info(path, &src);
     let win = wm::open(&meta.title, meta.icon, meta.color, meta.width, meta.height, Content::Canvas(Canvas::new(meta.width as usize, meta.height as usize)));
@@ -566,6 +592,9 @@ pub fn check(path: &str, events: &[String]) -> Result<CheckReport, String> {
 /// Render an app's current frame without a window (for desktop previews): load it,
 /// run init, `ticks` ticks and draw. None if it fails.
 pub fn snapshot(path: &str, ticks: u32) -> Option<Canvas> {
+    if path == NATIVE_EDITOR || path == NATIVE_FILES {
+        return None; // native app: Home shows its poster
+    }
     let src = fs::read_string(path).ok()?;
     let meta = info(path, &src);
     let (mut app, _) = Running::load("preview", &src, None, meta.width, meta.height).ok()?;

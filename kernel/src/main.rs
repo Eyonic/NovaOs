@@ -12,6 +12,8 @@ mod claude;
 mod console;
 mod cpu;
 mod drivers;
+mod editor;
+mod files;
 mod font;
 mod fs;
 mod fwcfg;
@@ -52,6 +54,7 @@ mod task;
 mod textgrid;
 mod tls;
 mod tty;
+mod ui;
 mod wm;
 
 use core::arch::asm;
