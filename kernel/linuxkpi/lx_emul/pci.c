@@ -15,6 +15,7 @@
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/bitfield.h>
+#include <linux/radix-tree.h>
 #include "nova.h"
 
 const struct bus_type pci_bus_type = { .name = "pci" };
@@ -912,6 +913,9 @@ extern initcall_entry_t __nova_initcall_start[], __nova_initcall_end[];
 void nova_lx_start(void)
 {
 	initcall_entry_t *entry;
+
+	/* What start_kernel() sets up before any initcall runs. */
+	radix_tree_init();
 
 	for (entry = __nova_initcall_start; entry < __nova_initcall_end; entry++) {
 		initcall_t fn = (initcall_t)offset_to_ptr(entry);

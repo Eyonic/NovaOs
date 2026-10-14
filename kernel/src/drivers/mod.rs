@@ -108,6 +108,7 @@ pub fn probe_all(mut progress: impl FnMut(&Record)) -> Probed {
 /// which devices they bound; their network devices join `probed.nics`.
 #[cfg(feature = "linux-drivers")]
 fn bind_linux(records: &mut [Record], probed: &mut Probed) {
+    crate::linuxkpi::spawn_poller();
     crate::linuxkpi::start();
     for r in records.iter_mut().filter(|r| matches!(r.status, Status::Missing)) {
         if let Some(name) = crate::linuxkpi::driver_for(&r.device) {
@@ -119,7 +120,6 @@ fn bind_linux(records: &mut [Record], probed: &mut Probed) {
     for nic in crate::linuxkpi::take_nics() {
         probed.nics.push(Box::new(nic));
     }
-    crate::linuxkpi::spawn_poller();
 }
 
 /// Nova drivers switched off with `nova.disable_driver=name[,name...]` on the kernel

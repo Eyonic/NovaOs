@@ -48,6 +48,12 @@ done < "$KPI/linux-objects.txt"
 for o in $(sed -n 's/^obj-y += //p' "$KPI/lx_emul/Makefile"); do objects+=("nova/$o"); done
 
 log "Building ${#objects[@]} Linux objects with Kbuild"
-kmake "${objects[@]}" || fail "Linux objects failed to build (log: $LOG)"
+# arch/x86/lib objects are reachable through two Kbuild rules (lib-y and obj-y), so a
+# parallel build can compile one twice at once and race on its .d file: build those
+# first, one at a time.
+arch=() rest=()
+for o in "${objects[@]}"; do [[ "$o" == arch/* ]] && arch+=("$o") || rest+=("$o"); done
+(( ${#arch[@]} )) && { make -C "$LINUX" ARCH=x86_64 -j1 "${arch[@]}" >>"$LOG" 2>&1 || fail "Linux objects failed to build (log: $LOG)"; }
+kmake "${rest[@]}" || fail "Linux objects failed to build (log: $LOG)"
 printf '%s\n' "${objects[@]/#/$LINUX/}" > "$LINUX/nova-objects.list"
 log "Linux objects ready ($LINUX/nova-objects.list)"

@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet linuxmsi nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -45,11 +45,12 @@ CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
 # a key through the QEMU monitor).
 # QEMU_EXTRA: extra QEMU arguments. NIC: QEMU network card model (default e1000).
 # FRESH_TARGET: create an empty 2 GiB disk image of that name in the run directory first.
-# BOOT_DEVICE: how the boot image is attached, sata (default) or nvme. EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
+# BOOT_DEVICE: how the boot image is attached, sata (default) or nvme.
+# MACHINE_OPTS: extra q35 machine options (e.g. i8042=off); VMPORT=off drops the vmmouse port. EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
 # MOCK=1: run with the mock Anthropic API and fail on any protocol violation it logs.
 define_case() {
     EXPECT=() CONTAINS=() FORBID=("$PANIC" "$EXC" "NESTED") CHECK_RIP=0 CMDLINE="nova.test=$1"
-    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET="" SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000 BOOT_DEVICE=sata
+    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET="" SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000 BOOT_DEVICE=sata MACHINE_OPTS="" VMPORT=on
     local fault=("$EXC" "$STATUS" "$HALTED")
     local fault_forbid=("$PANIC" "$SHELL_START" "NESTED")
     local shell=("$EXPECTED_BANNER" "$STATUS" "$SHELL_START")
@@ -146,6 +147,17 @@ define_case() {
                 CONTAINS=("linux/8139cp  Linux " "[nova] linux: eth0: link up" "network: online, address 10.0.2.15/24"
                           "nettest: HTTP/1.1 404 Not Found")
                 FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
+        usbinput) # The Linux USB stack: xHCI, USB core, HID and the input core, bridged to Nova's
+                # keyboard and mouse. The machine has no PS/2 controller, so every keystroke the
+                # shell sees comes through the USB keyboard.
+                CMDLINE="nova.mode=shell"; MACHINE_OPTS="i8042=off"; VMPORT=off
+                [[ ",${FEATURES:-}," == *,linux-drivers,* ]] || SKIP="kernel built without FEATURES=linux-drivers"
+                QEMU_EXTRA=(-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 -device usb-tablet,bus=xhci.0)
+                INPUT=("wait:$PROMPT" "wait:linux: input: QEMU QEMU USB Tablet" "kbd:echo typed over usb")
+                EXPECT=("${shell[@]}" "typed over usb")
+                CONTAINS=("linux/xhci_hcd  Linux " "new high-speed USB device number 2 using xhci_hcd"
+                          "linux: input: QEMU QEMU USB Keyboard" "keyboard: no response from PS/2 controller")
+                FORBID=("$PANIC" "$EXC" "NESTED" "probe failed" "kfree of unknown pointer") ;;
         nvme)   # Nova's NVMe driver: install from the live image onto an empty NVMe drive.
                 CMDLINE="nova.mode=shell"; FRESH_TARGET=nvme.img
                 QEMU_EXTRA=(-drive "if=none,id=nv0,format=raw,file=${run_dir:-}/nvme.img" -device nvme,serial=nova-test,drive=nv0)
@@ -343,7 +355,7 @@ run_case() {
     OVMF_VARS="$run_dir/$1.OVMF_VARS.fd"
     cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
     # shellcheck disable=SC2046
-    IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" NOVA_NIC="$NIC" NOVA_BOOT_DEVICE="$BOOT_DEVICE" qemu_base_args) -display none \
+    IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" NOVA_NIC="$NIC" NOVA_BOOT_DEVICE="$BOOT_DEVICE" NOVA_MACHINE_OPTS="$MACHINE_OPTS" NOVA_VMPORT="$VMPORT" qemu_base_args) -display none \
         -chardev "pipe,id=com1,path=$fifo/serial" -serial chardev:com1 \
         -chardev "pipe,id=mon,path=$fifo/monitor" -mon chardev=mon,mode=readline "${QEMU_EXTRA[@]}" >"$qemu_log" 2>&1 &
     local pid=$!

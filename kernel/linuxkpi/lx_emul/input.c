@@ -58,7 +58,8 @@ static void nova_input_disconnect(struct input_handle *handle)
 }
 
 static const struct input_device_id nova_input_ids[] = {
-	{ .driver_info = 1 }, /* match every device */
+	/* Every device: an event-bit match with an empty mask (the table ends at flags == 0). */
+	{ .flags = INPUT_DEVICE_ID_MATCH_EVBIT },
 	{ },
 };
 

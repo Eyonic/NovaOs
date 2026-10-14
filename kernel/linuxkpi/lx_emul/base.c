@@ -84,12 +84,7 @@ static void *lx_kmalloc(size_t size, gfp_t flags)
 	return nova_alloc(size, align, flags & __GFP_ZERO, flags & (GFP_DMA32 | GFP_DMA));
 }
 
-/* The objects only use the caches as tokens for their size class. */
-struct kmem_cache {
-	const char *name;
-	unsigned int size, align;
-	void (*ctor)(void *);
-};
+/* The objects only use the kmalloc caches as tokens for their size class. */
 kmem_buckets kmalloc_caches[NR_KMALLOC_TYPES];
 
 void *__kmalloc_noprof(DECL_TOKEN_PARAMS(size, token), gfp_t flags)

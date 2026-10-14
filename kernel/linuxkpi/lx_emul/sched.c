@@ -25,6 +25,9 @@
 #include <linux/list.h>
 #include "nova.h"
 
+void nova_park(void);
+void nova_wake(u64 task_id);
+
 /* ---------------------------------------------------------------- timers */
 
 static HLIST_HEAD(lx_timers);
@@ -150,8 +153,26 @@ struct workqueue_struct *system_bh_wq = &lx_system_wq;
 struct workqueue_struct *system_bh_highpri_wq = &lx_system_wq;
 struct workqueue_struct *system_dfl_long_wq = &lx_system_wq;
 
-/* Every queue feeds one list: there is one CPU and one worker. */
+/*
+ * Every queue feeds one list, served by a small pool of worker tasks (started by Nova
+ * before the initcalls, linuxkpi.rs). A work item that sleeps (waiting for a USB
+ * transfer, say) blocks only its worker; the others keep the list moving, as Linux's
+ * worker pools do. Timers, NAPI and threaded handlers stay in the "linux" task.
+ */
+#define LX_WORKERS 4
 static LIST_HEAD(lx_work_list);
+static struct work_struct *lx_running[LX_WORKERS];
+static u64 lx_worker_task[LX_WORKERS];
+static unsigned int lx_workers;
+
+static void lx_wake_workers(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < lx_workers; i++)
+		if (!lx_running[i])
+			nova_wake(lx_worker_task[i]);
+}
 
 struct workqueue_struct *alloc_workqueue_noprof(const char *fmt, unsigned int flags, int max_active, ...)
 {
@@ -174,6 +195,7 @@ static void lx_work_enqueue(struct work_struct *work)
 	local_irq_save(flags);
 	list_add_tail(&work->entry, &lx_work_list);
 	local_irq_restore(flags);
+	lx_wake_workers();
 }
 
 bool queue_work_on(int cpu, struct workqueue_struct *wq, struct work_struct *work)
@@ -222,6 +244,28 @@ static bool lx_work_unqueue(struct work_struct *work, struct timer_list *timer)
 	return true;
 }
 
+static bool lx_work_running(struct work_struct *work)
+{
+	unsigned int i;
+
+	for (i = 0; i < lx_workers; i++)
+		if (lx_running[i] == work && lx_worker_task[i] != nova_task_id())
+			return true;
+	return false;
+}
+
+/* Wait until no other worker runs `work` (a work item waiting for itself returns). */
+static bool lx_work_wait(struct work_struct *work)
+{
+	bool waited = false;
+
+	while (lx_work_running(work)) {
+		waited = true;
+		nova_park();
+	}
+	return waited;
+}
+
 bool mod_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed_work *dwork,
 			 unsigned long delay)
 {
@@ -236,12 +280,12 @@ bool cancel_work(struct work_struct *work)
 	return lx_work_unqueue(work, NULL);
 }
 
-/* Work items run only in lx_emul_work_run, between calls of which nothing is running,
- * so cancelling never has to wait for a running instance (unless a work item cancels
- * itself, which then simply returns). */
 bool cancel_work_sync(struct work_struct *work)
 {
-	return lx_work_unqueue(work, NULL);
+	bool was_pending = lx_work_unqueue(work, NULL);
+
+	lx_work_wait(work);
+	return was_pending;
 }
 
 bool cancel_delayed_work(struct delayed_work *dwork)
@@ -251,33 +295,36 @@ bool cancel_delayed_work(struct delayed_work *dwork)
 
 bool cancel_delayed_work_sync(struct delayed_work *dwork)
 {
-	return lx_work_unqueue(&dwork->work, &dwork->timer);
-}
+	bool was_pending = lx_work_unqueue(&dwork->work, &dwork->timer);
 
-static void lx_work_execute(struct work_struct *work)
-{
-	clear_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work));
-	work->func(work);
+	lx_work_wait(&dwork->work);
+	return was_pending;
 }
 
 bool flush_work(struct work_struct *work)
 {
-	if (!lx_work_unqueue(work, NULL))
-		return false;
-	work->func(work);
-	return true;
+	if (lx_work_unqueue(work, NULL)) {
+		work->func(work);
+		return true;
+	}
+	return lx_work_wait(work);
 }
 
 bool flush_delayed_work(struct delayed_work *dwork)
 {
-	if (!lx_work_unqueue(&dwork->work, &dwork->timer))
-		return false;
-	dwork->work.func(&dwork->work);
-	return true;
+	if (lx_work_unqueue(&dwork->work, &dwork->timer)) {
+		dwork->work.func(&dwork->work);
+		return true;
+	}
+	return lx_work_wait(&dwork->work);
 }
 
-void lx_emul_work_run(void)
+/* One worker task (index `n`); never returns. Called from Nova (linuxkpi.rs). */
+void nova_lx_worker(unsigned int n)
 {
+	lx_worker_task[n] = nova_task_id();
+	if (n + 1 > lx_workers)
+		lx_workers = n + 1;
 	for (;;) {
 		struct work_struct *work = NULL;
 		unsigned long flags;
@@ -286,22 +333,41 @@ void lx_emul_work_run(void)
 		if (!list_empty(&lx_work_list)) {
 			work = list_first_entry(&lx_work_list, struct work_struct, entry);
 			list_del_init(&work->entry);
+			lx_running[n] = work;
+			/* Cleared before running, so the item can queue itself again. */
+			clear_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work));
 		}
 		local_irq_restore(flags);
-		if (!work)
-			return;
-		lx_work_execute(work);
+		if (!work) {
+			nova_park();
+			continue;
+		}
+		work->func(work);
+		lx_running[n] = NULL;
 	}
+}
+
+static bool lx_work_idle(void)
+{
+	unsigned int i;
+
+	if (!list_empty(&lx_work_list))
+		return false;
+	for (i = 0; i < lx_workers; i++)
+		if (lx_running[i] && lx_worker_task[i] != nova_task_id())
+			return false;
+	return true;
 }
 
 void __flush_workqueue(struct workqueue_struct *wq)
 {
-	lx_emul_work_run();
+	while (!lx_work_idle())
+		nova_park();
 }
 
 void destroy_workqueue(struct workqueue_struct *wq)
 {
-	lx_emul_work_run();
+	__flush_workqueue(wq);
 	if (wq != &lx_system_wq)
 		kfree(wq);
 }
@@ -458,5 +524,5 @@ void nova_lx_poll(void)
 	lx_emul_irq_poll();
 	lx_emul_napi_poll();
 	lx_emul_timers_run();
-	lx_emul_work_run();
+	lx_emul_rcu_run();
 }

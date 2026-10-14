@@ -341,6 +341,32 @@ int devres_release_group(struct device *dev, void *id)
 	return dr ? lx_devres_release_from(dev, dr) : -ENOENT;
 }
 
+static void lx_devm_kmalloc_release(struct device *dev, void *res)
+{
+}
+
+void *devm_kmalloc(struct device *dev, size_t size, gfp_t gfp)
+{
+	void *p = __devres_alloc_node(lx_devm_kmalloc_release, size, gfp | __GFP_ZERO, NUMA_NO_NODE, "kmalloc");
+
+	if (p)
+		devres_add(dev, p);
+	return p;
+}
+
+void devm_kfree(struct device *dev, const void *p)
+{
+	struct lx_devres *dr;
+
+	list_for_each_entry(dr, &dev->devres_head, node) {
+		if (dr->data == p) {
+			list_del_init(&dr->node);
+			kfree(dr);
+			return;
+		}
+	}
+}
+
 struct lx_action {
 	void (*action)(void *);
 	void *data;
@@ -717,7 +743,8 @@ void unregister_chrdev_region(dev_t from, unsigned count)
 int __register_chrdev(unsigned int major, unsigned int baseminor, unsigned int count, const char *name,
 		      const struct file_operations *fops)
 {
-	return major ?: 240;
+	/* As Linux: 0 for a fixed major, the major number when one is assigned. */
+	return major ? 0 : 240;
 }
 
 void __unregister_chrdev(unsigned int major, unsigned int baseminor, unsigned int count, const char *name)

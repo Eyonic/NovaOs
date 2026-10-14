@@ -13,6 +13,16 @@
 
 #include <linux/types.h>
 
+/* Slab caches: lx_emul keeps only what allocation needs (base.c, support.c). */
+struct kmem_cache {
+	const char *name;
+	unsigned int size, align;
+	void (*ctor)(void *);
+};
+
+/* Run RCU callbacks queued by call_rcu() (support.c). */
+void lx_emul_rcu_run(void);
+
 /* ---- provided by Nova (Rust) ---- */
 
 /* Memory. nova_alloc returns direct-map memory (DMA-capable, physically contiguous). */
@@ -80,6 +90,7 @@ int nova_lx_netdev_xmit(void *dev, const u8 *frame, size_t len);
 void lx_emul_irq_poll(void);
 void lx_emul_napi_poll(void);
 void lx_emul_timers_run(void);
-void lx_emul_work_run(void);
+/* One work-queue worker task (index n < 4); never returns. */
+void nova_lx_worker(unsigned int n);
 
 #endif

@@ -145,6 +145,11 @@ void netif_device_attach(struct net_device *dev)
 		netif_tx_wake_all_queues(dev);
 }
 
+/* No qdisc to kick: Nova's stack polls the queue state (nova_lx_netdev_tx_ready). */
+void netif_schedule_queue(struct netdev_queue *txq)
+{
+}
+
 void netif_tx_stop_all_queues(struct net_device *dev)
 {
 	unsigned int i;

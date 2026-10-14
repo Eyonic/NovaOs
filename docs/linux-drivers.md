@@ -13,10 +13,12 @@ and, in spirit, FreeBSD's LinuxKPI: real Linux subsystems and drivers, Nova unde
   Linux 7.2.9 source (build/linux/, GPL-2.0): drivers + library code, compiled by Kbuild
 ```
 
-Status: **milestones 1 and 2a done.** Linux's own network drivers run in Nova and carry its
+Status: **milestones 1-5 done.** Linux's own network drivers run in Nova and carry its
 traffic: `8139cp` (RealTek RTL8139C+, legacy INTx routed by ACPI through the I/O APIC,
 `scripts/test.sh --case linuxnet`) and `e1000e` (Intel 82574, MSI-X through the local APIC,
-`--case linuxmsi`).
+`--case linuxmsi`). Linux's whole USB stack runs too: the xHCI host driver, the USB core
+with hubs, HID and the input core, bridged to Nova's keyboard and mouse
+(`--case usbinput`, on a machine with no PS/2 controller).
 
 ## Building
 
@@ -100,6 +102,19 @@ repository plus the pinned Linux release). Kernels built without the feature are
   (naturally aligned), and their entries in Linux's `vmemmap` array (at `vmemmap_base`, PML4
   slot 468) are backed with memory on demand by `memory::populate`. `put_page()` frees through
   Linux's own refcounting. Compound pages (folios > 1 page) are not supported yet.
+* **Tasks and sleeping** (`task.c`): every Nova task running Linux code has a
+  `task_struct`, and Nova's scheduler points Linux's `current` at it on every switch.
+  `schedule()`, `wake_up_process()`, wait queues, completions, semaphores and rwsems follow
+  Linux's protocol on top of Nova's park/wake. Work items run on a pool of four worker
+  tasks, so one that sleeps (a USB control transfer waiting for its completion, delivered
+  by another work item) does not block the rest, as with Linux's worker pools.
+* **Driver core** (`device.c`): buses, drivers, match-then-probe on `device_add()` and
+  `driver_register()`, reference-counted devices with release functions, real devres lists
+  and groups. sysfs is enabled in the configuration (the USB hub driver treats a missing
+  sysfs node as an error) and implemented as placeholders that accept everything.
+* **Input bridge** (`input.c`, `linuxkpi.rs`): an input handler attached to every Linux input
+  device turns keys into PS/2 set 1 scan codes and pointer motion (relative or absolute) into
+  Nova mouse reports.
 * **Network bridge**: a Linux `net_device` becomes a `LinuxNic` (the `Nic` trait of Nova's
   network stack). Received frames go from `netif_receive_skb()`/`napi_gro_receive()` straight
   to Nova; Nova transmits through the driver's `ndo_start_xmit`. Like Linux's queueing layer,
@@ -130,7 +145,7 @@ generation), and Steam.
 | 2 | Interrupts and SMP | uACPI (MIT) | real IRQ delivery to Linux handlers, ACPI, local APIC + I/O APIC, `_PRT` routing, MSI/MSI-X, page allocation (done); then multiple CPUs |
 | 3 | Real hardware boot | uACPI | PCIe ECAM from MCFG and ACPI power off / reboot (done); devices behind bridges, local APIC timer |
 | 4 | NVMe boot drive | — | done, natively: `drivers/nvme.rs` (see below) |
-| 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core | input bridge to Nova's keyboard/mouse |
+| 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core, input core (done) | task/wait model, driver core, input bridge (done) |
 | 6 | The board's network | `r8169` (RTL8168/8125) | firmware loading (`request_firmware` from Nova's disk) |
 | 7 | GPU | DRM core, TTM, `amdgpu` (incl. display core) | `struct page` backing and page allocation, kernel FPU sections, firmware, KMS to Nova's compositor |
 | 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |

@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn nova_lx_start();
     fn nova_lx_pci_driver(bus: u8, devfn: u8) -> *const c_char;
     fn nova_lx_poll();
+    fn nova_lx_worker(index: u32);
     fn nova_lx_irq(irq: u32) -> bool;
     fn nova_lx_switch(task_id: u64);
     fn nova_lx_netdev_get(index: u32) -> *mut c_void;
@@ -110,9 +111,21 @@ pub fn take_nics() -> Vec<LinuxNic> {
     nics
 }
 
+/// Work-queue workers: Linux work items run on this pool, so one that sleeps (waiting
+/// for a USB transfer, say) does not hold up the others.
+const WORKERS: u32 = 4;
+
 /// The "linux" kernel task: deferred interrupt work (NAPI, threaded handlers), timers and
-/// work items. Every interrupt wakes it, so NAPI runs right after a device interrupt.
+/// RCU callbacks; every interrupt wakes it, so NAPI runs right after a device interrupt.
+/// Plus the work-queue workers. Started before the initcalls: probing can already wait
+/// for deferred work (USB host controllers do).
 pub fn spawn_poller() {
+    for index in 0..WORKERS {
+        task::spawn(&alloc::format!("linux-worker-{index}"), move || {
+            // SAFETY: lx_emul's worker loop for slot `index`; never returns.
+            unsafe { nova_lx_worker(index) }
+        });
+    }
     task::spawn("linux", || loop {
         // SAFETY: lx_emul's poll loop; only ever called from this task.
         unsafe { nova_lx_poll() };
