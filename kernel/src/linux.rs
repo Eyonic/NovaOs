@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 
 use crate::input::Key;
 use crate::process::{self, Process, SyscallFrame, UserState, PAGE};
+use crate::signal;
 use crate::sync::SpinLock;
 use crate::{fs, ipc, pit, rand, rtc, task};
 
@@ -224,6 +225,8 @@ fn is_inet(f: &FileRef) -> bool {
 static SHM: SpinLock<alloc::collections::BTreeMap<String, ipc::SharedRef>> = SpinLock::new(alloc::collections::BTreeMap::new());
 
 const O_NONBLOCK: u64 = 0o4000;
+/// O_CLOEXEC, which is also SOCK_CLOEXEC, EFD_CLOEXEC and EPOLL_CLOEXEC.
+const O_CLOEXEC: u64 = 0o2000000;
 const EPIPE: i64 = 32;
 
 fn new_file(kind: Kind, flags: u64) -> FileRef {
@@ -267,6 +270,8 @@ fn fds_stdin_empty() -> bool {
 
 pub struct FdTable {
     fds: Vec<Option<FileRef>>,
+    /// Descriptors closed by execve (O_CLOEXEC / FD_CLOEXEC).
+    cloexec: alloc::collections::BTreeSet<usize>,
     cwd: String,
     /// Typed-ahead terminal input not yet consumed by read().
     stdin: Vec<u8>,
@@ -275,7 +280,34 @@ pub struct FdTable {
 impl FdTable {
     pub fn new() -> Self {
         let tty = || Some(Arc::new(SpinLock::new(OpenFile { kind: Kind::Tty, pos: 0, flags: 2 })));
-        Self { fds: vec![tty(), tty(), tty()], cwd: String::new(), stdin: Vec::new() }
+        Self { fds: vec![tty(), tty(), tty()], cloexec: Default::default(), cwd: String::new(), stdin: Vec::new() }
+    }
+
+    /// fork: the child shares every open file (offsets included), as on Linux.
+    pub fn fork(&self) -> Self {
+        Self { fds: self.fds.clone(), cloexec: self.cloexec.clone(), cwd: self.cwd.clone(), stdin: Vec::new() }
+    }
+
+    /// execve: close the descriptors marked close-on-exec.
+    pub fn close_on_exec(&mut self) {
+        for fd in core::mem::take(&mut self.cloexec) {
+            if let Some(f) = self.fds.get_mut(fd).and_then(Option::take)
+                && Arc::strong_count(&f) == 1
+            {
+                flush(&mut f.lock());
+            }
+        }
+    }
+
+    fn set_cloexec(&mut self, fd: i64, on: bool) {
+        if fd < 0 {
+            return;
+        }
+        if on {
+            self.cloexec.insert(fd as usize);
+        } else {
+            self.cloexec.remove(&(fd as usize));
+        }
     }
 
     fn get(&self, fd: i64) -> Result<FileRef, i64> {
@@ -293,6 +325,7 @@ impl FdTable {
             self.fds.resize(n + 1, None);
         }
         self.fds[n] = Some(f);
+        self.cloexec.remove(&n);
     }
 
     fn add(&mut self, f: FileRef, min: usize) -> i64 {
@@ -301,6 +334,7 @@ impl FdTable {
             self.fds.resize(slot + 1, None);
         }
         self.fds[slot] = Some(f);
+        self.cloexec.remove(&slot);
         slot as i64
     }
 }
@@ -484,7 +518,7 @@ fn proc_file(name: &str) -> Option<String> {
         ),
         "proc/self/stat" => format!("{} ({}) R 1 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 0 0\n", proc().pid, proc().name, proc().pid, proc().pid, proc().threads.load(core::sync::atomic::Ordering::Relaxed)),
         "proc/self/statm" => "1000 500 100 10 0 400 0\n".into(),
-        "proc/self/cmdline" => format!("{}\0", proc().exe),
+        "proc/self/cmdline" => format!("{}\0", *proc().exe.lock()),
         "proc/self/comm" => format!("{}\n", proc().name),
         "proc/self/oom_score_adj" => "0\n".into(),
         "proc/self/limits" => "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1024                 4096                 files\n".into(),
@@ -965,12 +999,16 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     }
                 }
                 let file = open(&p, flags)?;
-                fds().add(file, 0)
+                let mut t = fds();
+                let fd = t.add(file, 0);
+                t.set_cloexec(fd, flags & O_CLOEXEC != 0);
+                fd
             }
             3 => {
                 // close
                 let file = {
                     let mut fds = fds();
+                    fds.cloexec.remove(&(a0 as usize));
                     let slot = fds.fds.get_mut(a0 as usize).ok_or(EBADF)?;
                     slot.take().ok_or(EBADF)?
                 };
@@ -1014,6 +1052,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let mut t = fds();
                 let rfd = t.add(new_file(Kind::Channel(r), flags & O_NONBLOCK), 0);
                 let wfd = t.add(new_file(Kind::Channel(w), (flags & O_NONBLOCK) | 1), 0);
+                t.set_cloexec(rfd, flags & O_CLOEXEC != 0);
+                t.set_cloexec(wfd, flags & O_CLOEXEC != 0);
                 drop(t);
                 let mut b = Vec::new();
                 b.extend_from_slice(&(rfd as i32).to_le_bytes());
@@ -1032,6 +1072,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let mut t = fds();
                 let fa = t.add(new_file(Kind::Channel(x), flags), 0);
                 let fb = t.add(new_file(Kind::Channel(y), flags), 0);
+                t.set_cloexec(fa, a1 & O_CLOEXEC != 0);
+                t.set_cloexec(fb, a1 & O_CLOEXEC != 0);
                 drop(t);
                 let mut b = Vec::new();
                 b.extend_from_slice(&(fa as i32).to_le_bytes());
@@ -1051,7 +1093,10 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 };
                 let handle = if udp { crate::net::udp_open() } else { crate::net::tcp_open() }.map_err(sock_err)?;
                 let flags = (a1 & O_NONBLOCK) | 2;
-                fds().add(new_file(Kind::Inet(InetSocket { handle, udp, local_port: 0, peer: None, error: 0 }), flags), 0)
+                let mut t = fds();
+                let fd = t.add(new_file(Kind::Inet(InetSocket { handle, udp, local_port: 0, peer: None, error: 0 }), flags), 0);
+                t.set_cloexec(fd, a1 & O_CLOEXEC != 0);
+                fd
             }
             42 => {
                 // connect(fd, addr, len)
@@ -1407,12 +1452,94 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     u.brk as i64
                 }
             }
-            13 | 14 | 127 | 131 => {
-                // rt_sigaction, rt_sigprocmask, rt_sigpending, sigaltstack
-                if nr == 13 && a2 != 0 {
-                    write_user(a2, &[0u8; 32])?;
+            13 => {
+                // rt_sigaction(sig, act, oldact, sigsetsize)
+                let sig = a0 as u32;
+                if sig == 0 || sig > signal::NSIG {
+                    return Err(EINVAL);
+                }
+                let old = proc().signals.lock().actions[sig as usize];
+                if a2 != 0 {
+                    let mut b = Vec::with_capacity(32);
+                    for v in [old.handler, old.flags, old.restorer, old.mask] {
+                        b.extend_from_slice(&v.to_le_bytes());
+                    }
+                    write_user(a2, &b)?;
+                }
+                if a1 != 0 {
+                    if sig == signal::SIGKILL || sig == signal::SIGSTOP {
+                        return Err(EINVAL);
+                    }
+                    let b = read_user(a1, 32)?;
+                    let w = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+                    let a = signal::Action { handler: w(0), flags: w(1), restorer: w(2), mask: w(3) & !(signal::bit(signal::SIGKILL) | signal::bit(signal::SIGSTOP)) };
+                    let mut st = proc().signals.lock();
+                    st.actions[sig as usize] = a;
+                    // Setting a signal to "ignore" discards it if pending (POSIX).
+                    if a.handler == 1 {
+                        st.pending &= !signal::bit(sig);
+                    }
                 }
                 0
+            }
+            14 => {
+                // rt_sigprocmask(how, set, oldset, sigsetsize)
+                let t = thread();
+                if a2 != 0 {
+                    write_user(a2, &t.sigmask.to_le_bytes())?;
+                }
+                if a1 != 0 {
+                    let set = read_u64(a1)? & !(signal::bit(signal::SIGKILL) | signal::bit(signal::SIGSTOP));
+                    t.sigmask = match a0 {
+                        0 => t.sigmask | set,  // SIG_BLOCK
+                        1 => t.sigmask & !set, // SIG_UNBLOCK
+                        2 => set,              // SIG_SETMASK
+                        _ => return Err(EINVAL),
+                    };
+                }
+                0
+            }
+            127 => {
+                // rt_sigpending(set, sigsetsize)
+                let t = thread();
+                let pending = (t.pending | proc().signals.lock().pending) & t.sigmask;
+                write_user(a0, &pending.to_le_bytes())?;
+                0
+            }
+            131 => {
+                // sigaltstack(ss, old_ss): stack_t { ss_sp, ss_flags (int), ss_size }
+                let t = thread();
+                if a1 != 0 {
+                    let mut b = Vec::with_capacity(24);
+                    b.extend_from_slice(&t.altstack.0.to_le_bytes());
+                    b.extend_from_slice(&(t.altstack.2 as u64).to_le_bytes());
+                    b.extend_from_slice(&t.altstack.1.to_le_bytes());
+                    write_user(a1, &b)?;
+                }
+                if a0 != 0 {
+                    let b = read_user(a0, 24)?;
+                    let sp = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                    let flags = u32::from_le_bytes(b[8..12].try_into().unwrap());
+                    let size = u64::from_le_bytes(b[16..24].try_into().unwrap());
+                    t.altstack = if flags & 2 != 0 { (0, 0, 2) } else { (sp, size, flags & !1) };
+                }
+                0
+            }
+            15 => signal::sigreturn(f), // rt_sigreturn
+            34 | 130 => {
+                // pause(), rt_sigsuspend(mask, sigsetsize): wait for a signal handler to run
+                let t = thread();
+                if nr == 130 {
+                    let temporary = read_u64(a0)? & !(signal::bit(signal::SIGKILL) | signal::bit(signal::SIGSTOP));
+                    // The handler runs with the temporary mask; its frame restores the old one.
+                    t.saved_mask = Some(t.sigmask);
+                    t.sigmask = temporary;
+                }
+                while !signal::has_deliverable(thread()) {
+                    process::check_exiting();
+                    task::wait_event();
+                }
+                return Err(EINTR);
             }
             16 => {
                 // ioctl
@@ -1532,6 +1659,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         fds.fds.resize(new + 1, None);
                     }
                     fds.fds[new] = Some(file);
+                    fds.set_cloexec(new as i64, nr == 292 && a2 & O_CLOEXEC != 0);
                     new as i64
                 }
             }
@@ -1552,7 +1680,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             }
             39 => proc().pid as i64,
             186 => thread().tid as i64,
-            110 => 1,                     // getppid
+            110 => proc().parent.load(core::sync::atomic::Ordering::Relaxed) as i64, // getppid
             60 => process::exit_thread(a0 as i32 & 0xFF),
             231 => process::exit(a0 as i32 & 0xFF),
             63 => {
@@ -1563,9 +1691,24 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 // fcntl
                 0 | 1030 => {
                     let file = fds().get(a0 as i64)?;
-                    fds().add(file, a2 as usize)
+                    let mut t = fds();
+                    let fd = t.add(file, a2 as usize);
+                    t.set_cloexec(fd, a1 == 1030);
+                    fd
                 }
-                1 | 2 => 0,
+                1 => {
+                    // F_GETFD
+                    let t = fds();
+                    t.get(a0 as i64)?;
+                    t.cloexec.contains(&(a0 as usize)) as i64
+                }
+                2 => {
+                    // F_SETFD
+                    let mut t = fds();
+                    t.get(a0 as i64)?;
+                    t.set_cloexec(a0 as i64, a2 & 1 != 0);
+                    0
+                }
                 1033 => 0, // F_ADD_SEALS (memfd sealing: accepted, not enforced)
                 1034 => 0, // F_GET_SEALS
                 3 => fds().get(a0 as i64)?.lock().flags as i64,
@@ -1646,7 +1789,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let (path, buf, size) = if nr == 89 { (a0, a1, a2) } else { (a1, a2, a3) };
                 let p = resolve(&read_cstr(path)?);
                 let target = if p == "proc/self/exe" || p == format!("proc/{}/exe", proc().pid) {
-                    format!("/{}", proc().exe)
+                    format!("/{}", *proc().exe.lock())
                 } else if let Some(fd) = p.strip_prefix("proc/self/fd/") {
                     let file = fds().get(fd.parse().map_err(|_| ENOENT)?)?;
                     let t = match &file.lock().kind {
@@ -1842,15 +1985,103 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 v.len() as i64
             }
             334 => return Err(ENOSYS), // rseq: glibc copes without it
-            57 | 58 => unimplemented(nr), // fork, vfork: one address space per program for now
-            59 => return Err(ENOSYS), // execve
-            62 | 200 | 234 => {
-                // kill, tkill, tgkill: only "kill myself" (abort()) is meaningful
-                if a1 == 6 || a2 == 6 {
-                    crate::println!("\n{}: aborted", proc().name);
-                    process::exit(134);
+            57 | 58 => process::fork(f, nr == 58, 0, None)? as i64, // fork, vfork
+            59 | 322 => {
+                // execve(path, argv, envp), execveat(dirfd, path, argv, envp, flags)
+                let (path, argv, envp) = if nr == 59 { (a0, a1, a2) } else { (a1, a2, a3) };
+                let path = resolve(&read_cstr(path)?);
+                let list = |mut p: u64| -> Result<Vec<String>, i64> {
+                    let mut v = Vec::new();
+                    while p != 0 {
+                        let s = read_u64(p)?;
+                        if s == 0 || v.len() > 4096 {
+                            break;
+                        }
+                        v.push(read_cstr(s)?);
+                        p += 8;
+                    }
+                    Ok(v)
+                };
+                let (args, env) = (list(argv)?, list(envp)?);
+                process::exec(f, &path, args, env)?;
+                0
+            }
+            62 => {
+                // kill(pid, sig): a process, or (pid <= 0) every process Nova runs for the caller
+                let (pid, sig) = (a0 as i32 as i64, a1 as u32);
+                if sig > signal::NSIG {
+                    return Err(EINVAL);
+                }
+                if pid == proc().pid as i64 || pid == 0 {
+                    signal::send_process(proc(), sig, proc().pid);
+                } else if pid > 0 {
+                    let target = process::find(pid as u64).ok_or(ESRCH)?;
+                    signal::send_process(&target, sig, proc().pid);
+                } else {
+                    for p in process::processes() {
+                        if p.pid != proc().pid && p.parent.load(core::sync::atomic::Ordering::Relaxed) == proc().pid {
+                            signal::send_process(&p, sig, proc().pid);
+                        }
+                    }
                 }
                 0
+            }
+            200 | 234 => {
+                // tkill(tid, sig), tgkill(tgid, tid, sig): to a thread
+                let (tid, sig) = if nr == 200 { (a0, a1 as u32) } else { (a1, a2 as u32) };
+                if sig > signal::NSIG {
+                    return Err(EINVAL);
+                }
+                if tid == thread().tid {
+                    signal::send_self(thread(), sig);
+                } else if let Some(p) = process::find(if nr == 234 { a0 } else { tid }) {
+                    signal::send_process(&p, sig, proc().pid); // to the process: delivered to some thread
+                } else {
+                    signal::send_process(proc(), sig, proc().pid); // another thread of ours
+                }
+                0
+            }
+            61 => {
+                // wait4(pid, wstatus, options, rusage)
+                let nohang = a2 & 1 != 0;
+                match process::wait_child(a0 as i32 as i64, nohang, true)? {
+                    Some((pid, status)) => {
+                        if a1 != 0 {
+                            write_user(a1, &status.to_le_bytes())?;
+                        }
+                        if a3 != 0 {
+                            write_user(a3, &[0u8; 144])?;
+                        }
+                        pid as i64
+                    }
+                    None => 0,
+                }
+            }
+            247 => {
+                // waitid(idtype, id, infop, options): P_ALL 0, P_PID 1
+                let pid = if a0 == 1 { a1 as i32 as i64 } else { -1 };
+                let (nohang, reap) = (a3 & 1 != 0, a3 & 0x0100_0000 == 0); // WNOHANG, WNOWAIT
+                match process::wait_child(pid, nohang, reap)? {
+                    Some((child, status)) => {
+                        if a2 != 0 {
+                            // siginfo: si_signo = SIGCHLD, si_code = CLD_EXITED (1) / CLD_KILLED (2)
+                            let mut info = [0u8; 128];
+                            info[0..4].copy_from_slice(&(signal::SIGCHLD as i32).to_le_bytes());
+                            let (code, value) = if status & 0x7F != 0 { (2, status & 0x7F) } else { (1, (status >> 8) & 0xFF) };
+                            info[8..12].copy_from_slice(&(code as i32).to_le_bytes());
+                            info[16..20].copy_from_slice(&(child as i32).to_le_bytes());
+                            info[24..28].copy_from_slice(&value.to_le_bytes());
+                            write_user(a2, &info)?;
+                        }
+                        0
+                    }
+                    None => {
+                        if a2 != 0 {
+                            write_user(a2, &[0u8; 128])?;
+                        }
+                        0
+                    }
+                }
             }
             _ => unimplemented(nr),
         })
@@ -1864,11 +2095,18 @@ const CLONE_PARENT_SETTID: u64 = 0x100000;
 const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 const CLONE_CHILD_SETTID: u64 = 0x1000000;
 
-/// clone for threads (CLONE_VM | CLONE_THREAD); processes (fork) are not supported yet.
+const CLONE_VFORK: u64 = 0x4000;
+
+/// clone: a thread with CLONE_VM | CLONE_THREAD; anything else creates a process. A
+/// process always gets its own copy of the memory (CLONE_VM without CLONE_THREAD, as
+/// glibc's posix_spawn uses with CLONE_VFORK, is served as a vfork-style copy).
 fn clone(f: &SyscallFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> Result<i64, i64> {
     if flags & CLONE_VM == 0 || flags & CLONE_THREAD == 0 {
-        unimplemented(56);
-        return Err(ENOSYS);
+        let pid = process::fork(f, flags & CLONE_VFORK != 0, stack, (flags & CLONE_SETTLS != 0).then_some(tls))?;
+        if flags & CLONE_PARENT_SETTID != 0 {
+            write_user(parent_tid, &(pid as u32).to_le_bytes())?;
+        }
+        return Ok(pid as i64);
     }
     let tid = process::spawn_thread(f, stack, (flags & CLONE_SETTLS != 0).then_some(tls), if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 });
     if flags & CLONE_PARENT_SETTID != 0 {
@@ -1882,6 +2120,7 @@ fn clone(f: &SyscallFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u
 
 const ETIMEDOUT: i64 = 110;
 const EINTR: i64 = 4;
+const ESRCH: i64 = 3;
 
 struct Waiter {
     process: usize,

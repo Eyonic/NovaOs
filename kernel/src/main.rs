@@ -54,6 +54,7 @@ mod settings;
 mod setup;
 mod shell;
 mod shields;
+mod signal;
 mod storage;
 mod sync;
 mod task;

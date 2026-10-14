@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -132,6 +132,14 @@ define_case() {
                 EXPECT=("${shell[@]}" "Hello from C on Nova!" "[exit status 137]")
                 CONTAINS=("memhog: 1024 MiB" "memhog: out of memory (Nova has" "kernel heap:")
                 FORBID=("$PANIC" "$EXC" "NESTED") ;;
+        procs)  # Processes and signals for Linux programs: fork, execve, wait, kill, sigaction,
+                # posix_spawn, pipes across fork, close-on-exec (userland/proctest.c).
+                CMDLINE="nova.mode=shell"
+                INPUT=("wait:$PROMPT" "ser:proctest" "wait:proctest: ")
+                EXPECT=("${shell[@]}" "proctest: processes and signals" "  ok   fork() + execve(/bin/hello)"
+                        "  ok   posix_spawn(/bin/hello)" "  ok   kill(child, SIGTERM): WIFSIGNALED, WTERMSIG == SIGTERM"
+                        "proctest: 15 passed, 0 failed")
+                FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall") ;;
         net)    # Linux sockets: glibc DNS (UDP) and TCP, against the local mock server.
                 CMDLINE="nova.mode=shell"; MOCK=1
                 INPUT=("wait:$PROMPT" "ser:nettest 10.0.2.2:$MOCK_PORT" "wait:bytes")

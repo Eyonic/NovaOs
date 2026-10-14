@@ -138,6 +138,62 @@ pub fn init() {
     wrmsr(IA32_FMASK, 0x0004_0700); // clear IF, DF, TF and AC on entry
 }
 
+/// Size of the XSAVE area for the enabled components (0 without XSAVE: FXSAVE, 512 bytes).
+pub fn xsave_size() -> u64 {
+    XSAVE_SIZE.load(Ordering::Relaxed)
+}
+
+/// The enabled XSAVE components (XCR0).
+pub fn xcr0() -> u64 {
+    XCR0.load(Ordering::Relaxed)
+}
+
+/// Save the live SIMD/FPU state at `dst` (64-byte aligned, xsave_size() or 512 bytes).
+///
+/// # Safety
+/// `dst` must be writable for that many bytes in the current address space.
+pub unsafe fn save_fpu(dst: *mut u8) {
+    // SAFETY: per the caller; the kernel itself never touches SIMD registers.
+    unsafe {
+        if xsave_size() != 0 {
+            asm!("xsave64 [{}]", in(reg) dst, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags));
+        } else {
+            asm!("fxsave64 [{}]", in(reg) dst, options(nostack, preserves_flags));
+        }
+    }
+}
+
+/// Load SIMD/FPU state a program handed back (rt_sigreturn). The state is copied and
+/// sanitized first, as Linux does: a malformed image would fault inside the kernel.
+///
+/// # Safety
+/// `src` must be readable for 512 bytes (xsave_size() bytes if `xsave`).
+pub unsafe fn restore_fpu(src: *const u8, xsave: bool) {
+    let area = FxArea::initial();
+    let len = if xsave && xsave_size() != 0 { xsave_size() as usize } else { 512 };
+    // SAFETY: per the caller; the area holds at least max(xsave_size, 576) bytes.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, area.ptr, len);
+        // MXCSR: only defined bits (a reserved bit set makes fxrstor/xrstor #GP).
+        let mxcsr = area.ptr.add(24).cast::<u32>();
+        mxcsr.write(mxcsr.read() & 0xFFFF);
+        if xsave_size() != 0 {
+            let header = area.ptr.add(512);
+            if len == 512 {
+                core::ptr::write_bytes(header, 0, 64);
+                // Legacy region only: x87 and SSE state.
+                header.cast::<u64>().write(3 & xcr0());
+            } else {
+                let bv = header.cast::<u64>();
+                bv.write(bv.read() & xcr0());
+                header.add(8).cast::<u64>().write(0); // XCOMP_BV: standard format
+                core::ptr::write_bytes(header.add(16), 0, 48);
+            }
+        }
+    }
+    area.restore();
+}
+
 /// Saved SIMD/FPU state: an XSAVE area (64-byte aligned), or 512 bytes for FXSAVE.
 pub struct FxArea {
     ptr: *mut u8,
@@ -228,8 +284,9 @@ pub struct Process {
     pub pid: u64,
     pub name: String,
     /// Path of the executable (for /proc/self/exe), without the leading '/'.
-    pub exe: String,
-    pub cr3: u64,
+    pub exe: SpinLock<String>,
+    /// Page-table root; execve gives the process a new address space.
+    pub cr3: AtomicU64,
     pub mem: SpinLock<Memory>,
     pub fds: SpinLock<FdTable>,
     /// Set by exit_group or a fatal fault: every thread leaves at its next kernel entry.
@@ -239,6 +296,14 @@ pub struct Process {
     pub threads: AtomicUsize,
     /// Log every system call to the serial console (`strace`).
     pub trace: AtomicBool,
+    /// Parent process id (0: started by Nova itself, e.g. from the shell).
+    pub parent: AtomicU64,
+    /// Signal dispositions and process-directed pending signals.
+    pub signals: SpinLock<crate::signal::Signals>,
+    /// The signal that terminated the process (0 if it exited).
+    pub term_signal: AtomicI32,
+    /// vfork: set when the child has called execve or exited (the parent then resumes).
+    pub vfork_done: AtomicBool,
 }
 
 /// Per-thread user state, owned by the kernel task that runs the thread.
@@ -253,6 +318,14 @@ pub struct UserState {
     exit_ctx: u64,
     /// CLONE_CHILD_CLEARTID / set_tid_address: cleared and futex-woken at thread exit.
     pub clear_tid: u64,
+    /// Blocked signals (bit n-1 = signal n).
+    pub sigmask: u64,
+    /// Signals sent to this thread (tgkill, raise).
+    pub pending: u64,
+    /// sigaltstack: (base, size, flags).
+    pub altstack: (u64, u64, u32),
+    /// rt_sigsuspend: the mask to restore once the handler that ends the wait returns.
+    pub saved_mask: Option<u64>,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -354,6 +427,37 @@ impl Memory {
             i += PAGE;
         }
         self.shared.push(shm);
+    }
+
+    /// fork: give `child` (an empty address space) the same mappings. Private pages are
+    /// copied; read-only system-file pages stay shared (copied on write, as here); shared
+    /// memory pages stay shared. False when memory ran out.
+    pub fn fork_into(&self, child: &mut Memory) -> bool {
+        for (&va, &frame) in &self.pages {
+            let (target, flags) = if self.borrowed.contains(&va) {
+                child.borrowed.insert(va);
+                (frame, PRESENT | USER)
+            } else if self.foreign.contains(&va) {
+                child.foreign.insert(va);
+                (frame, PRESENT | USER | WRITABLE)
+            } else {
+                let Some(copy) = memory::alloc_page() else { return false };
+                // SAFETY: both are 4 KiB pages; `frame` is mapped in this address space.
+                unsafe { core::ptr::copy_nonoverlapping(frame, copy, PAGE as usize) };
+                let writable = self.area_at(va).is_some_and(|a| a.writable);
+                (copy, PRESENT | USER | if writable { WRITABLE } else { 0 })
+            };
+            let tables = &mut child.tables;
+            // SAFETY: a lower-half address of the child's own (unused) address space.
+            unsafe { memory::map_page_in(child.cr3, va, memory::virt_to_phys(target as u64), flags, PRESENT | WRITABLE | USER, &mut |t| tables.push(t)) };
+            child.pages.insert(va, target);
+        }
+        child.shared = self.shared.clone();
+        child.areas = self.areas.clone();
+        child.brk_start = self.brk_start;
+        child.brk = self.brk;
+        child.mmap_next = self.mmap_next;
+        true
     }
 
     /// Give a borrowed page its own writable copy.
@@ -594,36 +698,150 @@ impl Drop for Memory {
     }
 }
 
-impl Process {
-    fn new(name: &str, exe: &str) -> Arc<Self> {
-        let cr3 = memory::new_table();
-        // Share the kernel's upper half.
-        // SAFETY: both tables are 4 KiB pages in direct-mapped RAM.
-        unsafe {
-            let src = memory::phys_to_virt(memory::kernel_cr3()) as *const u64;
-            let dst = memory::phys_to_virt(cr3) as *mut u64;
-            for i in 256..512 {
-                dst.add(i).write(src.add(i).read());
-            }
+/// A new page-table root sharing the kernel's upper half.
+fn new_address_space() -> u64 {
+    let cr3 = memory::new_table();
+    // SAFETY: both tables are 4 KiB pages in direct-mapped RAM.
+    unsafe {
+        let src = memory::phys_to_virt(memory::kernel_cr3()) as *const u64;
+        let dst = memory::phys_to_virt(cr3) as *mut u64;
+        for i in 256..512 {
+            dst.add(i).write(src.add(i).read());
         }
-        Arc::new(Self {
+    }
+    cr3
+}
+
+impl Process {
+    fn new(name: &str, exe: &str, parent: u64) -> Arc<Self> {
+        let cr3 = new_address_space();
+        let p = Arc::new(Self {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
-            exe: exe.into(),
-            cr3,
+            exe: SpinLock::new(exe.into()),
+            cr3: AtomicU64::new(cr3),
             mem: SpinLock::new(Memory::new(cr3)),
             fds: SpinLock::new(FdTable::new()),
             exiting: AtomicBool::new(false),
             exit_code: AtomicI32::new(0),
             threads: AtomicUsize::new(1),
             trace: AtomicBool::new(false),
-        })
+            parent: AtomicU64::new(parent),
+            signals: SpinLock::new(crate::signal::Signals::new()),
+            term_signal: AtomicI32::new(0),
+            vfork_done: AtomicBool::new(false),
+        });
+        TABLE.lock().insert(p.pid, Entry { parent, process: Arc::downgrade(&p), status: None });
+        p
     }
+}
+
+// ---------------------------------------------------------------- process table
+
+/// Every process that exists or has exited and not been waited for (a zombie).
+struct Entry {
+    parent: u64,
+    process: alloc::sync::Weak<Process>,
+    /// wait() status once the process has ended.
+    status: Option<i32>,
+}
+
+static TABLE: SpinLock<BTreeMap<u64, Entry>> = SpinLock::new(BTreeMap::new());
+
+/// The live process with id `pid`.
+pub fn find(pid: u64) -> Option<Arc<Process>> {
+    TABLE.lock().get(&pid).and_then(|e| e.process.upgrade())
+}
+
+/// Every live process whose parent is `pid` (or every process, for 0).
+pub fn processes() -> Vec<Arc<Process>> {
+    TABLE.lock().values().filter_map(|e| e.process.upgrade()).collect()
+}
+
+/// End of a process: record its wait status for the parent, hand its children to no
+/// one, and tell the parent (SIGCHLD).
+fn finish(process: &Process, status: i32) {
+    let parent = process.parent.load(Ordering::SeqCst);
+    {
+        let mut table = TABLE.lock();
+        // Orphans: nobody will wait for them; their zombies go away now.
+        let orphans: Vec<u64> = table.iter().filter(|(_, e)| e.parent == process.pid).map(|(&pid, _)| pid).collect();
+        for pid in orphans {
+            if table.get(&pid).is_some_and(|e| e.status.is_some()) {
+                table.remove(&pid);
+            } else if let Some(e) = table.get_mut(&pid) {
+                e.parent = 0;
+                if let Some(p) = e.process.upgrade() {
+                    p.parent.store(0, Ordering::SeqCst);
+                }
+            }
+        }
+        if parent == 0 || !table.contains_key(&parent) {
+            table.remove(&process.pid);
+        } else if let Some(e) = table.get_mut(&process.pid) {
+            e.status = Some(status);
+        }
+    }
+    process.vfork_done.store(true, Ordering::SeqCst);
+    if parent != 0
+        && let Some(p) = find(parent)
+    {
+        crate::signal::send_process(&p, crate::signal::SIGCHLD, process.pid);
+    }
+    crate::ipc::notify();
+}
+
+/// The wait() status word for a process that ended with `code` or by `signal`.
+fn wait_status(code: i32, signal: i32) -> i32 {
+    if signal != 0 { signal & 0x7F } else { (code & 0xFF) << 8 }
+}
+
+/// wait4/waitid: a child of the calling process that has ended. `pid` > 0 selects one
+/// child, -1 (or 0 / < -1: process groups, which Nova does not have) any child.
+/// Returns (pid, status); Ok(None) with `nohang` when children are still running.
+pub fn wait_child(pid: i64, nohang: bool, reap: bool) -> Result<Option<(u64, i32)>, i64> {
+    let me = task::current_user().expect("wait outside a process").process.pid;
+    loop {
+        {
+            let mut table = TABLE.lock();
+            let mut children = table.iter().filter(|(p, e)| e.parent == me && (pid <= 0 || **p == pid as u64)).peekable();
+            if children.peek().is_none() {
+                return Err(10); // ECHILD
+            }
+            if let Some((&child, e)) = children.find(|(_, e)| e.status.is_some()) {
+                let status = e.status.unwrap();
+                if reap {
+                    table.remove(&child);
+                }
+                return Ok(Some((child, status)));
+            }
+        }
+        if nohang {
+            return Ok(None);
+        }
+        if let Some(u) = task::current_user()
+            && crate::signal::has_deliverable(u)
+        {
+            return Err(4); // EINTR: a signal handler runs first
+        }
+        check_exiting();
+        task::wait_event();
+    }
+}
+
+/// Terminate `p` by signal `sig` (default action, or SIGKILL).
+pub fn terminate(p: &Process, sig: u32) {
+    if !p.exiting.swap(true, Ordering::SeqCst) {
+        p.exit_code.store(128 + sig as i32, Ordering::SeqCst);
+        p.term_signal.store(sig as i32, Ordering::SeqCst);
+    }
+    crate::linux::futex_wake_all(p);
+    crate::ipc::notify();
 }
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0 })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None })
     }
 }
 
@@ -645,7 +863,7 @@ pub fn switch_out(user: Option<&mut UserState>) {
 
 /// Called by the scheduler for the task being switched in.
 pub fn switch_in(user: Option<&UserState>) {
-    let cr3 = user.map_or(memory::kernel_cr3(), |u| u.process.cr3);
+    let cr3 = user.map_or(memory::kernel_cr3(), |u| u.process.cr3.load(Ordering::Relaxed));
     if memory::read_cr3() != cr3 {
         // SAFETY: both kinds of address space map the whole kernel identically.
         unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
@@ -710,6 +928,7 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
     check_exiting();
     frame.rax = crate::linux::syscall(frame) as u64;
     check_exiting();
+    crate::signal::deliver(frame);
     // SYSRET to a non-canonical address would fault in ring 0: refuse.
     if frame.rip >= USER_MAX {
         exit(-11);
@@ -1086,63 +1305,80 @@ pub fn spawn(path: &str, args: Vec<String>, extra: Vec<(usize, crate::linux::Fil
 
 /// Ask every thread of `p` to exit (like SIGKILL).
 pub fn kill(p: &Process) {
-    if !p.exiting.swap(true, Ordering::SeqCst) {
-        p.exit_code.store(137, Ordering::SeqCst);
-    }
-    crate::linux::futex_wake_all(p);
-    crate::ipc::notify();
+    terminate(p, crate::signal::SIGKILL);
 }
+
+/// The bytes of program `path` (a system file is used in place), and whether it is one.
+fn program_bytes(path: &str) -> Result<(alloc::borrow::Cow<'static, [u8]>, bool), String> {
+    match crate::fs::system_file(path) {
+        Some(s) => Ok((alloc::borrow::Cow::Borrowed(s), true)),
+        None => crate::fs::read(path).map(|v| (alloc::borrow::Cow::Owned(v), false)).map_err(|e| format!("{path}: {e}")),
+    }
+}
+
+/// Load program `path` (and its dynamic loader) into `mem` and build its initial stack.
+/// Returns (entry point, stack pointer).
+fn load_program(mem: &mut Memory, path: &str, elf: &[u8], is_static: bool, args: &[String], env: &[String]) -> Result<(u64, u64), String> {
+    let loaded = load_elf(mem, elf, PIE_BASE, is_static)?;
+    // Dynamically linked: load the interpreter too and start there; it maps the
+    // shared libraries itself (openat + mmap) and then jumps to AT_ENTRY.
+    let (start, interp_base) = match &loaded.interp {
+        Some(ip) => {
+            let ip = ip.trim_start_matches('/');
+            let l = match crate::fs::system_file(ip) {
+                Some(ld) => load_elf(mem, ld, INTERP_BASE, true)?,
+                None => {
+                    let ld = crate::fs::read(ip).map_err(|_| format!("{path} needs the dynamic loader /{ip}, which is not installed"))?;
+                    load_elf(mem, &ld, INTERP_BASE, false)?
+                }
+            };
+            (l.entry, INTERP_BASE)
+        }
+        None => (loaded.entry, 0),
+    };
+    // The heap starts after the program, not after the loader.
+    let rsp = build_stack(mem, args, env, &loaded, interp_base, path);
+    Ok((start, rsp))
+}
+
+const DEFAULT_ENV: [&str; 5] = ["HOME=/", "PATH=/bin", "TERM=xterm", "LANG=C.UTF-8", "USER=nova"];
 
 fn run_with(path: &str, args: &[String], trace: bool, extra: Vec<(usize, crate::linux::FileRef)>, on_start: impl FnOnce(Arc<Process>)) -> Result<i32, String> {
     if task::current_user().is_some() {
         return Err("already running a program".into());
     }
-    let owned;
-    let (elf, is_static): (&[u8], bool) = match crate::fs::system_file(path) {
-        Some(s) => (s, true),
-        None => {
-            owned = crate::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-            (&owned, false)
-        }
-    };
+    let (elf, is_static) = program_bytes(path)?;
     let name: String = path.rsplit('/').next().unwrap_or(path).into();
-    let process = Process::new(&name, path);
+    let process = Process::new(&name, path, 0);
     process.trace.store(trace, Ordering::Relaxed);
     for (fd, file) in extra {
         process.fds.lock().install(fd, file);
     }
-    let env = ["HOME=/", "PATH=/bin", "TERM=xterm", "LANG=C.UTF-8", "USER=nova"].map(String::from);
-    let (entry, rsp) = {
-        let mut mem = process.mem.lock();
-        let loaded = load_elf(&mut mem, elf, PIE_BASE, is_static)?;
-        // Dynamically linked: load the interpreter too and start there; it maps the
-        // shared libraries itself (openat + mmap) and then jumps to AT_ENTRY.
-        let (start, interp_base) = match &loaded.interp {
-            Some(ip) => {
-                let ip = ip.trim_start_matches('/');
-                let l = match crate::fs::system_file(ip) {
-                    Some(ld) => load_elf(&mut mem, ld, INTERP_BASE, true)?,
-                    None => {
-                        let ld = crate::fs::read(ip).map_err(|_| format!("{path} needs the dynamic loader /{ip}, which is not installed"))?;
-                        load_elf(&mut mem, &ld, INTERP_BASE, false)?
-                    }
-                };
-                (l.entry, INTERP_BASE)
-            }
-            None => (loaded.entry, 0),
-        };
-        // The heap starts after the program, not after the loader.
-        let rsp = build_stack(&mut mem, args, &env, &loaded, interp_base, path);
-        (start, rsp)
+    let env = DEFAULT_ENV.map(String::from);
+    let loaded = load_program(&mut process.mem.lock(), path, &elf, is_static, args, &env);
+    let (entry, rsp) = match loaded {
+        Ok(v) => v,
+        Err(e) => {
+            finish(&process, wait_status(127, 0));
+            return Err(e);
+        }
     };
+    drop(elf);
+    let regs = SyscallFrame { r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r9: 0, r8: 0, r10: 0, rdx: 0, rsi: 0, rdi: 0, rax: 0, rip: entry, rflags: 0x202, rsp };
+    Ok(run_main(process, regs, |_| {}, on_start))
+}
 
+/// Run the main thread of `process` from `regs` in the current task until the whole
+/// process has ended; record its end (finish) and return its exit status (shell style:
+/// 128 + signal for a signal). `setup` adjusts the thread before it enters user mode.
+fn run_main(process: Arc<Process>, regs: SyscallFrame, setup: impl FnOnce(&mut UserState), on_start: impl FnOnce(Arc<Process>)) -> i32 {
     let mut thread = UserState::new_thread(process.clone(), process.pid);
     thread.kernel_rsp = kernel_stack_here();
+    setup(&mut thread);
     task::set_user(Some(thread));
-    let regs = SyscallFrame { r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r9: 0, r8: 0, r10: 0, rdx: 0, rsi: 0, rdi: 0, rax: 0, rip: entry, rflags: 0x202, rsp };
     let ctx = &raw mut task::current_user().unwrap().exit_ctx;
     on_start(process.clone());
-    // SAFETY: the address space is loaded; registers were set up above.
+    // SAFETY: the address space is loaded; registers were set up by the caller.
     let code = unsafe { enter_user(&regs, ctx) } as i32;
     process.threads.fetch_sub(1, Ordering::SeqCst);
     task::set_user(None);
@@ -1155,7 +1391,122 @@ fn run_with(path: &str, args: &[String], trace: bool, extra: Vec<(usize, crate::
         }
     }
     let status = if process.exiting.load(Ordering::SeqCst) { process.exit_code.load(Ordering::SeqCst) } else { code };
-    Ok(status)
+    finish(&process, wait_status(status, process.term_signal.load(Ordering::SeqCst)));
+    status
+}
+
+// ---------------------------------------------------------------- fork and exec
+
+/// fork (and vfork, and clone without CLONE_VM): a new process with a copy of the
+/// caller's memory and open files, whose one thread resumes after the system call with
+/// rax = 0. With `vfork`, the caller waits until the child execs or exits.
+pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Option<u64>) -> Result<u64, i64> {
+    let me = task::current_user().expect("fork outside a process");
+    let parent = me.process.clone();
+    let child = Process::new(&parent.name, &parent.exe.lock(), parent.pid);
+    child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
+    {
+        let src = parent.mem.lock();
+        let mut dst = child.mem.lock();
+        if !src.fork_into(&mut dst) {
+            drop(dst);
+            TABLE.lock().remove(&child.pid);
+            return Err(12); // ENOMEM
+        }
+    }
+    *child.fds.lock() = parent.fds.lock().fork();
+    {
+        let from = parent.signals.lock();
+        child.signals.lock().actions = from.actions;
+    }
+    let mut regs = *parent_regs;
+    regs.rax = 0;
+    if child_stack != 0 {
+        regs.rsp = child_stack;
+    }
+    // The child starts with the parent's SIMD state, FS base and signal mask.
+    let fx = FxArea::initial();
+    // SAFETY: the area is sized for xsave_size() (or 512) bytes and 64-byte aligned.
+    unsafe { save_fpu(fx.ptr) };
+    let (fs, sigmask, altstack) = (tls.unwrap_or(me.fs_base), me.sigmask, me.altstack);
+    let pid = child.pid;
+    let name = format!("{}[{pid}]", child.name);
+    let c = child.clone();
+    task::spawn_with_tty(&name, task::current_tty(), move || {
+        run_main(c, regs, move |t| {
+            t.fx = fx;
+            t.fs_base = fs;
+            t.sigmask = sigmask;
+            t.altstack = altstack;
+        }, |_| {});
+    });
+    if vfork {
+        while !child.vfork_done.load(Ordering::SeqCst) {
+            check_exiting();
+            task::wait_event();
+        }
+    }
+    Ok(pid)
+}
+
+/// execve: replace the calling process's program. Only the calling thread survives
+/// (other threads are asked to exit). On success the frame `f` starts the new program.
+pub fn exec(f: &mut SyscallFrame, path: &str, args: Vec<String>, env: Vec<String>) -> Result<(), i64> {
+    let me = task::current_user().expect("exec outside a process");
+    let process = me.process.clone();
+    // Scripts: "#!interpreter [arg]" runs the interpreter on the script.
+    let (mut path, mut args) = (String::from(path.trim_start_matches('/')), args);
+    for _ in 0..4 {
+        let (bytes, _) = program_bytes(&path).map_err(|_| 2i64)?; // ENOENT
+        if !bytes.starts_with(b"#!") {
+            break;
+        }
+        let line = bytes[2..].split(|&b| b == b'\n').next().unwrap_or(&[]);
+        let line = core::str::from_utf8(line).map_err(|_| 8i64)?.trim(); // ENOEXEC
+        let mut parts = line.splitn(2, |c: char| c == ' ' || c == '\t');
+        let interp = parts.next().filter(|i| !i.is_empty()).ok_or(8i64)?;
+        let interp = String::from(interp);
+        let mut new_args = alloc::vec![interp.clone()];
+        if let Some(arg) = parts.next().map(str::trim).filter(|a| !a.is_empty()) {
+            new_args.push(arg.into());
+        }
+        new_args.push(format!("/{path}"));
+        new_args.extend(args.into_iter().skip(1));
+        args = new_args;
+        path = interp.trim_start_matches('/').into();
+    }
+    let (elf, is_static) = program_bytes(&path).map_err(|_| 2i64)?;
+    if !elf.starts_with(b"\x7fELF") {
+        return Err(8); // ENOEXEC
+    }
+    if process.threads.load(Ordering::SeqCst) > 1 {
+        return Err(11); // EAGAIN: multi-threaded execve is not supported yet
+    }
+    let cr3 = new_address_space();
+    let mut mem = Memory::new(cr3);
+    let env = if env.is_empty() { DEFAULT_ENV.map(String::from).to_vec() } else { env };
+    let (entry, rsp) = load_program(&mut mem, &path, &elf, is_static, &args, &env).map_err(|_| 8i64)?;
+    drop(elf);
+    // Switch to the new address space, then free the old one.
+    let old = core::mem::replace(&mut *process.mem.lock(), mem);
+    process.cr3.store(cr3, Ordering::SeqCst);
+    // SAFETY: the new tables map the kernel's upper half like every address space.
+    unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
+    drop(old);
+    *process.exe.lock() = path;
+    process.fds.lock().close_on_exec();
+    process.signals.lock().reset_handlers();
+    let u = task::current_user().unwrap();
+    u.fs_base = 0;
+    wrmsr(IA32_FS_BASE, 0);
+    u.altstack = (0, 0, 2);
+    u.clear_tid = 0;
+    // SAFETY: an initial-state image.
+    unsafe { restore_fpu(FxArea::initial().ptr, xsave_size() != 0) };
+    *f = SyscallFrame { r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r9: 0, r8: 0, r10: 0, rdx: 0, rsi: 0, rdi: 0, rax: 0, rip: entry, rflags: 0x202, rsp };
+    process.vfork_done.store(true, Ordering::SeqCst);
+    crate::ipc::notify();
+    Ok(())
 }
 
 /// Start a new thread of the current process (clone with CLONE_VM | CLONE_THREAD):
