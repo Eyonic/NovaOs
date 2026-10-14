@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -140,6 +140,17 @@ define_case() {
                         "  ok   posix_spawn(/bin/hello)" "  ok   kill(child, SIGTERM): WIFSIGNALED, WTERMSIG == SIGTERM"
                         "proctest: 15 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall") ;;
+        compat32) # 32-bit (i386) Linux programs in compatibility mode: static and dynamically
+                # linked (ld-linux.so.2), processes and signals, threads with TLS descriptors
+                # (userland/compat32/).
+                CMDLINE="nova.mode=shell"
+                INPUT=("wait:$PROMPT" "ser:hello32 one" "wait:argv[1] = one" "ser:hello32-dyn" "wait:sqrt(2)"
+                       "ser:proctest32" "wait:proctest: " "wait:$PROMPT" "ser:threads32" "wait:threads32: ")
+                EXPECT=("${shell[@]}" "Hello from a 32-bit program on Nova! (pointer size 4, argc 2)"
+                        "Hello from a dynamically linked 32-bit program! sqrt(2) = 1.414214"
+                        "proctest: 15 passed, 0 failed" "  ok   each thread has its own __thread variable"
+                        "threads32: 7 passed, 0 failed")
+                FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
         busybox) # A Unix userland on Nova: BusyBox's shell runs pipelines, loops, subshells and
                 # command substitution, which fork, execve, wait and pipes underneath.
                 CMDLINE="nova.mode=shell"

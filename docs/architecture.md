@@ -75,11 +75,15 @@ before the IDT, because the IDT gates reference Nova's code selector.
 | `0x00` | null |
 | `0x08` | 64-bit kernel code (`0x00AF9A000000FFFF`) |
 | `0x10` | kernel data (`0x00CF92000000FFFF`) |
-| `0x18` | user data, DPL 3 (selector `0x1B`) |
-| `0x20` | 64-bit user code, DPL 3 (selector `0x23`) |
-| `0x28` | 64-bit TSS (16-byte system descriptor, type 0x9) |
+| `0x18` | 32-bit user code, DPL 3 (selector `0x1B`, compatibility mode: D=1, L=0) |
+| `0x20` | user data, DPL 3 (selector `0x23`) |
+| `0x28` | 64-bit user code, DPL 3 (selector `0x2B`) |
+| `0x30` | 64-bit TSS (16-byte system descriptor, type 0x9) |
+| `0x60`-`0x70` | 32-bit TLS descriptors, entries 12-14 (`set_thread_area`; glibc's `%gs` = `0x63`) |
 
-The user segments are in the order SYSRET requires (STAR[63:48] = 0x10: SS = 0x18, CS = 0x20).
+This is Linux's layout, which SYSRET requires (STAR[63:48] = 0x18: 32-bit CS = 0x18, SS =
+0x20, 64-bit CS = 0x28). The TLS entries are per thread and rewritten on every switch to a
+32-bit thread.
 TSS.RSP0 is set on every task switch to the running program's kernel stack.
 
 Besides RSP0 for user programs, the TSS provides **IST1**: a dedicated 16 KiB stack for the #DF gate. If an exception
@@ -87,7 +91,7 @@ happens because RSP is bad, the CPU can't push the exception frame, which escala
 then switches to IST1 and can still report. Without that, the CPU would triple-fault and reset.
 
 After `lgdt`, CS is reloaded with a far return (`push 0x08; push rip; retfq`). DS/ES/SS get
-`0x10`, FS/GS get null, and `ltr 0x28` loads the TSS.
+`0x10`, FS/GS get null, and `ltr 0x30` loads the TSS.
 
 ### IDT and entry stubs (`src/interrupts.rs`)
 
@@ -447,6 +451,16 @@ multi-threaded, including the Chromium engine (`process.rs`, `linux.rs`, `ipc.rs
   (nanosecond resolution; a coarse clock made Chromium's schedulers busy-poll).
 * **CPU state.** XSAVE/XRSTOR with x87, SSE, AVX and (if present) AVX-512 per thread; FS
   base per thread. Faults in user code end the program, not the system.
+* **32-bit programs** (`linux/compat32.rs`). i386 ELF programs run in compatibility mode
+  under the 32-bit code segment, with a 4 GiB layout (stack below `0xFFFFE000`, `mmap` below
+  `0xF7000000`, PIE at `0x56555000`, `ld-linux.so.2` at `0xF7F00000`). `int 0x80` (a DPL 3
+  gate) enters `syscall32`. 269 i386 calls served by the same Linux function as an x86-64 one
+  are forwarded by number (`compat32_table.rs`, generated from Linux's syscall tables); the
+  rest convert their 32-bit structures (`stat64`, `iovec`, `timespec`, `sigaction`, `rlimit`,
+  `socketcall`, `_llseek`, `mmap2`, ...). `set_thread_area` and `clone`/`clone3` with
+  `CLONE_SETTLS` install TLS descriptors in the GDT; signal delivery builds i386 `sigframe`
+  and `rt_sigframe` frames. Tests: `hello32`, `hello32-dyn` (glibc's i386 loader and
+  `libm.so.6`), `proctest32` (proctest's 15 checks) and `threads32` (7 checks).
 * **Diagnostics.** `strace <program>` logs every system call with arguments and results to
   the serial console; unimplemented calls return `-ENOSYS` and are logged once.
 
@@ -455,8 +469,7 @@ checks: exceptions, RTTI, static constructors/destructors, STL, iostreams, fstre
 `threads` (7 checks: mutexes, condition variables, TLS, async, exceptions in threads),
 `hello-dyn`, `nettest` (DNS + HTTP over sockets), `guess` (interactive stdin).
 
-Not yet: `fork`/`exec` (Chromium runs with `--single-process`), signals delivered to
-handlers, `AF_INET6`, listening sockets, inotify.
+Not yet: `AF_INET6`, listening sockets, inotify, namespaces (containers), `vm86`.
 
 ## Nova Browser and Shields (0.4)
 
@@ -556,6 +569,7 @@ All cases run the same kernel binary. `scripts/mkimage.sh` adds `cmdline: nova.t
 | `keyboard` | typed as PS/2 key presses: Shift, punctuation, Backspace, Tab completion, Ctrl-C | the echoed text and `^C` |
 | `crash` | `crash pf` typed at the shell, with interrupts on | full #PF report with RIP check, controlled halt |
 | `native` | `hello`, `ctest`, `cxxtest`, `threads`, `hello-dyn`, `cxxtest-dyn`, `guess` | C and C++ runtime checks pass (static and dynamic), threads, stdin, exit status, no unimplemented syscall |
+| `compat32` | `hello32`, `hello32-dyn`, `proctest32`, `threads32` | 32-bit programs: static and dynamic, processes and signals, threads with TLS, no fault or unimplemented syscall |
 | `net` | `nettest 10.0.2.2:<mock port>` | glibc DNS and a TCP HTTP exchange through the Linux socket layer |
 | `chromium` | `chrome-headless-shell --screenshot` of a `data:` URL | the Chromium engine starts, renders and writes the PNG (skipped if Chromium was not downloaded) |
 | `browser` | desktop; "open the test page" typed to Claude Code (mock API) | Claude calls `open_url`, Nova Browser starts Chromium, Chromium fetches the page from the host, Shields blocks its Google Analytics script (skipped without Chromium) |

@@ -269,6 +269,11 @@ pub fn init() {
         // SAFETY: as above; the stub table has one 16-byte entry per vector from 48.
         unsafe { (*idt)[vector] = Gate::new(table + ((vector - 48) * DYNAMIC_STUB_SIZE) as u64, 0) };
     }
+    // int 0x80: 32-bit programs' system calls, callable from user mode (DPL 3).
+    let mut gate = Gate::new(crate::linux::compat32::int80_entry as usize as u64, 0);
+    gate.attributes = 0xEE;
+    // SAFETY: as above; vector 0x80 < 256.
+    unsafe { (*idt)[crate::apic::SYSCALL32_VECTOR as usize] = gate };
     let pointer = DescriptorTablePointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: idt as u64 };
     // SAFETY: the IDT is 'static, fully initialised, and every present gate points
     // at a stub defined above.

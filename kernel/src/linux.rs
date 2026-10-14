@@ -25,6 +25,9 @@ use alloc::vec::Vec;
 use crate::input::Key;
 use crate::process::{self, Process, SyscallFrame, UserState, PAGE};
 use crate::signal;
+use crate::gdt;
+
+pub mod compat32;
 use crate::sync::SpinLock;
 use crate::{fs, ipc, pit, rand, rtc, task};
 
@@ -557,6 +560,42 @@ fn proc_file(name: &str) -> Option<String> {
     })
 }
 
+/// A path relative to directory descriptor `dirfd` (AT_FDCWD, or a descriptor that is not
+/// a directory Nova tracks by path: the working directory, as openat does).
+fn at_path(dirfd: i64, p: &str) -> Result<String, i64> {
+    if dirfd != AT_FDCWD && !p.starts_with('/') {
+        if let Kind::Dir { path: d, .. } = &fds().get(dirfd)?.lock().kind {
+            return Ok(resolve(&format!("/{d}/{p}")));
+        }
+    }
+    Ok(resolve(p))
+}
+
+/// struct statx (256 bytes) from an x86-64 struct stat.
+fn statx(s: &[u8]) -> Vec<u8> {
+    let q = |o: usize| u64::from_le_bytes(s[o..o + 8].try_into().unwrap());
+    let d = |o: usize| u32::from_le_bytes(s[o..o + 4].try_into().unwrap());
+    let mut b = vec![0u8; 256];
+    let mut put = |o: usize, v: &[u8]| b[o..o + v.len()].copy_from_slice(v);
+    put(0, &0x7FFu32.to_le_bytes()); // STATX_BASIC_STATS
+    put(4, &(q(56) as u32).to_le_bytes()); // blksize
+    put(16, &(q(16) as u32).to_le_bytes()); // nlink
+    put(20, &d(28).to_le_bytes()); // uid
+    put(24, &d(32).to_le_bytes()); // gid
+    put(28, &(d(24) as u16).to_le_bytes()); // mode
+    put(32, &q(8).to_le_bytes()); // ino
+    put(40, &q(48).to_le_bytes()); // size
+    put(48, &q(64).to_le_bytes()); // blocks
+    for (dst, src) in [(64, 72), (96, 104), (112, 88)] {
+        // atime, ctime, mtime: tv_sec (s64), tv_nsec (u32)
+        put(dst, &q(src).to_le_bytes());
+        put(dst + 8, &(q(src + 8) as u32).to_le_bytes());
+    }
+    put(80, &q(88).to_le_bytes()); // btime = mtime
+    put(88, &(q(96) as u32).to_le_bytes());
+    b
+}
+
 fn stat_path(name: &str) -> Result<Vec<u8>, i64> {
     if let Some(text) = proc_file(name) {
         return Ok(stat_buf(0o100444, text.len() as u64, 0, ino_of(name)));
@@ -895,9 +934,14 @@ fn now_ns(clock: u64) -> u64 {
     }
 }
 
+/// Sleep at least `ns` (POSIX: never less than requested), in timer ticks, checking the
+/// TSC clock at each one: counting whole ticks alone would end up to one tick early.
 fn sleep_ns(ns: u64) {
-    let ticks = ns.div_ceil(1_000_000_000 / pit::HZ);
-    task::sleep_ticks(ticks.max(if ns > 0 { 1 } else { 0 }));
+    let end = pit::nanos().saturating_add(ns);
+    while pit::nanos() < end {
+        let left = end - pit::nanos();
+        task::sleep_ticks(left.div_ceil(1_000_000_000 / pit::HZ).max(1));
+    }
 }
 
 fn uname() -> Vec<u8> {
@@ -973,7 +1017,7 @@ fn syscall_name(nr: u64) -> String {
         157 => "prctl", 158 => "arch_prctl", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
         213 => "epoll_create", 217 => "getdents64", 218 => "set_tid_address", 228 => "clock_gettime",
         231 => "exit_group", 232 => "epoll_wait", 233 => "epoll_ctl", 257 => "openat", 262 => "newfstatat",
-        273 => "set_robust_list", 281 => "epoll_pwait", 284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1",
+        273 => "set_robust_list", 332 => "statx", 281 => "epoll_pwait", 284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1",
         293 => "pipe2", 302 => "prlimit64", 318 => "getrandom", 319 => "memfd_create", 334 => "rseq", 435 => "clone3",
         _ => return format!("syscall_{nr}"),
     };
@@ -1040,8 +1084,15 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             262 => {
                 // newfstatat
                 let p = read_cstr(a1)?;
-                let b = if p.is_empty() && a3 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&resolve(&p))? };
+                let b = if p.is_empty() && a3 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&at_path(a0 as i32 as i64, &p)?)? };
                 write_user(a2, &b)?;
+                0
+            }
+            332 => {
+                // statx(dirfd, path, flags, mask, statxbuf): filled from the same data as stat
+                let p = read_cstr(a1)?;
+                let s = if p.is_empty() && a2 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&at_path(a0 as i32 as i64, &p)?)? };
+                write_user(a4, &statx(&s))?;
                 0
             }
             7 | 271 => {
@@ -2028,7 +2079,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     Ok(v)
                 };
                 let (args, env) = (list(argv)?, list(envp)?);
-                process::exec(f, &path, args, env)?;
+                process::exec(f, path, args, env)?;
                 0
             }
             62 => {

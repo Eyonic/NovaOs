@@ -36,6 +36,11 @@ pub const STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 const STACK_SIZE: u64 = 8 << 20;
 /// Anonymous mmap areas are placed growing down from here.
 const MMAP_TOP: u64 = 0x0000_7F00_0000_0000;
+/// 32-bit programs (Linux's i386 layout on x86-64): everything below 4 GiB.
+const STACK_TOP32: u64 = 0xFFFF_E000;
+const MMAP_TOP32: u64 = 0xF700_0000;
+const PIE_BASE32: u64 = 0x5655_5000;
+const INTERP_BASE32: u64 = 0xF7F0_0000;
 /// Lowest address a program may use.
 const USER_MIN: u64 = 0x1_0000;
 pub const USER_MAX: u64 = 0x0000_8000_0000_0000;
@@ -194,6 +199,24 @@ pub unsafe fn restore_fpu(src: *const u8, xsave: bool) {
     area.restore();
 }
 
+/// A 32-bit signal handler is about to run: keep the interrupted code's SIMD state.
+pub fn push_signal_fpu(u: &mut UserState) {
+    let area = FxArea::initial();
+    // SAFETY: the area is sized and aligned for the enabled state components.
+    unsafe { save_fpu(area.ptr) };
+    if u.sigfpu.len() == 32 {
+        u.sigfpu.remove(0); // handlers left with siglongjmp: forget the oldest
+    }
+    u.sigfpu.push(area);
+}
+
+/// The handler returned (sigreturn): bring the interrupted code's SIMD state back.
+pub fn pop_signal_fpu(u: &mut UserState) {
+    if let Some(area) = u.sigfpu.pop() {
+        area.restore();
+    }
+}
+
 /// Saved SIMD/FPU state: an XSAVE area (64-byte aligned), or 512 bytes for FXSAVE.
 pub struct FxArea {
     ptr: *mut u8,
@@ -274,6 +297,8 @@ pub struct Memory {
     pub brk_start: u64,
     pub brk: u64,
     mmap_next: u64,
+    /// A 32-bit program's address space: everything stays below 4 GiB.
+    pub compat: bool,
 }
 
 // SAFETY: the raw page pointers refer to heap pages owned by this value.
@@ -326,6 +351,15 @@ pub struct UserState {
     pub altstack: (u64, u64, u32),
     /// rt_sigsuspend: the mask to restore once the handler that ends the wait returns.
     pub saved_mask: Option<u64>,
+    /// A 32-bit (compatibility mode) thread.
+    pub compat: bool,
+    /// 32-bit TLS descriptors (set_thread_area), GDT entries 12-14 while this thread runs.
+    pub tls: [u64; gdt::TLS_ENTRIES],
+    /// The user's %fs and %gs selectors, kept across task switches (32-bit TLS uses %gs).
+    pub user_fs: u16,
+    pub user_gs: u16,
+    /// SIMD state of the interrupted code while 32-bit signal handlers run (innermost last).
+    sigfpu: Vec<Box<FxArea>>,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -352,7 +386,7 @@ pub fn oom_scratch_page() -> *mut u8 {
 
 impl Memory {
     fn new(cr3: u64) -> Self {
-        Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP }
+        Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP, compat: false }
     }
 
     /// Map a zeroed page at `va` (page aligned) if not mapped yet; returns its kernel pointer.
@@ -457,6 +491,7 @@ impl Memory {
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         child.mmap_next = self.mmap_next;
+        child.compat = self.compat;
         true
     }
 
@@ -534,6 +569,17 @@ impl Memory {
     }
 
     /// Reserve a fresh area of `len` bytes for mmap; returns its start.
+    /// Top of the stack area (a 32-bit program's is below 4 GiB).
+    pub fn stack_top(&self) -> u64 {
+        if self.compat { STACK_TOP32 } else { STACK_TOP }
+    }
+
+    /// Make this (empty) address space a 32-bit program's.
+    fn make_compat(&mut self) {
+        self.compat = true;
+        self.mmap_next = MMAP_TOP32;
+    }
+
     pub fn reserve(&mut self, len: u64) -> u64 {
         self.reserve_with(len, true)
     }
@@ -541,7 +587,7 @@ impl Memory {
     /// Is [start, start+len) free (no area overlaps it, inside the user range)?
     pub fn is_free(&self, start: u64, len: u64) -> bool {
         let Some(end) = start.checked_add(len) else { return false };
-        start >= USER_MIN && end <= STACK_TOP - STACK_SIZE && !self.areas.iter().any(|a| a.start < end && start < a.end)
+        start >= USER_MIN && end <= self.stack_top() - STACK_SIZE && !self.areas.iter().any(|a| a.start < end && start < a.end)
     }
 
     /// Reserve `len` bytes at `hint` if that range is free (mmap address hints, as on
@@ -841,7 +887,7 @@ pub fn terminate(p: &Process, sig: u32) {
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new() })
     }
 }
 
@@ -857,8 +903,35 @@ fn kernel_stack_here() -> u64 {
 pub fn switch_out(user: Option<&mut UserState>) {
     if let Some(u) = user {
         u.fx.save();
-        u.fs_base = rdmsr(IA32_FS_BASE);
+        if u.compat {
+            let (fs, gs): (u16, u16);
+            // SAFETY: reading segment selectors has no side effects.
+            unsafe { asm!("mov {0:x}, fs", "mov {1:x}, gs", out(reg) fs, out(reg) gs, options(nomem, nostack, preserves_flags)) };
+            u.user_fs = fs;
+            u.user_gs = gs;
+        } else {
+            u.fs_base = rdmsr(IA32_FS_BASE);
+        }
     }
+}
+
+/// DS and ES for compatibility mode (64-bit code ignores them; 32-bit code needs a usable
+/// data segment there).
+fn load_ds_es(sel: u16) {
+    // SAFETY: the user data segment is a flat, present DPL 3 data descriptor.
+    unsafe { asm!("mov ds, {0:x}", "mov es, {0:x}", in(reg) sel, options(nostack, preserves_flags)) };
+}
+
+/// sigreturn of a 32-bit thread restored these selectors: load them now.
+pub fn reload_fs_gs(fs: u16, gs: u16) {
+    load_fs_gs(fs, gs);
+}
+
+/// Load %fs and %gs selectors (from GDT entries, e.g. 32-bit TLS).
+fn load_fs_gs(fs: u16, gs: u16) {
+    // SAFETY: the selectors are null or user TLS/data descriptors (set_thread_area
+    // validates what it installs); the kernel itself does not use %fs or %gs.
+    unsafe { asm!("mov fs, {0:x}", "mov gs, {1:x}", in(reg) fs, in(reg) gs, options(nostack, preserves_flags)) };
 }
 
 /// Called by the scheduler for the task being switched in.
@@ -871,7 +944,17 @@ pub fn switch_in(user: Option<&UserState>) {
     if let Some(u) = user {
         gdt::set_kernel_stack(u.kernel_rsp);
         SYSCALL_KERNEL_RSP.store(u.kernel_rsp, Ordering::Relaxed);
-        wrmsr(IA32_FS_BASE, u.fs_base);
+        if u.compat {
+            // The descriptors first: loading a selector reads its descriptor.
+            gdt::set_tls(&u.tls);
+            load_fs_gs(u.user_fs, u.user_gs);
+            load_ds_es(gdt::USER_DATA);
+        } else {
+            // A 64-bit thread uses the FS base MSR; null selectors first, since loading a
+            // selector would overwrite the base.
+            load_fs_gs(0, 0);
+            wrmsr(IA32_FS_BASE, u.fs_base);
+        }
         u.fx.restore();
     }
 }
@@ -953,6 +1036,48 @@ unsafe extern "C" fn enter_user(regs: *const SyscallFrame, ctx: *mut u64) -> i64
         "iretq",
         ss = const gdt::USER_DATA as u64,
         cs = const gdt::USER_CODE as u64,
+    )
+}
+
+/// `enter_user` for a 32-bit thread: the same, with the compatibility-mode code segment.
+#[unsafe(naked)]
+unsafe extern "C" fn enter_user32(regs: *const SyscallFrame, ctx: *mut u64) -> i64 {
+    naked_asm!(
+        "pushfq",
+        "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
+        "mov [rsi], rsp",
+        // Compatibility mode uses DS and ES (a null DS faults there): the user data segment.
+        "mov eax, {ss}", "mov ds, ax", "mov es, ax",
+        "push {ss}", "push qword ptr [rdi + 15*8]", "push qword ptr [rdi + 14*8]", "push {cs}", "push qword ptr [rdi + 13*8]",
+        "mov r15, [rdi + 0*8]", "mov r14, [rdi + 1*8]", "mov r13, [rdi + 2*8]", "mov r12, [rdi + 3*8]",
+        "mov rbp, [rdi + 4*8]", "mov rbx, [rdi + 5*8]", "mov r9, [rdi + 6*8]", "mov r8, [rdi + 7*8]",
+        "mov r10, [rdi + 8*8]", "mov rdx, [rdi + 9*8]", "mov rsi, [rdi + 10*8]", "mov rax, [rdi + 12*8]",
+        // i386 code keeps ecx across int 0x80: it travels in the r10 slot.
+        "mov rcx, [rdi + 8*8]", "xor r11d, r11d",
+        "mov rdi, [rdi + 11*8]",
+        "iretq",
+        ss = const gdt::USER_DATA as u64,
+        cs = const gdt::USER_CODE32 as u64,
+    )
+}
+
+/// Leave the kernel for user mode with `regs` in 64-bit or compatibility mode (execve,
+/// which may switch between them). Kernel frames below are abandoned: the next entry
+/// starts again at the thread's kernel stack top.
+#[unsafe(naked)]
+unsafe extern "C" fn resume_user(regs: *const SyscallFrame, cs: u64) -> ! {
+    naked_asm!(
+        "cli",
+        // DS/ES: the user data segment (needed by 32-bit programs, ignored in 64-bit mode).
+        "mov eax, {ss}", "mov ds, ax", "mov es, ax",
+        "push {ss}", "push qword ptr [rdi + 15*8]", "push qword ptr [rdi + 14*8]", "push rsi", "push qword ptr [rdi + 13*8]",
+        "mov r15, [rdi + 0*8]", "mov r14, [rdi + 1*8]", "mov r13, [rdi + 2*8]", "mov r12, [rdi + 3*8]",
+        "mov rbp, [rdi + 4*8]", "mov rbx, [rdi + 5*8]", "mov r9, [rdi + 6*8]", "mov r8, [rdi + 7*8]",
+        "mov r10, [rdi + 8*8]", "mov rdx, [rdi + 9*8]", "mov rsi, [rdi + 10*8]", "mov rax, [rdi + 12*8]",
+        "xor ecx, ecx", "xor r11d, r11d",
+        "mov rdi, [rdi + 11*8]",
+        "iretq",
+        ss = const gdt::USER_DATA as u64,
     )
 }
 
@@ -1106,6 +1231,8 @@ struct Loaded {
     entry: u64,
     phdr: u64,
     phnum: u64,
+    /// ELFCLASS32 (an i386 program).
+    class32: bool,
     /// PT_INTERP path (dynamically linked programs).
     interp: Option<String>,
 }
@@ -1125,9 +1252,17 @@ fn load_elf(u: &mut Memory, elf: &[u8], dyn_base: u64, is_static: bool) -> Resul
     if elf.len() < 64 || &elf[0..4] != b"\x7fELF" {
         return Err("not an ELF executable".into());
     }
-    if elf[4] != 2 || elf[5] != 1 || le16(elf, 18) != 0x3E {
-        return Err("not a 64-bit little-endian x86-64 ELF file".into());
+    // ELFCLASS64 + EM_X86_64, or ELFCLASS32 + EM_386 (32-bit programs).
+    let class32 = match (elf[4], elf[5], le16(elf, 18)) {
+        (2, 1, 0x3E) => false,
+        (1, 1, 3) if elf.len() >= 52 => true,
+        _ => return Err("not an x86-64 or i386 little-endian ELF file".into()),
+    };
+    if class32 != u.compat {
+        return Err("program and dynamic loader are not the same kind (32- and 64-bit)".into());
     }
+    // Header and program-header fields by ELF class.
+    let word = |b: &[u8], o32: usize, o64: usize| if class32 { le32(b, o32) as u64 } else { le64(b, o64) };
     let kind = le16(elf, 16);
     let base = match kind {
         2 => 0,        // ET_EXEC: fixed addresses
@@ -1135,23 +1270,24 @@ fn load_elf(u: &mut Memory, elf: &[u8], dyn_base: u64, is_static: bool) -> Resul
         _ => return Err(format!("not an executable (ELF type {kind})")),
     };
     let mut interp = None;
-    let phoff = le64(elf, 32) as usize;
-    let phentsize = le16(elf, 54) as usize;
-    let phnum = le16(elf, 56) as usize;
+    let phoff = word(elf, 28, 32) as usize;
+    let phentsize = le16(elf, if class32 { 42 } else { 54 }) as usize;
+    let phnum = le16(elf, if class32 { 44 } else { 56 }) as usize;
+    let user_top = u.stack_top() - STACK_SIZE;
     let mut phdr_addr = 0;
     let mut top = 0;
     for i in 0..phnum {
         let p = &elf.get(phoff + i * phentsize..phoff + (i + 1) * phentsize).ok_or("truncated program headers")?;
         let ptype = le32(p, 0);
-        let flags = le32(p, 4);
-        let offset = le64(p, 8) as usize;
-        let vaddr = le64(p, 16) + base;
-        let filesz = le64(p, 32) as usize;
-        let memsz = le64(p, 40);
+        let flags = if class32 { le32(p, 24) } else { le32(p, 4) };
+        let offset = word(p, 4, 8) as usize;
+        let vaddr = word(p, 8, 16) + base;
+        let filesz = word(p, 16, 32) as usize;
+        let memsz = word(p, 20, 40);
         match ptype {
             1 => {
                 // PT_LOAD
-                if vaddr < USER_MIN || vaddr + memsz > STACK_TOP - STACK_SIZE {
+                if vaddr < USER_MIN || vaddr + memsz > user_top {
                     return Err(format!("segment at {vaddr:#x} outside the user range"));
                 }
                 let data = elf.get(offset..offset + filesz).ok_or("truncated segment")?;
@@ -1203,13 +1339,14 @@ fn load_elf(u: &mut Memory, elf: &[u8], dyn_base: u64, is_static: bool) -> Resul
         u.brk_start = top.next_multiple_of(PAGE);
         u.brk = u.brk_start;
     }
-    Ok(Loaded { entry: le64(elf, 24) + base, phdr: phdr_addr, phnum: phnum as u64, interp })
+    Ok(Loaded { entry: word(elf, 24, 24) + base, phdr: phdr_addr, phnum: phnum as u64, class32, interp })
 }
 
 /// Build the initial stack: argc, argv, envp, auxv (System V ABI), return RSP.
 fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, interp_base: u64, execfn: &str) -> u64 {
-    u.areas.push(Area { start: STACK_TOP - STACK_SIZE, end: STACK_TOP, writable: true });
-    let mut sp = STACK_TOP;
+    let top = u.stack_top();
+    u.areas.push(Area { start: top - STACK_SIZE, end: top, writable: true });
+    let mut sp = top;
     let push_bytes = |u: &mut Memory, sp: &mut u64, data: &[u8]| -> u64 {
         *sp -= data.len() as u64;
         u.poke(*sp, data, true);
@@ -1221,7 +1358,7 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
         v
     };
     let execfn_ptr = push_bytes(u, &mut sp, &cstr(execfn));
-    let platform = push_bytes(u, &mut sp, &cstr("x86_64"));
+    let platform = push_bytes(u, &mut sp, &cstr(if l.class32 { "i686" } else { "x86_64" }));
     let mut random = [0u8; 16];
     crate::rand::fill(&mut random);
     let random_ptr = push_bytes(u, &mut sp, &random);
@@ -1229,7 +1366,7 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
     let envp: Vec<u64> = env.iter().map(|e| push_bytes(u, &mut sp, &cstr(e))).collect();
     let auxv: [(u64, u64); 17] = [
         (3, l.phdr),
-        (4, 56),
+        (4, if l.class32 { 32 } else { 56 }),
         (5, l.phnum),
         (6, PAGE),
         (7, interp_base),
@@ -1247,9 +1384,10 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
         (31, execfn_ptr),
     ];
     let words = 1 + argv.len() + 1 + envp.len() + 1 + (auxv.len() + 1) * 2;
+    let wsize = if l.class32 { 4 } else { 8 };
     sp &= !15;
-    if words % 2 == 1 {
-        sp -= 8; // keep RSP 16-byte aligned at entry
+    if (words * wsize) % 16 != 0 {
+        sp -= (16 - (words * wsize) % 16) as u64; // keep the stack pointer 16-byte aligned at entry
     }
     let mut table: Vec<u64> = Vec::with_capacity(words);
     table.push(args.len() as u64);
@@ -1263,7 +1401,11 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
     }
     table.push(0);
     table.push(0);
-    let bytes: Vec<u8> = table.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let bytes: Vec<u8> = if l.class32 {
+        table.iter().flat_map(|w| (*w as u32).to_le_bytes()).collect()
+    } else {
+        table.iter().flat_map(|w| w.to_le_bytes()).collect()
+    };
     sp -= bytes.len() as u64;
     u.poke(sp, &bytes, true);
     sp
@@ -1319,20 +1461,24 @@ fn program_bytes(path: &str) -> Result<(alloc::borrow::Cow<'static, [u8]>, bool)
 /// Load program `path` (and its dynamic loader) into `mem` and build its initial stack.
 /// Returns (entry point, stack pointer).
 fn load_program(mem: &mut Memory, path: &str, elf: &[u8], is_static: bool, args: &[String], env: &[String]) -> Result<(u64, u64), String> {
-    let loaded = load_elf(mem, elf, PIE_BASE, is_static)?;
+    if elf.len() > 4 && elf[4] == 1 {
+        mem.make_compat(); // ELFCLASS32: a 32-bit program
+    }
+    let (pie_base, interp_load) = if mem.compat { (PIE_BASE32, INTERP_BASE32) } else { (PIE_BASE, INTERP_BASE) };
+    let loaded = load_elf(mem, elf, pie_base, is_static)?;
     // Dynamically linked: load the interpreter too and start there; it maps the
     // shared libraries itself (openat + mmap) and then jumps to AT_ENTRY.
     let (start, interp_base) = match &loaded.interp {
         Some(ip) => {
             let ip = ip.trim_start_matches('/');
             let l = match crate::fs::system_file(ip) {
-                Some(ld) => load_elf(mem, ld, INTERP_BASE, true)?,
+                Some(ld) => load_elf(mem, ld, interp_load, true)?,
                 None => {
                     let ld = crate::fs::read(ip).map_err(|_| format!("{path} needs the dynamic loader /{ip}, which is not installed"))?;
-                    load_elf(mem, &ld, INTERP_BASE, false)?
+                    load_elf(mem, &ld, interp_load, false)?
                 }
             };
-            (l.entry, INTERP_BASE)
+            (l.entry, interp_load)
         }
         None => (loaded.entry, 0),
     };
@@ -1374,12 +1520,14 @@ fn run_with(path: &str, args: &[String], trace: bool, extra: Vec<(usize, crate::
 fn run_main(process: Arc<Process>, regs: SyscallFrame, setup: impl FnOnce(&mut UserState), on_start: impl FnOnce(Arc<Process>)) -> i32 {
     let mut thread = UserState::new_thread(process.clone(), process.pid);
     thread.kernel_rsp = kernel_stack_here();
+    thread.compat = process.mem.lock().compat;
     setup(&mut thread);
+    let compat = thread.compat;
     task::set_user(Some(thread));
     let ctx = &raw mut task::current_user().unwrap().exit_ctx;
     on_start(process.clone());
     // SAFETY: the address space is loaded; registers were set up by the caller.
-    let code = unsafe { enter_user(&regs, ctx) } as i32;
+    let code = unsafe { if compat { enter_user32(&regs, ctx) } else { enter_user(&regs, ctx) } } as i32;
     process.threads.fetch_sub(1, Ordering::SeqCst);
     task::set_user(None);
     // Wait for the other threads to leave (they notice `exiting`).
@@ -1396,6 +1544,17 @@ fn run_main(process: Arc<Process>, regs: SyscallFrame, setup: impl FnOnce(&mut U
 }
 
 // ---------------------------------------------------------------- fork and exec
+
+/// The calling thread's live %fs/%gs selectors (32-bit threads; 0 for 64-bit ones).
+pub fn current_fs_gs(u: &UserState) -> (u16, u16) {
+    if !u.compat {
+        return (0, 0);
+    }
+    let (fs, gs): (u16, u16);
+    // SAFETY: reading segment selectors has no side effects.
+    unsafe { asm!("mov {0:x}, fs", "mov {1:x}, gs", out(reg) fs, out(reg) gs, options(nomem, nostack, preserves_flags)) };
+    (fs, gs)
+}
 
 /// fork (and vfork, and clone without CLONE_VM): a new process with a copy of the
 /// caller's memory and open files, whose one thread resumes after the system call with
@@ -1429,6 +1588,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     // SAFETY: the area is sized for xsave_size() (or 512) bytes and 64-byte aligned.
     unsafe { save_fpu(fx.ptr) };
     let (fs, sigmask, altstack) = (tls.unwrap_or(me.fs_base), me.sigmask, me.altstack);
+    let (compat, tls32, sel) = (me.compat, me.tls, current_fs_gs(me));
     let pid = child.pid;
     let name = format!("{}[{pid}]", child.name);
     let c = child.clone();
@@ -1438,6 +1598,9 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
             t.fs_base = fs;
             t.sigmask = sigmask;
             t.altstack = altstack;
+            t.compat = compat;
+            t.tls = tls32;
+            (t.user_fs, t.user_gs) = sel;
         }, |_| {});
     });
     if vfork {
@@ -1451,7 +1614,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
 
 /// execve: replace the calling process's program. Only the calling thread survives
 /// (other threads are asked to exit). On success the frame `f` starts the new program.
-pub fn exec(f: &mut SyscallFrame, path: &str, args: Vec<String>, env: Vec<String>) -> Result<(), i64> {
+pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<String>) -> Result<(), i64> {
     let me = task::current_user().expect("exec outside a process");
     let process = me.process.clone();
     // Scripts: "#!interpreter [arg]" runs the interpreter on the script.
@@ -1506,11 +1669,58 @@ pub fn exec(f: &mut SyscallFrame, path: &str, args: Vec<String>, env: Vec<String
     *f = SyscallFrame { r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r9: 0, r8: 0, r10: 0, rdx: 0, rsi: 0, rdi: 0, rax: 0, rip: entry, rflags: 0x202, rsp };
     process.vfork_done.store(true, Ordering::SeqCst);
     crate::ipc::notify();
-    Ok(())
+    // The new program may be 32- or 64-bit, whichever the caller was: leave through iretq
+    // with the matching code segment instead of the caller's return path.
+    let compat = process.mem.lock().compat;
+    // resume_user does not return: release what this function owns first (the extra
+    // reference to the process above all, which would keep it alive forever).
+    drop(args);
+    drop(env);
+    drop(process);
+    let u = task::current_user().unwrap();
+    u.compat = compat;
+    u.tls = [0; gdt::TLS_ENTRIES];
+    (u.user_fs, u.user_gs) = (0, 0);
+    load_fs_gs(0, 0);
+    let regs = *f;
+    // SAFETY: the new address space is loaded and the registers describe its entry.
+    unsafe { resume_user(&regs, if compat { gdt::USER_CODE32 } else { gdt::USER_CODE } as u64) }
 }
 
 /// Start a new thread of the current process (clone with CLONE_VM | CLONE_THREAD):
 /// it resumes after the syscall with rax = 0, on `stack`, with FS base `tls`.
+/// clone for a 32-bit thread: like [`spawn_thread`], with the child's TLS descriptors and
+/// the parent's %gs selector (`parent` is a 32-bit frame: ecx in the r10 slot).
+pub fn spawn_thread32(parent: &SyscallFrame, stack: u64, tls: [u64; gdt::TLS_ENTRIES], clear_tid: u64) -> u64 {
+    let me = task::current_user().expect("clone outside a process");
+    let process = me.process.clone();
+    let tid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let mut regs = SyscallFrame { ..*parent };
+    regs.rax = 0;
+    if stack != 0 {
+        regs.rsp = stack;
+    }
+    let (fs, gs) = current_fs_gs(me);
+    process.threads.fetch_add(1, Ordering::SeqCst);
+    let name = format!("{}:{tid}", process.name);
+    task::spawn_with_tty(&name, task::current_tty(), move || {
+        let mut thread = UserState::new_thread(process.clone(), tid);
+        thread.compat = true;
+        thread.tls = tls;
+        thread.user_fs = fs;
+        thread.user_gs = gs;
+        thread.clear_tid = clear_tid;
+        thread.kernel_rsp = kernel_stack_here();
+        task::set_user(Some(thread));
+        let ctx = &raw mut task::current_user().unwrap().exit_ctx;
+        // SAFETY: as for run(): this task now runs in the process's address space.
+        unsafe { enter_user32(&regs, ctx) };
+        task::set_user(None);
+        process.threads.fetch_sub(1, Ordering::SeqCst);
+    });
+    tid
+}
+
 pub fn spawn_thread(parent: &SyscallFrame, stack: u64, tls: Option<u64>, clear_tid: u64) -> u64 {
     let me = task::current_user().expect("clone outside a process");
     let process = me.process.clone();

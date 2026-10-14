@@ -40,6 +40,8 @@ pub const SPURIOUS_VECTOR: u8 = 0xFF;
 /// First and last vector handed out for PCI interrupts.
 pub const FIRST_DYNAMIC_VECTOR: u8 = 48;
 pub const LAST_DYNAMIC_VECTOR: u8 = 0xEF;
+/// The i386 system call vector (int 0x80): never handed out to devices.
+pub const SYSCALL32_VECTOR: u8 = 0x80;
 /// IRQ numbers of MSI vectors start here (above any GSI).
 pub const MSI_IRQ_BASE: u32 = 0x1000;
 
@@ -241,7 +243,7 @@ pub fn route_sci(irq: u32) {
 
 /// Take a free dynamic vector for IRQ number `irq`.
 fn alloc_vector(irq: u32) -> Option<u8> {
-    (FIRST_DYNAMIC_VECTOR..=LAST_DYNAMIC_VECTOR).find(|&v| {
+    (FIRST_DYNAMIC_VECTOR..=LAST_DYNAMIC_VECTOR).filter(|&v| v != SYSCALL32_VECTOR).find(|&v| {
         VECTOR_IRQ[v as usize].compare_exchange(0, irq + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     })
 }
@@ -277,7 +279,7 @@ pub fn alloc_msi() -> Option<(u32, u64, u32)> {
     if !active() {
         return None;
     }
-    let vector = (FIRST_DYNAMIC_VECTOR..=LAST_DYNAMIC_VECTOR).find(|&v| {
+    let vector = (FIRST_DYNAMIC_VECTOR..=LAST_DYNAMIC_VECTOR).filter(|&v| v != SYSCALL32_VECTOR).find(|&v| {
         let irq = MSI_IRQ_BASE + v as u32;
         VECTOR_IRQ[v as usize].compare_exchange(0, irq + 1, Ordering::AcqRel, Ordering::Relaxed).is_ok()
     })?;

@@ -37,6 +37,16 @@ for src in "$USERLAND_SRC"/*.c "$USERLAND_SRC"/*.cpp; do
     strip "$USERLAND_OUT/$name"
 done
 
+# 32-bit (i386) programs (userland/compat32/): Nova runs them in compatibility mode.
+if compgen -G "$USERLAND_SRC/compat32/*.c" >/dev/null; then
+    log "Building 32-bit user programs (static)"
+    for src in "$USERLAND_SRC"/compat32/*.c; do
+        name="$(basename "${src%.*}")"
+        "${CC:-gcc}" -m32 -static -O2 -Wall -o "$USERLAND_OUT/$name" "$src" -lm >>"$BUILD_LOG" 2>&1 || fail "compiling $src failed (32-bit; needs lib32-glibc; log: $BUILD_LOG)"
+        strip "$USERLAND_OUT/$name"
+    done
+fi
+
 # Dynamically linked programs (userland/dynamic/) run with the host's dynamic loader
 # and shared libraries, which are collected into a small sysroot shipped alongside.
 SYSROOT="$BUILD/sysroot"
@@ -76,6 +86,20 @@ for src in "$USERLAND_SRC"/dynamic/*.c "$USERLAND_SRC"/dynamic/*.cpp; do
         *.cpp) cc="${CXX:-g++}"; extra=() ;;
     esac
     "$cc" -O2 -Wall -o "$USERLAND_OUT/$name" "$src" "${extra[@]}" >>"$BUILD_LOG" 2>&1 || fail "compiling $src failed (log: $BUILD_LOG)"
+    strip "$USERLAND_OUT/$name"
+    interp="$(readelf -l "$USERLAND_OUT/$name" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
+    for lib in "$interp" $(ldd "$USERLAND_OUT/$name" | awk '/=> \//{print $3}'); do
+        [[ -n "$lib" ]] || continue
+        mkdir -p "$SYSROOT$(dirname "$lib")"
+        cp -L "$lib" "$SYSROOT$lib"
+    done
+done
+# Dynamically linked 32-bit programs: the host's 32-bit loader (/lib/ld-linux.so.2) and
+# libraries (lib32-glibc) go into the sysroot the same way.
+for src in "$USERLAND_SRC"/compat32/dynamic/*.c; do
+    [[ -f "$src" ]] || continue
+    name="$(basename "${src%.*}")"
+    "${CC:-gcc}" -m32 -O2 -Wall -o "$USERLAND_OUT/$name" "$src" -lm >>"$BUILD_LOG" 2>&1 || fail "compiling $src failed (32-bit; log: $BUILD_LOG)"
     strip "$USERLAND_OUT/$name"
     interp="$(readelf -l "$USERLAND_OUT/$name" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')"
     for lib in "$interp" $(ldd "$USERLAND_OUT/$name" | awk '/=> \//{print $3}'); do

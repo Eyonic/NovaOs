@@ -114,7 +114,7 @@ extern "C" fn kmain() -> ! {
     }
 
     gdt::init();
-    println!("[nova] gdt: loaded (kernel 0x08/0x10, user 0x23/0x1b, tss 0x28, #DF on IST1)");
+    println!("[nova] gdt: loaded (kernel 0x08/0x10, user 0x2b/0x23, user32 0x1b, tss 0x30, #DF on IST1)");
     interrupts::init();
     process::init();
     let (exceptions, irqs) = interrupts::installed_vectors();

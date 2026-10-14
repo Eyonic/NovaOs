@@ -34,7 +34,7 @@ core::arch::global_asm!(
 
     .global nova_selftest_gp
     nova_selftest_gp:
-        mov eax, 0x40                   // selector index 8: beyond the 7-entry GDT limit
+        mov eax, 0x40                   // selector index 8: an empty GDT slot (not a segment)
     .global nova_selftest_gp_rip
     nova_selftest_gp_rip:
         mov ds, ax                      // #GP(0x40)

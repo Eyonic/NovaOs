@@ -8,6 +8,10 @@ rustup default stable        # any toolchain; kernel/rust-toolchain.toml auto-in
 scripts/check-prereqs.sh
 ```
 
+The 32-bit test programs (`userland/compat32/`) also need `lib32-glibc` and `lib32-gcc-libs`
+from the `[multilib]` repository (`sudo pacman -S --needed lib32-glibc lib32-gcc-libs`);
+without them, `scripts/build.sh` stops at "compiling ... failed (32-bit)".
+
 Do not run `pacman -Sy <pkg>` (partial upgrade). Either use the command above or do a full `-Syu` first.
 
 The `limine` package only places files under `/usr/share/limine`. Nova copies

@@ -83,12 +83,12 @@ pub fn bit(sig: u32) -> u64 {
 }
 
 /// What happens to a signal nobody handles.
-enum Default {
+pub(crate) enum Default {
     Terminate,
     Ignore,
 }
 
-fn default_action(sig: u32) -> Default {
+pub(crate) fn default_action(sig: u32) -> Default {
     match sig {
         SIGCHLD | SIGURG | SIGWINCH | SIGCONT => Default::Ignore,
         // Job control: Nova has no stopped state yet, so stopping is ignored.
@@ -138,7 +138,7 @@ pub fn has_deliverable(u: &UserState) -> bool {
 }
 
 /// Take the lowest deliverable signal: (signal, sender pid, sent to the thread itself).
-fn take(u: &mut UserState) -> Option<(u32, u32, bool)> {
+pub(crate) fn take(u: &mut UserState) -> Option<(u32, u32, bool)> {
     let own = u.pending & !u.sigmask;
     if own != 0 {
         let sig = own.trailing_zeros() + 1;
@@ -241,7 +241,7 @@ fn push_frame(u: &mut UserState, f: &mut SyscallFrame, sig: u32, sender: u32, to
             w64(UC_MCONTEXT + i as u64 * 8, *r);
         }
         // cs, gs, fs, ss as user mode sees them.
-        w64(UC_MCONTEXT + SC_SEGS, 0x2b << 48 | 0x33);
+        w64(UC_MCONTEXT + SC_SEGS, 0x23 << 48 | 0x2b);
         w64(UC_MCONTEXT + SC_OLDMASK, old_mask);
         w64(UC_MCONTEXT + SC_FPSTATE, fpstate);
         w64(UC_SIGMASK, old_mask);
