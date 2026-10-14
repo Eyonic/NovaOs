@@ -27,4 +27,6 @@ panic = "abort"
 
 [profile.release]
 panic = "abort"
-debug = true      # keep symbols for gdb; Limine ignores them
+debug = true      # keep symbols for gdb; mkimage.sh strips them from the image
+lto = "fat"       # optimize across crates (smoltcp, rustls, rhai, ...)
+codegen-units = 1
