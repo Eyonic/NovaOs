@@ -231,6 +231,7 @@ is kept for `lspci`, System Monitor and Claude.
 |---|---|---|
 | Intel 8254x/82574 Ethernet | `drivers/e1000.rs` | legacy descriptors, 64-entry rings, polled |
 | AHCI SATA controller | `drivers/ahci.rs` | IDENTIFY, READ/WRITE DMA EXT, one command slot, polled |
+| NVMe SSD controller | `drivers/nvme.rs` | admin + one I/O queue pair, PRP lists, every active namespace a disk, 4 KiB-block drives via read-modify-write, polled |
 | PS/2 keyboard and mouse | `keyboard.rs`, `mouse.rs` | scan code set 1; VMware vmmouse backdoor for absolute pointing |
 | 16550 UART | `serial.rs` | polled output, IRQ input |
 | Display | firmware framebuffer (GOP via Limine) | no mode setting |

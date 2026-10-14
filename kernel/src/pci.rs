@@ -1,9 +1,11 @@
 //! PCI bus enumeration through the legacy configuration mechanism (ports 0xCF8/0xCFC).
 //!
-//! Mechanism #1 reaches the first 256 bytes of every function's configuration space,
-//! which is all Nova needs (IDs, class, BARs, command register, capabilities).
+//! Mechanism #1 reaches the first 256 bytes of every function's configuration space.
+//! When ACPI's MCFG describes PCIe ECAM, all accesses go through that memory-mapped
+//! window instead, which reaches the whole 4 KiB (extended capabilities).
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 const CONFIG_ADDRESS: u16 = 0xCF8;
 const CONFIG_DATA: u16 = 0xCFC;
@@ -34,23 +36,16 @@ fn inl(port: u16) -> u32 {
 }
 
 impl Address {
-    fn select(&self, offset: u8) {
-        let address = 1 << 31
-            | (self.bus as u32) << 16
-            | (self.device as u32) << 11
-            | (self.function as u32) << 8
-            | (offset as u32 & 0xFC);
-        outl(CONFIG_ADDRESS, address);
+    fn devfn(&self) -> u8 {
+        self.device << 3 | self.function
     }
 
     pub fn read32(&self, offset: u8) -> u32 {
-        self.select(offset);
-        inl(CONFIG_DATA)
+        config_read(self.bus, self.devfn(), offset as u16 & !3, 4)
     }
 
     pub fn write32(&self, offset: u8, value: u32) {
-        self.select(offset);
-        outl(CONFIG_DATA, value);
+        config_write(self.bus, self.devfn(), offset as u16 & !3, 4, value)
     }
 
     pub fn read16(&self, offset: u8) -> u16 {
@@ -76,8 +71,50 @@ fn select(bus: u8, devfn: u8, offset: u16) -> u16 {
     CONFIG_DATA + (offset & 3)
 }
 
-/// Read 1, 2 or 4 bytes of configuration space (offset < 256) of function `devfn` on `bus`.
+/// PCIe enhanced configuration access (ECAM, from ACPI's MCFG): the virtual address of
+/// bus `ECAM_FIRST_BUS`'s configuration space, 0 when there is none (legacy ports only).
+static ECAM: AtomicU64 = AtomicU64::new(0);
+static ECAM_BUSES: AtomicU32 = AtomicU32::new(0); // first bus << 8 | last bus
+
+/// Use ECAM for segment 0 if the MCFG describes it. Returns the bus range mapped.
+pub fn init_ecam(regions: &[(u64, u16, u8, u8)]) -> Option<(u8, u8)> {
+    let &(base, _, first, last) = regions.iter().find(|r| r.1 == 0)?;
+    let virt = crate::memory::map_mmio(base + ((first as u64) << 20), ((last - first) as u64 + 1) << 20);
+    ECAM_BUSES.store((first as u32) << 8 | last as u32, Ordering::Relaxed);
+    ECAM.store(virt, Ordering::Release);
+    Some((first, last))
+}
+
+/// The ECAM address of a register, if ECAM covers `bus`.
+fn ecam(bus: u8, devfn: u8, offset: u16) -> Option<u64> {
+    let base = ECAM.load(Ordering::Acquire);
+    let range = ECAM_BUSES.load(Ordering::Relaxed);
+    let (first, last) = ((range >> 8) as u8, range as u8);
+    (base != 0 && bus >= first && bus <= last && offset < 4096)
+        .then(|| base + (((bus - first) as u64) << 20 | (devfn as u64) << 12 | offset as u64))
+}
+
+/// Size of a function's configuration space: 4096 bytes through ECAM, else 256.
+pub fn config_size(bus: u8) -> u16 {
+    if ecam(bus, 0, 0).is_some() { 4096 } else { 256 }
+}
+
+/// Read 1, 2 or 4 bytes of configuration space (offset < 256, or < 4096 with ECAM) of
+/// function `devfn` on `bus`.
 pub fn config_read(bus: u8, devfn: u8, offset: u16, width: u8) -> u32 {
+    if let Some(addr) = ecam(bus, devfn, offset) {
+        // SAFETY: inside the ECAM window mapped uncached by init_ecam; width-matched access.
+        return unsafe {
+            match width {
+                1 => (addr as *const u8).read_volatile() as u32,
+                2 => (addr as *const u16).read_volatile() as u32,
+                _ => (addr as *const u32).read_volatile(),
+            }
+        };
+    }
+    if offset >= 256 {
+        return !0;
+    }
     let port = select(bus, devfn, offset);
     // SAFETY: PCI configuration data port, width-matched access.
     unsafe {
@@ -97,8 +134,22 @@ pub fn config_read(bus: u8, devfn: u8, offset: u16, width: u8) -> u32 {
     }
 }
 
-/// Write 1, 2 or 4 bytes of configuration space (offset < 256).
+/// Write 1, 2 or 4 bytes of configuration space.
 pub fn config_write(bus: u8, devfn: u8, offset: u16, width: u8, value: u32) {
+    if let Some(addr) = ecam(bus, devfn, offset) {
+        // SAFETY: as in config_read.
+        unsafe {
+            match width {
+                1 => (addr as *mut u8).write_volatile(value as u8),
+                2 => (addr as *mut u16).write_volatile(value as u16),
+                _ => (addr as *mut u32).write_volatile(value),
+            }
+        }
+        return;
+    }
+    if offset >= 256 {
+        return;
+    }
     let port = select(bus, devfn, offset);
     // SAFETY: PCI configuration data port, width-matched access.
     unsafe {

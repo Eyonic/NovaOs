@@ -7,3 +7,5 @@ obj-y += pci.o
 obj-y += net.o
 obj-y += thunks.o
 obj-y += mm.o
+obj-y += task.o
+obj-y += device.o

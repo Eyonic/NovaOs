@@ -32,6 +32,9 @@ u64 nova_nanos(void);
 void nova_ndelay(u64 ns);
 void nova_sleep_ticks(u64 ticks);
 void nova_yield(void);
+/* Sleep until nova_wake(this task) or the next interrupt. */
+void nova_park(void);
+void nova_wake(u64 task_id);
 u64 nova_task_id(void);
 
 /* Log one line (without the trailing newline) to the serial console and the log. */
@@ -55,6 +58,8 @@ void nova_lx_pci_add(u8 bus, u8 devfn, u16 vendor, u16 device, u16 subvendor, u1
 void nova_lx_start(void);
 /* The Linux driver bound to device (bus, devfn), or NULL. */
 const char *nova_lx_pci_driver(u8 bus, u8 devfn);
+/* Nova's scheduler switched to task `task_id`: point Linux's `current` at it. */
+void nova_lx_switch(u64 task_id);
 /* Advance jiffies; called from Nova's timer interrupt. */
 void nova_lx_tick(void);
 /* Run the Linux handlers on a PCI line (from Nova's IRQ dispatcher, interrupts off). */

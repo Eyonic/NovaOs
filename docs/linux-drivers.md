@@ -128,13 +128,21 @@ generation), and Steam.
 |---|---|---|---|
 | 1 | Driver layer + netdev (done) | 8139too, 8139cp, e1000e, mii, eth, lib | lx_emul core, build, Rust bridge |
 | 2 | Interrupts and SMP | uACPI (MIT) | real IRQ delivery to Linux handlers, ACPI, local APIC + I/O APIC, `_PRT` routing, MSI/MSI-X, page allocation (done); then multiple CPUs |
-| 3 | Real hardware boot | uACPI | PCIe ECAM from MCFG (extended config space), devices behind bridges, HPET/TSC deadline timer, ACPI power off and reboot |
-| 4 | NVMe boot drive | `drivers/nvme/host`, blk-mq | block layer emulation, installer on NVMe |
+| 3 | Real hardware boot | uACPI | PCIe ECAM from MCFG and ACPI power off / reboot (done); devices behind bridges, local APIC timer |
+| 4 | NVMe boot drive | — | done, natively: `drivers/nvme.rs` (see below) |
 | 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core | input bridge to Nova's keyboard/mouse |
 | 6 | The board's network | `r8169` (RTL8168/8125) | firmware loading (`request_firmware` from Nova's disk) |
 | 7 | GPU | DRM core, TTM, `amdgpu` (incl. display core) | `struct page` backing and page allocation, kernel FPU sections, firmware, KMS to Nova's compositor |
 | 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |
 | 9 | Steam | Mesa RADV, Steam runtime, Proton (userspace) | a Wayland compositor or Xwayland path, audio (HDA via ALSA), namespaces for the Steam runtime |
+
+NVMe is the one family on the roadmap that Nova drives natively instead of through Linux:
+it is a single standard interface for every NVMe SSD, while Linux's driver sits on blk-mq and
+the generic block layer, which are tied to Linux's VFS and page cache (Genode, whose approach
+this layer follows, uses its own NVMe driver too). `drivers/nvme.rs` is polled with one admin
+and one I/O queue pair and PRP lists; Nova installs onto and boots from NVMe
+(`--case nvme`, `--case nvmeboot`). Drives formatted with 4 KiB logical blocks are readable
+and writable, but not installation targets (the installer lays GPT out in 512-byte sectors).
 
 Known limitations: one CPU, INTx routing for devices on the root bus only (others need
 MSI), no bounce

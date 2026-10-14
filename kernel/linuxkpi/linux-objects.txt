@@ -24,6 +24,8 @@ drivers/pci/iomap.o
 
 # Library code
 lib/vsprintf.o
+lib/kasprintf.o
+kernel/notifier.o
 lib/string.o
 lib/string_helpers.o
 lib/ctype.o

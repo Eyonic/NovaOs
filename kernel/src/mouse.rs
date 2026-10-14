@@ -155,8 +155,23 @@ struct Decoder {
 
 static DECODER: SpinLock<Decoder> = SpinLock::new(Decoder { packet: [0; 3], len: 0 });
 
+/// Reports from other pointing devices (USB mice and tablets through the Linux input
+/// bridge, linuxkpi.rs), delivered before PS/2 ones.
+static INJECTED: SpinLock<alloc::collections::VecDeque<Report>> = SpinLock::new(alloc::collections::VecDeque::new());
+
+/// Queue a pointer report from a device other than the PS/2 mouse (task context).
+pub fn inject(report: Report) {
+    let mut queue = INJECTED.lock();
+    if queue.len() < 256 {
+        queue.push_back(report);
+    }
+}
+
 /// Next pointer report, if any.
 pub fn poll() -> Option<Report> {
+    if let Some(report) = INJECTED.try_lock().and_then(|mut q| q.pop_front()) {
+        return Some(report);
+    }
     let mut dec = DECODER.try_lock()?;
     if absolute() {
         // IRQ 12 only signals that the backdoor has data; the PS/2 bytes are dummies.

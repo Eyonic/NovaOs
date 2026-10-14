@@ -214,6 +214,8 @@ fn schedule() {
                     s.current = next;
                     crate::process::switch_out(s.tasks[old].user.as_deref_mut());
                     crate::process::switch_in(s.tasks[next].user.as_deref());
+                    #[cfg(feature = "linux-drivers")]
+                    crate::linuxkpi::switch_to(s.tasks[next].id);
                     let old_rsp = &raw mut s.tasks[old].rsp;
                     let new_rsp = s.tasks[next].rsp;
                     // SAFETY: new_rsp was saved by `switch` or built by `spawn`; old_rsp

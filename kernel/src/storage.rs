@@ -73,6 +73,8 @@ pub struct DiskInfo {
     pub sectors: u64,
     pub partitions: Vec<Partition>,
     pub is_boot: bool,
+    /// The device's logical block size (Nova addresses 512-byte sectors everywhere).
+    pub block_size: usize,
 }
 
 pub fn list() -> Vec<DiskInfo> {
@@ -87,6 +89,7 @@ pub fn list() -> Vec<DiskInfo> {
             sectors: d.dev.sector_count(),
             partitions: d.partitions.clone(),
             is_boot: boot.is_some() && d.disk_guid == boot,
+            block_size: d.dev.logical_block_size(),
         })
         .collect()
 }

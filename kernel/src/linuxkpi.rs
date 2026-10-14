@@ -32,6 +32,7 @@ unsafe extern "C" {
     fn nova_lx_pci_driver(bus: u8, devfn: u8) -> *const c_char;
     fn nova_lx_poll();
     fn nova_lx_irq(irq: u32) -> bool;
+    fn nova_lx_switch(task_id: u64);
     fn nova_lx_netdev_get(index: u32) -> *mut c_void;
     fn nova_lx_netdev_open(dev: *mut c_void) -> c_int;
     fn nova_lx_netdev_mac(dev: *mut c_void, mac: *mut u8);
@@ -44,6 +45,12 @@ unsafe extern "C" {
 pub fn init() {
     // SAFETY: lx_emul's entry point; runs once, before the drivers.
     unsafe { nova_lx_init() }
+}
+
+/// Scheduler hook: task `id` runs now, so Linux's `current` must be its task_struct.
+pub fn switch_to(id: usize) {
+    // SAFETY: lx_emul only updates its current_task pointer (no allocation, no locks).
+    unsafe { nova_lx_switch(id as u64) }
 }
 
 /// Timer interrupt: advance `jiffies`.
@@ -332,6 +339,11 @@ extern "C" fn nova_pci_read(bus: u8, devfn: u8, offset: u16, width: u8) -> u32 {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn nova_pci_config_size(bus: u8) -> c_int {
+    crate::pci::config_size(bus) as c_int
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn nova_pci_write(bus: u8, devfn: u8, offset: u16, width: u8, value: u32) {
     crate::pci::config_write(bus, devfn, offset, width, value)
 }
@@ -354,6 +366,18 @@ extern "C" fn nova_ndelay(ns: u64) {
 #[unsafe(no_mangle)]
 extern "C" fn nova_sleep_ticks(ticks: u64) {
     task::sleep_ticks(ticks)
+}
+
+/// Sleep until woken (`nova_wake`) or the next interrupt; Linux code re-checks its
+/// condition after every return.
+#[unsafe(no_mangle)]
+extern "C" fn nova_park() {
+    task::wait_event()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_wake(task_id: u64) {
+    task::wake(task_id as usize)
 }
 
 #[unsafe(no_mangle)]
@@ -381,4 +405,130 @@ extern "C" fn nova_log(level: c_int, msg: *const u8, len: usize) {
     } else {
         crate::log::info(&alloc::format!("linux: {text}"));
     }
+}
+
+// ---------------------------------------------------------------- input devices
+
+/// Pointer state accumulated between Linux SYN_REPORT events.
+struct Pointer {
+    dx: i32,
+    dy: i32,
+    wheel: i32,
+    abs: Option<(u32, u32)>,
+    buttons: [bool; 3],
+    changed: bool,
+}
+
+static POINTER: SpinLock<Pointer> = SpinLock::new(Pointer { dx: 0, dy: 0, wheel: 0, abs: None, buttons: [false; 3], changed: false });
+
+const EV_SYN: u16 = 0x00;
+const EV_KEY: u16 = 0x01;
+const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
+const REL_X: u16 = 0x00;
+const REL_Y: u16 = 0x01;
+const REL_WHEEL: u16 = 0x08;
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+const BTN_LEFT: u16 = 0x110;
+const BTN_RIGHT: u16 = 0x111;
+const BTN_MIDDLE: u16 = 0x112;
+const BTN_TOUCH: u16 = 0x14a;
+
+/// A Linux key code as a PS/2 scan code set 1 make code (0xE0-prefixed when `.1`).
+/// Codes 1-88 are the set 1 codes themselves; the rest of a PC keyboard is mapped here.
+fn set1(code: u16) -> Option<(u8, bool)> {
+    Some(match code {
+        1..=88 => (code as u8, false),
+        96 => (0x1C, true),  // keypad Enter
+        97 => (0x1D, true),  // right Ctrl
+        98 => (0x35, true),  // keypad /
+        99 => (0x37, true),  // SysRq / Print Screen
+        100 => (0x38, true), // right Alt
+        102 => (0x47, true), // Home
+        103 => (0x48, true), // Up
+        104 => (0x49, true), // Page Up
+        105 => (0x4B, true), // Left
+        106 => (0x4D, true), // Right
+        107 => (0x4F, true), // End
+        108 => (0x50, true), // Down
+        109 => (0x51, true), // Page Down
+        110 => (0x52, true), // Insert
+        111 => (0x53, true), // Delete
+        119 => (0x45, false), // Pause (as Num Lock's code without the E1 sequence)
+        125 => (0x5B, true), // left Windows
+        126 => (0x5C, true), // right Windows
+        127 => (0x5D, true), // Menu
+        _ => return None,
+    })
+}
+
+/// One event from a Linux input device (lx_emul/input.c, task context). Absolute axes
+/// arrive scaled to 0..=0xFFFF.
+#[unsafe(no_mangle)]
+extern "C" fn nova_input_event(kind: u16, code: u16, value: i32) {
+    match kind {
+        EV_KEY if code < 0x100 => {
+            if let Some((make, extended)) = set1(code) {
+                if value == 2 {
+                    return; // autorepeat: Nova repeats keys itself
+                }
+                if extended {
+                    crate::input::SCANCODES.push(0xE0);
+                }
+                crate::input::SCANCODES.push(if value == 0 { make | 0x80 } else { make });
+            }
+        }
+        EV_KEY => {
+            let mut p = POINTER.lock();
+            let index = match code {
+                BTN_LEFT | BTN_TOUCH => 0,
+                BTN_RIGHT => 1,
+                BTN_MIDDLE => 2,
+                _ => return,
+            };
+            p.buttons[index] = value != 0;
+            p.changed = true;
+        }
+        EV_REL => {
+            let mut p = POINTER.lock();
+            match code {
+                REL_X => p.dx += value,
+                REL_Y => p.dy += value,
+                REL_WHEEL => p.wheel -= value, // Linux: positive = away from the user
+                _ => return,
+            }
+            p.changed = true;
+        }
+        EV_ABS => {
+            let mut p = POINTER.lock();
+            let (x, y) = p.abs.unwrap_or((0x8000, 0x8000));
+            p.abs = Some(match code {
+                ABS_X => (value.clamp(0, 0xFFFF) as u32, y),
+                ABS_Y => (x, value.clamp(0, 0xFFFF) as u32),
+                _ => return,
+            });
+            p.changed = true;
+        }
+        EV_SYN => {
+            let mut p = POINTER.lock();
+            if !p.changed {
+                return;
+            }
+            let motion = match p.abs {
+                Some((x, y)) => crate::mouse::Motion::Absolute(x, y),
+                None => crate::mouse::Motion::Relative(p.dx, p.dy),
+            };
+            let report = crate::mouse::Report { motion, left: p.buttons[0], right: p.buttons[1], middle: p.buttons[2], wheel: p.wheel };
+            p.dx = 0;
+            p.dy = 0;
+            p.wheel = 0;
+            p.changed = false;
+            drop(p);
+            crate::mouse::inject(report);
+        }
+        _ => {}
+    }
+    // Wake whoever waits for input (the desktop and shells poll after interrupts).
+    crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
 }

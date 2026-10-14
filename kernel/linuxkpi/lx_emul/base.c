@@ -16,6 +16,7 @@
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/rcupdate.h>
+#include <linux/srcu.h>
 #include <linux/bottom_half.h>
 #include <linux/random.h>
 #include <linux/uaccess.h>
@@ -199,32 +200,6 @@ void *kmemdup_noprof(const void *src, size_t len, gfp_t gfp)
 	return p;
 }
 
-char *kvasprintf(gfp_t gfp, const char *fmt, va_list ap)
-{
-	va_list aq;
-	int len;
-	char *p;
-
-	va_copy(aq, ap);
-	len = vsnprintf(NULL, 0, fmt, aq);
-	va_end(aq);
-	p = lx_kmalloc(len + 1, gfp);
-	if (p)
-		vsnprintf(p, len + 1, fmt, ap);
-	return p;
-}
-
-char *kasprintf(gfp_t gfp, const char *fmt, ...)
-{
-	va_list ap;
-	char *p;
-
-	va_start(ap, fmt);
-	p = kvasprintf(gfp, fmt, ap);
-	va_end(ap);
-	return p;
-}
-
 /* All Linux code in Nova runs in the kernel: "user" pointers are kernel pointers. */
 unsigned long _copy_from_user(void *to, const void __user *from, unsigned long n)
 {
@@ -247,40 +222,6 @@ void *memdup_user_nul(const void __user *src, size_t len)
 	memcpy(p, (const void __force *)src, len);
 	p[len] = '\0';
 	return p;
-}
-
-/* Device-managed resources: released when the device goes away, which in Nova it does
- * not (no hot unplug yet); allocations are kept for the device's lifetime. */
-struct lx_devres {
-	dr_release_t release;
-	size_t size;
-	u8 data[] __aligned(ARCH_KMALLOC_MINALIGN);
-};
-
-void *__devres_alloc_node(dr_release_t release, size_t size, gfp_t gfp, int nid, const char *name)
-{
-	struct lx_devres *dr = lx_kmalloc(sizeof(*dr) + size, gfp | __GFP_ZERO);
-
-	if (!dr)
-		return NULL;
-	dr->release = release;
-	dr->size = size;
-	return dr->data;
-}
-
-void devres_add(struct device *dev, void *res)
-{
-}
-
-void devres_free(void *res)
-{
-	if (res)
-		kfree(container_of(res, struct lx_devres, data));
-}
-
-int __devm_add_action(struct device *dev, void (*action)(void *), void *data, const char *name)
-{
-	return 0;
 }
 
 /* ---------------------------------------------------------------- printk */
@@ -593,6 +534,27 @@ void synchronize_rcu(void)
 void synchronize_net(void)
 {
 }
+
+/* Sleepable RCU: the same argument as for RCU holds (readers are never interrupted by a
+ * grace period on one CPU), so read sections need no tracking. */
+int init_srcu_struct(struct srcu_struct *ssp)
+{
+	return 0;
+}
+
+void __srcu_read_unlock(struct srcu_struct *ssp, int idx)
+{
+}
+
+void synchronize_srcu(struct srcu_struct *ssp)
+{
+}
+
+void cleanup_srcu_struct(struct srcu_struct *ssp)
+{
+}
+
+enum system_states system_state = SYSTEM_RUNNING;
 
 /* Bottom halves: softirqs are never raised (NAPI is polled from the lx_emul task), so
  * enabling them only undoes the count that local_bh_disable() added. */

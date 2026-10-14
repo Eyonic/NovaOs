@@ -8,6 +8,7 @@
 
 pub mod ahci;
 pub mod e1000;
+pub mod nvme;
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -39,6 +40,10 @@ pub trait BlockDevice: Send {
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), String>;
     fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), String>;
     fn flush(&mut self) -> Result<(), String>;
+    /// The device's own logical block size; reads and writes still use 512-byte sectors.
+    fn logical_block_size(&self) -> usize {
+        512
+    }
 }
 
 #[derive(Clone)]
@@ -142,6 +147,22 @@ fn bind(dev: &Device, probed: &mut Probed) -> Status {
                 Status::Bound { driver: "e1000", detail }
             }
             Err(e) => Status::Failed { driver: "e1000", error: e.into() },
+        };
+    }
+    if (dev.class, dev.subclass, dev.prog_if) == (0x01, 0x08, 0x02) && !disabled("nvme") {
+        static CONTROLLERS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+        let first = CONTROLLERS.fetch_add(16, core::sync::atomic::Ordering::Relaxed);
+        return match nvme::probe(dev, first / 16 * 16) {
+            Ok(disks) => {
+                let detail = if disks.is_empty() {
+                    "no namespaces".into()
+                } else {
+                    disks.iter().map(|d| format!("{} {} MiB", d.name(), d.sector_count() / 2048)).collect::<Vec<_>>().join(", ")
+                };
+                probed.disks.extend(disks.into_iter().map(|d| Box::new(d) as Box<dyn BlockDevice>));
+                Status::Bound { driver: "nvme", detail }
+            }
+            Err(e) => Status::Failed { driver: "nvme", error: e },
         };
     }
     if (dev.class, dev.subclass, dev.prog_if) == (0x01, 0x06, 0x01) && !disabled("ahci") {

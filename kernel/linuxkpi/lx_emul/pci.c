@@ -19,6 +19,9 @@
 
 const struct bus_type pci_bus_type = { .name = "pci" };
 
+/* Provided by Nova (pci.rs): 4096 with ECAM, else 256. */
+int nova_pci_config_size(u8 bus);
+
 /* Every function handed over, in bus order (pci_dev's own bus_list links it into its bus). */
 struct lx_pci_dev {
 	struct pci_dev pdev;
@@ -49,7 +52,7 @@ static struct pci_bus *lx_pci_bus(u8 number)
 #define LX_PCI_CONFIG(type, width, name)						\
 	int pci_read_config_##name(const struct pci_dev *dev, int where, type *val)	\
 	{										\
-		if (where < 0 || where + width > 256) {					\
+		if (where < 0 || where + width > dev->cfg_size) {			\
 			*val = (type)~0;						\
 			return PCIBIOS_BAD_REGISTER_NUMBER;				\
 		}									\
@@ -58,7 +61,7 @@ static struct pci_bus *lx_pci_bus(u8 number)
 	}										\
 	int pci_write_config_##name(const struct pci_dev *dev, int where, type val)	\
 	{										\
-		if (where < 0 || where + width > 256)					\
+		if (where < 0 || where + width > dev->cfg_size)				\
 			return PCIBIOS_BAD_REGISTER_NUMBER;				\
 		nova_pci_write(dev->bus->number, dev->devfn, where, width, val);	\
 		return PCIBIOS_SUCCESSFUL;						\
@@ -90,10 +93,23 @@ u8 pci_find_capability(struct pci_dev *dev, int cap)
 	return 0;
 }
 
-/* Extended capabilities live above 256 bytes, which the legacy configuration mechanism
- * cannot reach; ECAM (from ACPI MCFG) arrives with real-hardware support. */
+/* Extended capabilities live above 256 bytes: reachable through ECAM (ACPI MCFG). */
 u16 pci_find_ext_capability(struct pci_dev *dev, int cap)
 {
+	int pos = PCI_CFG_SPACE_SIZE, ttl = (PCI_CFG_SPACE_EXP_SIZE - PCI_CFG_SPACE_SIZE) / 8;
+	u32 header;
+
+	if (dev->cfg_size <= PCI_CFG_SPACE_SIZE)
+		return 0;
+	if (pci_read_config_dword(dev, pos, &header) || header == 0 || header == ~0u)
+		return 0;
+	while (ttl-- > 0) {
+		if (PCI_EXT_CAP_ID(header) == cap && pos != 0)
+			return pos;
+		pos = PCI_EXT_CAP_NEXT(header);
+		if (pos < PCI_CFG_SPACE_SIZE || pci_read_config_dword(dev, pos, &header))
+			break;
+	}
 	return 0;
 }
 
@@ -428,14 +444,6 @@ void pci_dev_put(struct pci_dev *dev)
 {
 }
 
-struct device *get_device(struct device *dev)
-{
-	return dev;
-}
-
-void put_device(struct device *dev)
-{
-}
 
 /* ---------------------------------------------------------------- MMIO */
 
@@ -873,6 +881,8 @@ void nova_lx_pci_add(u8 busnr, u8 devfn, u16 vendor, u16 device, u16 subvendor, 
 	dev->dev.dma_mask = &dev->dma_mask;
 	dev->dev.coherent_dma_mask = DMA_BIT_MASK(32);
 	dev->dev.bus = &pci_bus_type;
+	dev->cfg_size = nova_pci_config_size(busnr);
+	device_initialize(&dev->dev); /* never released: Nova keeps PCI functions forever */
 	dev->dev.init_name = kasprintf(GFP_KERNEL, "0000:%02x:%02x.%d", busnr, PCI_SLOT(devfn), PCI_FUNC(devfn));
 	pci_read_config_byte(dev, PCI_HEADER_TYPE, &hdr);
 	dev->hdr_type = hdr & 0x7f;

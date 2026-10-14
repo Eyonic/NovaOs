@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet linuxmsi chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet linuxmsi nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -43,11 +43,13 @@ CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
 # steps are sent immediately ("raw:..." sends without Enter, "sleep:N" waits N seconds,
 # "dump:FILE" saves a screenshot of the display to the log directory, "key:NAME" presses
 # a key through the QEMU monitor).
-# QEMU_EXTRA: extra QEMU arguments. NIC: QEMU network card model (default e1000). EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
+# QEMU_EXTRA: extra QEMU arguments. NIC: QEMU network card model (default e1000).
+# FRESH_TARGET: create an empty 2 GiB disk image of that name in the run directory first.
+# BOOT_DEVICE: how the boot image is attached, sata (default) or nvme. EXPECT_EXIT=1: the case ends with the VM rebooting (QEMU exits).
 # MOCK=1: run with the mock Anthropic API and fail on any protocol violation it logs.
 define_case() {
     EXPECT=() CONTAINS=() FORBID=("$PANIC" "$EXC" "NESTED") CHECK_RIP=0 CMDLINE="nova.test=$1"
-    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET=0 SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000
+    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET="" SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000 BOOT_DEVICE=sata
     local fault=("$EXC" "$STATUS" "$HALTED")
     local fault_forbid=("$PANIC" "$SHELL_START" "NESTED")
     local shell=("$EXPECTED_BANNER" "$STATUS" "$SHELL_START")
@@ -68,7 +70,7 @@ define_case() {
                 FORBID=("$PANIC" "NESTED"); CHECK_RIP=1 ;;
         setup)  # First boot from the live image: drivers, Claude login, driver porting, installation.
                 CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT"; MOCK=1; EXPECT_EXIT=1
-                FRESH_TARGET=1
+                FRESH_TARGET=target.img
                 QEMU_EXTRA=(-drive "format=raw,file=${run_dir:-}/target.img" -device ich9-intel-hda)
                 INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:Install Nova on disk 1? [Y/n]" "raw:y")
                 EXPECT=("$EXPECTED_BANNER" "Setting up this computer" "$CLAUDE_BOX"
@@ -144,6 +146,22 @@ define_case() {
                 CONTAINS=("linux/8139cp  Linux " "[nova] linux: eth0: link up" "network: online, address 10.0.2.15/24"
                           "nettest: HTTP/1.1 404 Not Found")
                 FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
+        nvme)   # Nova's NVMe driver: install from the live image onto an empty NVMe drive.
+                CMDLINE="nova.mode=shell"; FRESH_TARGET=nvme.img
+                QEMU_EXTRA=(-drive "if=none,id=nv0,format=raw,file=${run_dir:-}/nvme.img" -device nvme,serial=nova-test,drive=nv0)
+                INPUT=("wait:$PROMPT" "ser:disks" "wait:mounted:" "ser:install 0" "wait:Nova is installed on disk 0.")
+                EXPECT=("${shell[@]}" "disk 0: nvme0 (QEMU NVMe Ctrl, namespace 1) (2048 MiB)"
+                        "Nova is installed on disk 0. Reboot from that disk to use it.")
+                CONTAINS=("nvme  nvme0 (QEMU NVMe Ctrl, namespace 1) 2048 MiB")
+                FORBID=("$PANIC" "$EXC" "NESTED" "install failed") ;;
+        nvmeboot) # Boot the NVMe drive the nvme case installed, with no other disk attached.
+                CMDLINE=""; BOOT_IMAGE="${run_dir:-}/nvme.img"; BOOT_DEVICE=nvme
+                INPUT=("wait:$PROMPT" "ser:disks" "wait:mounted:")
+                EXPECT=("$EXPECTED_BANNER" "$STATUS" "$SHELL_START"
+                        "disk 0: nvme0 (QEMU NVMe Ctrl, namespace 1) (2048 MiB) [boot]")
+                CONTAINS=("storage: installed system, NovaFS on nvme0 (QEMU NVMe Ctrl, namespace 1) partition 2"
+                          "(installed system)")
+                FORBID=("$PANIC" "$EXC" "NESTED") ;;
         linuxmsi) # Linux's e1000e driver on an Intel 82574 (Nova's own e1000 driver switched off):
                 # MSI-X interrupts through the local APIC, then DHCP, DNS and TCP.
                 CMDLINE="nova.mode=shell nova.disable_driver=e1000"; MOCK=1; NIC=e1000e
@@ -303,9 +321,9 @@ run_case() {
     else
         IMAGE="$image" "$ROOT/scripts/mkimage.sh" "$image" "$CMDLINE" >/dev/null || { echo "  image build failed"; return 1; }
     fi
-    if (( FRESH_TARGET )); then
-        rm -f "${run_dir:-}/target.img"
-        truncate -s 2G "${run_dir:-}/target.img"
+    if [[ -n "$FRESH_TARGET" ]]; then
+        rm -f "${run_dir:-}/$FRESH_TARGET"
+        truncate -s 2G "${run_dir:-}/$FRESH_TARGET"
     fi
     local mock_mark=0
     (( MOCK )) && mock_mark=$(wc -l <"$MOCK_LOG")
@@ -319,8 +337,13 @@ run_case() {
     cat_pids+=($!)
     # Opening the input FIFOs read-write never blocks, even if QEMU has died.
     exec {SERIAL_FD}<>"$fifo/serial.in" {MONITOR_FD}<>"$fifo/monitor.in"
+    # A fresh copy of the firmware's variable store per case: every case ends with QEMU
+    # being killed, and a kill during a variable write (the firmware updates boot
+    # entries on every boot) could leave a shared store that stalls the next boot.
+    OVMF_VARS="$run_dir/$1.OVMF_VARS.fd"
+    cp "$OVMF_VARS_TEMPLATE" "$OVMF_VARS"
     # shellcheck disable=SC2046
-    IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" NOVA_NIC="$NIC" qemu_base_args) -display none \
+    IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" NOVA_NIC="$NIC" NOVA_BOOT_DEVICE="$BOOT_DEVICE" qemu_base_args) -display none \
         -chardev "pipe,id=com1,path=$fifo/serial" -serial chardev:com1 \
         -chardev "pipe,id=mon,path=$fifo/monitor" -mon chardev=mon,mode=readline "${QEMU_EXTRA[@]}" >"$qemu_log" 2>&1 &
     local pid=$!

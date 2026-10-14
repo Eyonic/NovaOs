@@ -57,8 +57,14 @@ pub fn mount_system() -> String {
 }
 
 /// Disks Nova could be installed on: not the boot disk, large enough.
+/// Disks Nova can be installed on. The partition table and boot partition are laid out
+/// in 512-byte sectors, so drives formatted with larger logical blocks (4Kn) are left
+/// out: firmware would not find a bootable GPT on them.
 pub fn targets() -> alloc::vec::Vec<DiskInfo> {
-    storage::list().into_iter().filter(|d| !d.is_boot && d.sectors >= MIN_TARGET_SECTORS && !d.name.starts_with("ram")).collect()
+    storage::list()
+        .into_iter()
+        .filter(|d| !d.is_boot && d.sectors >= MIN_TARGET_SECTORS && !d.name.starts_with("ram") && d.block_size == 512)
+        .collect()
 }
 
 /// Install onto disk `target`. `progress(percent, message)` is called as it goes.

@@ -337,7 +337,7 @@ fn cmd_rm(args: &str, _: &History) {
 fn cmd_install(args: &str, _: &History) {
     let targets = crate::install::targets();
     if targets.is_empty() {
-        println!("install: no suitable disk (needs a non-boot disk of at least 256 MiB)");
+        println!("install: no suitable disk (needs a non-boot disk of at least 256 MiB with 512-byte sectors)");
         return;
     }
     let Ok(index) = args.parse::<usize>() else {

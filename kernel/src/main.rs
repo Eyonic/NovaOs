@@ -128,6 +128,9 @@ extern "C" fn kmain() -> ! {
     // ACPI tables first: the MADT says whether an I/O APIC replaces the 8259 PICs.
     if acpi::init_tables() {
         println!("[nova] acpi: tables found (uACPI {})", env!("NOVA_UACPI_VERSION"));
+        if let Some((first, last)) = pci::init_ecam(&acpi::mcfg()) {
+            println!("[nova] pci: PCIe ECAM for buses {first}-{last} (4 KiB configuration space)");
+        }
     } else {
         println!("[nova] acpi: no tables, legacy PC devices only");
     }
