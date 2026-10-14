@@ -588,7 +588,7 @@ Shift makes `keyboard` fail.
 
 ## Not included (by design)
 
-No SMP, APIC/I/O APIC, USB, audio, GPU acceleration, or Wi-Fi. Device drivers are polled. The
+No SMP, USB, audio, GPU acceleration, or Wi-Fi yet (see docs/linux-drivers.md for the plan). Interrupts go through the local APIC and I/O APIC when ACPI describes them (uACPI), else the 8259 PIC; Nova's own Rust drivers are polled. The
 compatibility layer has no fork/exec, signal handlers, IPv6 or server sockets yet. Kernel code
 (drivers, desktop, Rhai apps, the browser shell) shares one address space; Linux programs run in
 user mode. Rhai apps are not sandboxed from the filesystem.

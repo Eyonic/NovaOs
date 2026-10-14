@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native net linuxnet linuxmsi chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -143,6 +143,14 @@ define_case() {
                 EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
                 CONTAINS=("linux/8139cp  Linux " "[nova] linux: eth0: link up" "network: online, address 10.0.2.15/24"
                           "nettest: HTTP/1.1 404 Not Found")
+                FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
+        linuxmsi) # Linux's e1000e driver on an Intel 82574 (Nova's own e1000 driver switched off):
+                # MSI-X interrupts through the local APIC, then DHCP, DNS and TCP.
+                CMDLINE="nova.mode=shell nova.disable_driver=e1000"; MOCK=1; NIC=e1000e
+                [[ ",${FEATURES:-}," == *,linux-drivers,* ]] || SKIP="kernel built without FEATURES=linux-drivers"
+                INPUT=("wait:$PROMPT" "ser:nettest 10.0.2.2:$MOCK_PORT" "wait:bytes")
+                EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
+                CONTAINS=("linux/e1000e  Linux " "NIC Link is Up 1000 Mbps Full Duplex" "nettest: HTTP/1.1 404 Not Found")
                 FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
         apps)   # Native apps on the desktop: the Text Editor with a sample file (quick open,
                 # find), Files (grid, preview, list), System Monitor, Settings and Home (Home and

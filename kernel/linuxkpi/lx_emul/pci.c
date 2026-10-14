@@ -14,6 +14,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/list.h>
+#include <linux/bitfield.h>
 #include "nova.h"
 
 const struct bus_type pci_bus_type = { .name = "pci" };
@@ -22,7 +23,11 @@ const struct bus_type pci_bus_type = { .name = "pci" };
 struct lx_pci_dev {
 	struct pci_dev pdev;
 	struct list_head node;
+	unsigned int intx_irq;		/* pdev.irq as Nova routed it, restored after MSI */
+	unsigned int nvec;		/* MSI/MSI-X vectors in use */
+	unsigned int msi_irqs[32];	/* their IRQ numbers */
 };
+#define to_lx_pci_dev(p) container_of(p, struct lx_pci_dev, pdev)
 static LIST_HEAD(lx_pci_devices);
 #define for_each_lx_pci_dev(d) list_for_each_entry(d, &lx_pci_devices, node)
 static struct pci_bus *lx_pci_buses[256];
@@ -229,6 +234,160 @@ void pci_clear_mwi(struct pci_dev *dev)
 	lx_pci_command(dev, 0, PCI_COMMAND_INVALIDATE);
 }
 
+/* ---- PCI Express capability (registers relative to the PCIe capability) ---- */
+
+static int lx_pcie_pos(struct pci_dev *dev, int pos)
+{
+	int cap = pci_find_capability(dev, PCI_CAP_ID_EXP);
+
+	return cap ? cap + pos : 0;
+}
+
+int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
+{
+	int at = lx_pcie_pos(dev, pos);
+
+	*val = 0;
+	return at ? pci_read_config_word(dev, at, val) : PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+int pcie_capability_read_dword(struct pci_dev *dev, int pos, u32 *val)
+{
+	int at = lx_pcie_pos(dev, pos);
+
+	*val = 0;
+	return at ? pci_read_config_dword(dev, at, val) : PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+int pcie_capability_write_word(struct pci_dev *dev, int pos, u16 val)
+{
+	int at = lx_pcie_pos(dev, pos);
+
+	return at ? pci_write_config_word(dev, at, val) : PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+int pcie_capability_write_dword(struct pci_dev *dev, int pos, u32 val)
+{
+	int at = lx_pcie_pos(dev, pos);
+
+	return at ? pci_write_config_dword(dev, at, val) : PCIBIOS_DEVICE_NOT_FOUND;
+}
+
+int pcie_capability_clear_and_set_word_locked(struct pci_dev *dev, int pos, u16 clear, u16 set)
+{
+	u16 val;
+	int ret = pcie_capability_read_word(dev, pos, &val);
+
+	if (ret)
+		return ret;
+	return pcie_capability_write_word(dev, pos, (val & ~clear) | set);
+}
+
+int pcie_capability_clear_and_set_word_unlocked(struct pci_dev *dev, int pos, u16 clear, u16 set)
+{
+	return pcie_capability_clear_and_set_word_locked(dev, pos, clear, set);
+}
+
+int pcie_capability_clear_and_set_dword(struct pci_dev *dev, int pos, u32 clear, u32 set)
+{
+	u32 val;
+	int ret = pcie_capability_read_dword(dev, pos, &val);
+
+	if (ret)
+		return ret;
+	return pcie_capability_write_dword(dev, pos, (val & ~clear) | set);
+}
+
+/* ASPM link states are left as the firmware set them. */
+int pci_disable_link_state(struct pci_dev *pdev, int state)
+{
+	return 0;
+}
+
+int pci_disable_link_state_locked(struct pci_dev *pdev, int state)
+{
+	return 0;
+}
+
+/* ---- configuration space save/restore (the standard header, as before a reset) ---- */
+
+struct lx_saved_config {
+	struct pci_dev *dev;
+	u32 dwords[16];
+};
+static struct lx_saved_config lx_saved[16];
+
+int pci_save_state(struct pci_dev *dev)
+{
+	struct lx_saved_config *slot = NULL;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(lx_saved) && !slot; i++)
+		if (lx_saved[i].dev == dev || !lx_saved[i].dev)
+			slot = &lx_saved[i];
+	if (!slot)
+		return -ENOMEM;
+	slot->dev = dev;
+	for (i = 0; i < 16; i++)
+		pci_read_config_dword(dev, i * 4, &slot->dwords[i]);
+	dev->state_saved = true;
+	return 0;
+}
+
+void pci_restore_state(struct pci_dev *dev)
+{
+	int i, n;
+
+	for (n = 0; n < ARRAY_SIZE(lx_saved); n++) {
+		if (lx_saved[n].dev != dev)
+			continue;
+		/* Command register last, so BARs are valid before decoding is enabled. */
+		for (i = 15; i >= 0; i--)
+			if (i != 0)
+				pci_write_config_dword(dev, i * 4, lx_saved[n].dwords[i]);
+		dev->state_saved = false;
+	}
+}
+
+int pci_select_bars(struct pci_dev *dev, unsigned long flags)
+{
+	int i, bars = 0;
+
+	for (i = 0; i < PCI_STD_NUM_BARS; i++)
+		if (pci_resource_flags(dev, i) & flags)
+			bars |= 1 << i;
+	return bars;
+}
+
+int pci_request_selected_regions_exclusive(struct pci_dev *dev, int bars, const char *name)
+{
+	return 0;
+}
+
+int pci_request_selected_regions(struct pci_dev *dev, int bars, const char *name)
+{
+	return 0;
+}
+
+void pci_release_selected_regions(struct pci_dev *dev, int bars)
+{
+}
+
+bool pci_dev_run_wake(struct pci_dev *dev)
+{
+	return false;
+}
+
+int pci_prepare_to_sleep(struct pci_dev *dev)
+{
+	return 0;
+}
+
+int pci_back_from_sleep(struct pci_dev *dev)
+{
+	return 0;
+}
+
 /* Power management: devices stay in D0, as at boot; wake-up is not wired. */
 int pci_set_power_state(struct pci_dev *dev, pci_power_t state)
 {
@@ -369,6 +528,15 @@ void dma_unmap_page_attrs(struct device *dev, dma_addr_t addr, size_t size, enum
 {
 }
 
+/* x86 DMA is cache coherent: syncing is a no-op (there are no bounce buffers). */
+void __dma_sync_single_for_cpu(struct device *dev, dma_addr_t addr, size_t size, enum dma_data_direction dir)
+{
+}
+
+void __dma_sync_single_for_device(struct device *dev, dma_addr_t addr, size_t size, enum dma_data_direction dir)
+{
+}
+
 dma_addr_t dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 			enum dma_data_direction dir, unsigned long attrs)
 {
@@ -378,6 +546,216 @@ dma_addr_t dma_map_phys(struct device *dev, phys_addr_t phys, size_t size,
 void dma_unmap_phys(struct device *dev, dma_addr_t addr, size_t size, enum dma_data_direction dir,
 		    unsigned long attrs)
 {
+}
+
+/* ---------------------------------------------------------------- MSI and MSI-X */
+
+/* Provided by Nova (linuxkpi.rs / apic.rs). */
+bool nova_msi_alloc(u32 *irq, u64 *address, u32 *data);
+void nova_msi_free(u32 irq);
+
+void pci_intx(struct pci_dev *dev, int enable)
+{
+	if (enable)
+		lx_pci_command(dev, 0, PCI_COMMAND_INTX_DISABLE);
+	else
+		lx_pci_command(dev, PCI_COMMAND_INTX_DISABLE, 0);
+}
+
+int pci_msi_vec_count(struct pci_dev *dev)
+{
+	u16 ctrl;
+
+	if (!dev->msi_cap)
+		return -EINVAL;
+	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &ctrl);
+	return 1 << FIELD_GET(PCI_MSI_FLAGS_QMASK, ctrl);
+}
+
+int pci_msix_vec_count(struct pci_dev *dev)
+{
+	u16 ctrl;
+
+	if (!dev->msix_cap)
+		return -EINVAL;
+	pci_read_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, &ctrl);
+	return (ctrl & PCI_MSIX_FLAGS_QSIZE) + 1;
+}
+
+static void lx_msi_release(struct lx_pci_dev *d)
+{
+	while (d->nvec)
+		nova_msi_free(d->msi_irqs[--d->nvec]);
+}
+
+/* Single-message MSI (multiple messages need aligned blocks of vectors; drivers that
+ * want several vectors use MSI-X, which every modern device has). */
+static int lx_msi_enable(struct lx_pci_dev *d)
+{
+	struct pci_dev *dev = &d->pdev;
+	int pos = dev->msi_cap;
+	u16 ctrl;
+	u64 address;
+	u32 data, irq;
+
+	if (!pos || !nova_msi_alloc(&irq, &address, &data))
+		return -ENOSPC;
+	pci_read_config_word(dev, pos + PCI_MSI_FLAGS, &ctrl);
+	pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_LO, (u32)address);
+	if (ctrl & PCI_MSI_FLAGS_64BIT) {
+		pci_write_config_dword(dev, pos + PCI_MSI_ADDRESS_HI, address >> 32);
+		pci_write_config_word(dev, pos + PCI_MSI_DATA_64, data);
+		if (ctrl & PCI_MSI_FLAGS_MASKBIT)
+			pci_write_config_dword(dev, pos + PCI_MSI_MASK_64, 0);
+	} else {
+		pci_write_config_word(dev, pos + PCI_MSI_DATA_32, data);
+		if (ctrl & PCI_MSI_FLAGS_MASKBIT)
+			pci_write_config_dword(dev, pos + PCI_MSI_MASK_32, 0);
+	}
+	ctrl &= ~PCI_MSI_FLAGS_QSIZE; /* one message */
+	pci_write_config_word(dev, pos + PCI_MSI_FLAGS, ctrl | PCI_MSI_FLAGS_ENABLE);
+	pci_intx(dev, 0);
+	d->msi_irqs[0] = irq;
+	d->nvec = 1;
+	dev->msi_enabled = 1;
+	dev->irq = irq;
+	return 1;
+}
+
+static int lx_msix_enable(struct lx_pci_dev *d, unsigned int nvec)
+{
+	struct pci_dev *dev = &d->pdev;
+	int pos = dev->msix_cap;
+	u32 table, offset;
+	void __iomem *base;
+	u16 ctrl;
+	int bir;
+
+	if (!pos)
+		return -EINVAL;
+	pci_read_config_dword(dev, pos + PCI_MSIX_TABLE, &table);
+	bir = table & PCI_MSIX_TABLE_BIR;
+	offset = table & PCI_MSIX_TABLE_OFFSET;
+	if (!(pci_resource_flags(dev, bir) & IORESOURCE_MEM))
+		return -EINVAL;
+	base = ioremap(pci_resource_start(dev, bir) + offset, nvec * PCI_MSIX_ENTRY_SIZE);
+
+	/* Mask the whole function while the table is written, as Linux does. */
+	pci_read_config_word(dev, pos + PCI_MSIX_FLAGS, &ctrl);
+	pci_write_config_word(dev, pos + PCI_MSIX_FLAGS, ctrl | PCI_MSIX_FLAGS_ENABLE | PCI_MSIX_FLAGS_MASKALL);
+	for (d->nvec = 0; d->nvec < nvec; d->nvec++) {
+		void __iomem *entry = base + d->nvec * PCI_MSIX_ENTRY_SIZE;
+		u64 address;
+		u32 data, irq;
+
+		if (!nova_msi_alloc(&irq, &address, &data))
+			break;
+		writel((u32)address, entry + PCI_MSIX_ENTRY_LOWER_ADDR);
+		writel(address >> 32, entry + PCI_MSIX_ENTRY_UPPER_ADDR);
+		writel(data, entry + PCI_MSIX_ENTRY_DATA);
+		writel(0, entry + PCI_MSIX_ENTRY_VECTOR_CTRL);
+		d->msi_irqs[d->nvec] = irq;
+	}
+	if (d->nvec < nvec) {
+		lx_msi_release(d);
+		pci_write_config_word(dev, pos + PCI_MSIX_FLAGS, ctrl & ~PCI_MSIX_FLAGS_ENABLE);
+		return -ENOSPC;
+	}
+	pci_intx(dev, 0);
+	pci_write_config_word(dev, pos + PCI_MSIX_FLAGS, (ctrl | PCI_MSIX_FLAGS_ENABLE) & ~PCI_MSIX_FLAGS_MASKALL);
+	dev->msix_enabled = 1;
+	return nvec;
+}
+
+int pci_alloc_irq_vectors_affinity(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs,
+				   unsigned int flags, struct irq_affinity *affd)
+{
+	struct lx_pci_dev *d = to_lx_pci_dev(dev);
+	int n;
+
+	if (d->nvec)
+		return -EINVAL;
+	max_vecs = min_t(unsigned int, max_vecs, ARRAY_SIZE(d->msi_irqs));
+	if ((flags & PCI_IRQ_MSIX) && dev->msix_cap) {
+		n = min_t(int, max_vecs, pci_msix_vec_count(dev));
+		if (n >= (int)min_vecs && lx_msix_enable(d, n) > 0)
+			return n;
+	}
+	if ((flags & PCI_IRQ_MSI) && dev->msi_cap && min_vecs <= 1 && lx_msi_enable(d) > 0)
+		return 1;
+	if ((flags & PCI_IRQ_INTX) && min_vecs <= 1 && dev->irq)
+		return 1;
+	return -ENOSPC;
+}
+
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs, unsigned int flags)
+{
+	return pci_alloc_irq_vectors_affinity(dev, min_vecs, max_vecs, flags, NULL);
+}
+
+void pci_free_irq_vectors(struct pci_dev *dev)
+{
+	if (dev->msix_enabled)
+		pci_disable_msix(dev);
+	if (dev->msi_enabled)
+		pci_disable_msi(dev);
+}
+
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	struct lx_pci_dev *d = to_lx_pci_dev(dev);
+
+	if (dev->msix_enabled || dev->msi_enabled)
+		return nr < d->nvec ? (int)d->msi_irqs[nr] : -EINVAL;
+	return nr == 0 ? (int)dev->irq : -EINVAL;
+}
+
+int pci_enable_msi(struct pci_dev *dev)
+{
+	int n = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI);
+
+	return n < 0 ? n : 0;
+}
+
+void pci_disable_msi(struct pci_dev *dev)
+{
+	struct lx_pci_dev *d = to_lx_pci_dev(dev);
+	u16 ctrl;
+
+	if (!dev->msi_enabled)
+		return;
+	pci_read_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, &ctrl);
+	pci_write_config_word(dev, dev->msi_cap + PCI_MSI_FLAGS, ctrl & ~PCI_MSI_FLAGS_ENABLE);
+	lx_msi_release(d);
+	dev->msi_enabled = 0;
+	dev->irq = d->intx_irq;
+	pci_intx(dev, 1);
+}
+
+void pci_disable_msix(struct pci_dev *dev)
+{
+	struct lx_pci_dev *d = to_lx_pci_dev(dev);
+	u16 ctrl;
+
+	if (!dev->msix_enabled)
+		return;
+	pci_read_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, &ctrl);
+	pci_write_config_word(dev, dev->msix_cap + PCI_MSIX_FLAGS, ctrl & ~PCI_MSIX_FLAGS_ENABLE);
+	lx_msi_release(d);
+	dev->msix_enabled = 0;
+	pci_intx(dev, 1);
+}
+
+int pci_enable_msix_range(struct pci_dev *dev, struct msix_entry *entries, int minvec, int maxvec)
+{
+	struct lx_pci_dev *d = to_lx_pci_dev(dev);
+	int i, n = pci_alloc_irq_vectors(dev, minvec, maxvec, PCI_IRQ_MSIX);
+
+	if (n < 0)
+		return n;
+	for (i = 0; entries && i < n; i++)
+		entries[i].vector = d->msi_irqs[entries[i].entry < d->nvec ? entries[i].entry : i];
+	return n;
 }
 
 /* ---------------------------------------------------------------- drivers */
@@ -489,6 +867,7 @@ void nova_lx_pci_add(u8 busnr, u8 devfn, u16 vendor, u16 device, u16 subvendor, 
 	dev->class = class_rev >> 8;
 	dev->revision = class_rev & 0xff;
 	dev->irq = irq;
+	d->intx_irq = irq;
 	dev->current_state = PCI_UNKNOWN;
 	dev->dma_mask = DMA_BIT_MASK(32);
 	dev->dev.dma_mask = &dev->dma_mask;
@@ -500,6 +879,8 @@ void nova_lx_pci_add(u8 busnr, u8 devfn, u16 vendor, u16 device, u16 subvendor, 
 	pci_read_config_byte(dev, PCI_INTERRUPT_PIN, &dev->pin);
 	if (dev->hdr_type == PCI_HEADER_TYPE_NORMAL)
 		lx_pci_read_bases(dev);
+	dev->msi_cap = pci_find_capability(dev, PCI_CAP_ID_MSI);
+	dev->msix_cap = pci_find_capability(dev, PCI_CAP_ID_MSIX);
 	list_add_tail(&d->node, &lx_pci_devices);
 	list_add_tail(&dev->bus_list, &dev->bus->devices);
 }

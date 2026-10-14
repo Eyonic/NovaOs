@@ -31,10 +31,12 @@ unsafe extern "C" {
     fn nova_lx_start();
     fn nova_lx_pci_driver(bus: u8, devfn: u8) -> *const c_char;
     fn nova_lx_poll();
+    fn nova_lx_irq(irq: u32) -> bool;
     fn nova_lx_netdev_get(index: u32) -> *mut c_void;
     fn nova_lx_netdev_open(dev: *mut c_void) -> c_int;
     fn nova_lx_netdev_mac(dev: *mut c_void, mac: *mut u8);
     fn nova_lx_netdev_carrier(dev: *mut c_void) -> bool;
+    fn nova_lx_netdev_tx_ready(dev: *mut c_void) -> bool;
     fn nova_lx_netdev_xmit(dev: *mut c_void, frame: *const u8, len: usize) -> c_int;
 }
 
@@ -60,7 +62,7 @@ pub fn add_pci(dev: &Device) {
     let class_rev = (dev.class as u32) << 24 | (dev.subclass as u32) << 16 | (dev.prog_if as u32) << 8 | dev.revision as u32;
     // SAFETY: plain values; lx_emul copies them into its own struct pci_dev.
     unsafe {
-        nova_lx_pci_add(dev.address.bus, devfn(dev), dev.vendor, dev.device, subsystem as u16, (subsystem >> 16) as u16, class_rev, dev.irq_line)
+        nova_lx_pci_add(dev.address.bus, devfn(dev), dev.vendor, dev.device, subsystem as u16, (subsystem >> 16) as u16, class_rev, intx_irq(dev))
     }
 }
 
@@ -101,13 +103,105 @@ pub fn take_nics() -> Vec<LinuxNic> {
     nics
 }
 
-/// The "linux" kernel task: Linux's interrupt handlers, NAPI, timers and work items.
+/// The "linux" kernel task: deferred interrupt work (NAPI, threaded handlers), timers and
+/// work items. Every interrupt wakes it, so NAPI runs right after a device interrupt.
 pub fn spawn_poller() {
     task::spawn("linux", || loop {
         // SAFETY: lx_emul's poll loop; only ever called from this task.
         unsafe { nova_lx_poll() };
+        if let Some(irq) = masked_storm() {
+            crate::log::warn(&alloc::format!("linux: IRQ {irq} kept firing with no handler claiming it; masked, its devices are polled"));
+        }
         task::wait_event();
     });
+}
+
+// ---------------------------------------------------------------- interrupts
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+/// IRQ numbers as Linux drivers see them: a PIC line (0-15) without an I/O APIC, a GSI
+/// with one, or an MSI number (apic::MSI_IRQ_BASE + vector). The storm guard counts
+/// unclaimed interrupts per number, folded into this table.
+static UNCLAIMED: [AtomicU32; 512] = [const { AtomicU32::new(0) }; 512];
+/// A line masked by the storm guard and not yet reported (IRQ number + 1).
+static STORMED: AtomicU32 = AtomicU32::new(0);
+/// Like Linux's "nobody cared": a level-triggered line nobody acknowledges would
+/// otherwise lock the CPU in its interrupt handler.
+const STORM_LIMIT: u32 = 100_000;
+
+fn is_msi(irq: u32) -> bool {
+    irq >= crate::apic::MSI_IRQ_BASE
+}
+
+/// IRQ handler (interrupts disabled) for an IRQ number Linux drivers requested.
+pub fn irq(irq: u32) {
+    // SAFETY: lx_emul runs the handlers registered for this IRQ, with interrupts off.
+    let claimed = unsafe { nova_lx_irq(irq) };
+    let counter = &UNCLAIMED[irq as usize % UNCLAIMED.len()];
+    if claimed || is_msi(irq) {
+        counter.store(0, Ordering::Relaxed);
+    } else if counter.fetch_add(1, Ordering::Relaxed) + 1 == STORM_LIMIT {
+        set_line(irq, false);
+        STORMED.store(irq + 1, Ordering::Relaxed);
+    }
+}
+
+fn masked_storm() -> Option<u32> {
+    STORMED.swap(0, Ordering::Relaxed).checked_sub(1)
+}
+
+/// Unmask or mask an INTx line at whichever controller delivers it.
+fn set_line(irq: u32, enable: bool) {
+    if crate::apic::active() {
+        if enable { crate::apic::unmask_gsi(irq) } else { crate::apic::mask_gsi(irq) }
+    } else if irq < 16 && irq != 2 && !matches!(irq as u8, crate::pic::IRQ_TIMER | crate::pic::IRQ_KEYBOARD | crate::pic::IRQ_COM1 | crate::pic::IRQ_MOUSE) {
+        if enable { crate::pic::unmask(irq as u8) } else { crate::pic::mask(irq as u8) }
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_irq_line(irq: u32, enable: bool) {
+    // MSI vectors are always open at the CPU; lx_emul gates their handlers itself.
+    if is_msi(irq) {
+        return;
+    }
+    if enable {
+        UNCLAIMED[irq as usize % UNCLAIMED.len()].store(0, Ordering::Relaxed);
+    }
+    set_line(irq, enable);
+}
+
+/// One MSI/MSI-X vector for a Linux driver: the IRQ number, and the message the device
+/// must write (address, data). False when no vector is free or there is no local APIC.
+#[unsafe(no_mangle)]
+extern "C" fn nova_msi_alloc(irq: *mut u32, address: *mut u64, data: *mut u32) -> bool {
+    let Some((n, a, d)) = crate::apic::alloc_msi() else { return false };
+    // SAFETY: lx_emul passes valid out pointers.
+    unsafe {
+        *irq = n;
+        *address = a;
+        *data = d;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_msi_free(irq: u32) {
+    crate::apic::free_msi(irq)
+}
+
+/// The IRQ number Linux should see for `dev`'s INTx pin: with an I/O APIC, the GSI from
+/// ACPI's _PRT (routed, masked until request_irq); without, the PIC line from config space.
+fn intx_irq(dev: &Device) -> u8 {
+    let pin = crate::pci::config_read(dev.address.bus, devfn(dev), 0x3D, 1) as u8;
+    if !crate::apic::active() || pin == 0 {
+        return dev.irq_line;
+    }
+    match crate::acpi::pci_irq(dev.address.device, pin - 1) {
+        Some((gsi, level, low)) if gsi < 256 && crate::apic::route_gsi(gsi, level, low) => gsi as u8,
+        _ => 0xFF, // no route: the driver must use MSI (or is polled)
+    }
 }
 
 // ---------------------------------------------------------------- network devices
@@ -140,6 +234,11 @@ impl Nic for LinuxNic {
 
     fn receive(&mut self) -> Option<Vec<u8>> {
         RX.lock().get_mut(&(self.dev as usize))?.pop_front()
+    }
+
+    fn can_transmit(&self) -> bool {
+        // SAFETY: reads the net_device's carrier and queue state.
+        unsafe { nova_lx_netdev_tx_ready(self.dev) }
     }
 
     fn transmit(&mut self, frame: &[u8]) -> bool {
@@ -203,6 +302,13 @@ extern "C" fn nova_alloc_size(ptr: *const u8) -> usize {
     ALLOCATIONS.lock().get(&(ptr as usize)).map_or(0, |(layout, _)| layout.size())
 }
 
+/// Back the `struct page` entries (`page_size` bytes each) of `count` page frames from
+/// `pfn` with memory, so Linux code can use them (memory.rs, VMEMMAP_BASE).
+#[unsafe(no_mangle)]
+extern "C" fn nova_vmemmap_populate(pfn: u64, count: u64, page_size: u64) -> bool {
+    memory::populate(memory::VMEMMAP_BASE + pfn * page_size, count * page_size)
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn nova_hhdm_offset() -> u64 {
     memory::hhdm_offset()
@@ -220,52 +326,14 @@ extern "C" fn nova_map_mmio(phys: u64, len: u64, _write_combine: bool) -> *mut c
 
 // ---------------------------------------------------------------- PCI configuration space
 
-/// Select a configuration register and return the data port for an access of the given
-/// width; byte and word accesses use the matching port offset (no read-modify-write,
-/// which would clear write-1-to-clear status bits in the same dword).
-fn pci_select(bus: u8, devfn: u8, offset: u16) -> u16 {
-    let address = 1u32 << 31 | (bus as u32) << 16 | (devfn as u32) << 8 | (offset as u32 & 0xFC);
-    // SAFETY: PCI configuration address port.
-    unsafe { core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") address, options(nomem, nostack, preserves_flags)) };
-    0xCFC + (offset & 3)
-}
-
 #[unsafe(no_mangle)]
 extern "C" fn nova_pci_read(bus: u8, devfn: u8, offset: u16, width: u8) -> u32 {
-    let port = pci_select(bus, devfn, offset);
-    // SAFETY: PCI configuration data port, width-matched access.
-    unsafe {
-        match width {
-            1 => {
-                let v: u8;
-                core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
-                v as u32
-            }
-            2 => {
-                let v: u16;
-                core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-                v as u32
-            }
-            _ => {
-                let v: u32;
-                core::arch::asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack, preserves_flags));
-                v
-            }
-        }
-    }
+    crate::pci::config_read(bus, devfn, offset, width)
 }
 
 #[unsafe(no_mangle)]
 extern "C" fn nova_pci_write(bus: u8, devfn: u8, offset: u16, width: u8, value: u32) {
-    let port = pci_select(bus, devfn, offset);
-    // SAFETY: PCI configuration data port, width-matched access.
-    unsafe {
-        match width {
-            1 => core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8, options(nomem, nostack, preserves_flags)),
-            2 => core::arch::asm!("out dx, ax", in("dx") port, in("ax") value as u16, options(nomem, nostack, preserves_flags)),
-            _ => core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)),
-        }
-    }
+    crate::pci::config_write(bus, devfn, offset, width, value)
 }
 
 // ---------------------------------------------------------------- time, tasks, log

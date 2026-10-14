@@ -116,6 +116,29 @@ irq_stubs!(32 irq_00, 33 irq_01, 34 irq_02, 35 irq_03, 36 irq_04, 37 irq_05, 38 
            40 irq_08, 41 irq_09, 42 irq_10, 43 irq_11, 44 irq_12, 45 irq_13, 46 irq_14, 47 irq_15);
 const _: () = assert!(pic::IRQ_BASE == 32, "irq_stubs! hard-codes vectors 32-47");
 
+// Vectors 48-255 (APIC-routed PCI interrupts, MSI, the spurious vector): one 16-byte stub
+// each in a table, all entering irq_common like the PIC stubs.
+const DYNAMIC_STUB_SIZE: usize = 16;
+core::arch::global_asm!(
+    ".pushsection .text.nova_irq_stubs, \"ax\"",
+    ".balign 16",
+    ".globl nova_dynamic_irq_stubs",
+    "nova_dynamic_irq_stubs:",
+    ".set nova_vec, 48",
+    ".rept 208",
+    ".balign 16",
+    "push 0",
+    "push nova_vec",
+    "jmp {common}",
+    ".set nova_vec, nova_vec + 1",
+    ".endr",
+    ".popsection",
+    common = sym irq_common,
+);
+unsafe extern "C" {
+    static nova_dynamic_irq_stubs: u8;
+}
+
 /// Generates one entry stub per vector plus the matching info table, so the
 /// "does this vector push an error code" fact has a single source of truth.
 macro_rules! exceptions {
@@ -216,8 +239,7 @@ struct DescriptorTablePointer {
     base: u64,
 }
 
-/// Full 256-entry table: vectors >= 48 stay not-present, so a stray interrupt
-/// raises #NP (error code names the IDT vector) instead of reading garbage.
+/// Full 256-entry table: 32 exceptions, 16 legacy IRQ vectors, 208 dynamic vectors.
 static IDT: BootCell<[Gate; 256]> = BootCell::new([Gate::MISSING; 256]);
 
 /// Nesting depth of exception handling. 0 = not handling an exception.
@@ -242,6 +264,11 @@ pub fn init() {
         // SAFETY: as above; index < 48 < 256.
         unsafe { (*idt)[pic::IRQ_BASE as usize + irq] = Gate::new(*stub as usize as u64, 0) };
     }
+    let table = (&raw const nova_dynamic_irq_stubs) as u64;
+    for vector in 48..256usize {
+        // SAFETY: as above; the stub table has one 16-byte entry per vector from 48.
+        unsafe { (*idt)[vector] = Gate::new(table + ((vector - 48) * DYNAMIC_STUB_SIZE) as u64, 0) };
+    }
     let pointer = DescriptorTablePointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: idt as u64 };
     // SAFETY: the IDT is 'static, fully initialised, and every present gate points
     // at a stub defined above.
@@ -250,7 +277,7 @@ pub fn init() {
 
 /// (exception vectors, IRQ vectors) installed by `init`.
 pub const fn installed_vectors() -> (usize, usize) {
-    (STUBS.len(), IRQ_STUBS.len())
+    (STUBS.len(), 256 - STUBS.len())
 }
 
 /// Enable interrupts. Requires `init` and a configured PIC.
@@ -262,8 +289,17 @@ pub fn enable() {
 /// Called from `irq_common` with interrupts disabled. Handlers only record data
 /// (tick count, raw input bytes); they never print or take locks.
 extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
-    let irq = (frame.vector as u8).wrapping_sub(pic::IRQ_BASE);
-    if !pic::is_genuine(irq) {
+    let vector = frame.vector as u8;
+    if vector == crate::apic::SPURIOUS_VECTOR {
+        return; // spurious local APIC interrupt: no EOI
+    }
+    if vector >= crate::apic::FIRST_DYNAMIC_VECTOR {
+        dynamic_irq(vector);
+        return;
+    }
+    let irq = vector.wrapping_sub(pic::IRQ_BASE);
+    let apic = crate::apic::active();
+    if !apic && !pic::is_genuine(irq) {
         return;
     }
     crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
@@ -276,15 +312,37 @@ extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
                 input::SERIAL_RX.push(byte);
             }
         }
-        _ => {}
+        // ACPI's SCI, or PCI devices driven by Linux drivers on a PIC line.
+        line => {
+            if !crate::acpi::interrupt(line as u32) {
+                #[cfg(feature = "linux-drivers")]
+                crate::linuxkpi::irq(line as u32);
+            }
+        }
     }
-    pic::end_of_interrupt(irq);
+    if apic {
+        crate::apic::eoi();
+    } else {
+        pic::end_of_interrupt(irq);
+    }
     // Preempt user programs on the timer, so they cannot monopolise the CPU.
     if irq == pic::IRQ_TIMER && frame.cs & 3 == 3 {
         crate::task::yield_now();
         // A thread spinning in user code learns here that its program is exiting.
         crate::process::check_exiting();
     }
+}
+
+/// A vector the APIC code handed out: a PCI INTx GSI, an MSI message or the SCI.
+fn dynamic_irq(vector: u8) {
+    crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    if let Some(irq) = crate::apic::vector_irq(vector)
+        && !crate::acpi::interrupt(irq)
+    {
+        #[cfg(feature = "linux-drivers")]
+        crate::linuxkpi::irq(irq);
+    }
+    crate::apic::eoi();
 }
 
 fn read_cr2() -> u64 {

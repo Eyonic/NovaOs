@@ -68,6 +68,48 @@ impl Address {
     }
 }
 
+/// Select a configuration register and return the data port for an access of `offset`'s
+/// width: byte and word accesses use the matching port offset, with no read-modify-write
+/// (which would clear write-1-to-clear status bits in the same dword).
+fn select(bus: u8, devfn: u8, offset: u16) -> u16 {
+    outl(CONFIG_ADDRESS, 1 << 31 | (bus as u32) << 16 | (devfn as u32) << 8 | (offset as u32 & 0xFC));
+    CONFIG_DATA + (offset & 3)
+}
+
+/// Read 1, 2 or 4 bytes of configuration space (offset < 256) of function `devfn` on `bus`.
+pub fn config_read(bus: u8, devfn: u8, offset: u16, width: u8) -> u32 {
+    let port = select(bus, devfn, offset);
+    // SAFETY: PCI configuration data port, width-matched access.
+    unsafe {
+        match width {
+            1 => {
+                let v: u8;
+                core::arch::asm!("in al, dx", out("al") v, in("dx") port, options(nomem, nostack, preserves_flags));
+                v as u32
+            }
+            2 => {
+                let v: u16;
+                core::arch::asm!("in ax, dx", out("ax") v, in("dx") port, options(nomem, nostack, preserves_flags));
+                v as u32
+            }
+            _ => inl(port),
+        }
+    }
+}
+
+/// Write 1, 2 or 4 bytes of configuration space (offset < 256).
+pub fn config_write(bus: u8, devfn: u8, offset: u16, width: u8, value: u32) {
+    let port = select(bus, devfn, offset);
+    // SAFETY: PCI configuration data port, width-matched access.
+    unsafe {
+        match width {
+            1 => core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8, options(nomem, nostack, preserves_flags)),
+            2 => core::arch::asm!("out dx, ax", in("dx") port, in("ax") value as u16, options(nomem, nostack, preserves_flags)),
+            _ => outl(port, value),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum Bar {
     Memory { base: u64, size: u64 },

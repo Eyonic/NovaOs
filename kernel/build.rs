@@ -3,6 +3,8 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{dir}/linker.ld");
     println!("cargo:rerun-if-changed=linker.ld");
 
+    build_uacpi(&dir);
+
     // FEATURES=linux-drivers: link the Linux objects scripts/build-linux.sh built. They are
     // passed as plain object files (not an archive), so the drivers, which nothing
     // references by name, are linked too; their initcalls are KEPT by linker.ld.
@@ -19,4 +21,43 @@ fn main() {
         let version = std::fs::read_to_string(format!("{linux}/VERSION")).unwrap_or_default();
         println!("cargo:rustc-env=NOVA_LINUX_VERSION={}", version.trim());
     }
+}
+
+/// uACPI (third_party/uacpi, MIT) and Nova's glue for it (acpi/nova_acpi.c): freestanding
+/// C for the kernel's code model, linked as a static library. The Rust side is src/acpi.rs.
+fn build_uacpi(dir: &str) {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let uacpi = format!("{dir}/third_party/uacpi");
+    let mut sources: Vec<String> = std::fs::read_dir(format!("{uacpi}/source"))
+        .expect("third_party/uacpi/source")
+        .filter_map(|e| e.ok().map(|e| e.path().display().to_string()))
+        .filter(|p| p.ends_with(".c"))
+        .collect();
+    sources.sort();
+    sources.push(format!("{dir}/acpi/nova_acpi.c"));
+    let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".into());
+    let mut objects = Vec::new();
+    for src in &sources {
+        let obj = format!("{out}/{}.o", std::path::Path::new(src).file_stem().unwrap().to_string_lossy());
+        let status = std::process::Command::new(&cc)
+            .args(["-c", "-O2", "-std=gnu11", "-ffreestanding", "-fno-stack-protector", "-fno-pic", "-fno-pie"])
+            .args(["-mcmodel=kernel", "-mno-red-zone", "-mgeneral-regs-only", "-fno-asynchronous-unwind-tables"])
+            .args(["-fno-strict-aliasing", "-Wall", "-Wno-unused-function", "-DUACPI_SIZED_FREES", "-DUACPI_NATIVE_ALLOC_ZEROED"])
+            .arg(format!("-I{uacpi}/include"))
+            .args([src.as_str(), "-o", obj.as_str()])
+            .status()
+            .expect("running the C compiler for uACPI");
+        assert!(status.success(), "compiling {src} failed");
+        println!("cargo:rerun-if-changed={src}");
+        objects.push(obj);
+    }
+    let lib = format!("{out}/libuacpi.a");
+    let _ = std::fs::remove_file(&lib);
+    let status = std::process::Command::new("ar").arg("rcs").arg(&lib).args(&objects).status().expect("running ar");
+    assert!(status.success(), "ar failed for uACPI");
+    println!("cargo:rerun-if-changed={uacpi}/include");
+    println!("cargo:rustc-link-search=native={out}");
+    println!("cargo:rustc-link-lib=static=uacpi");
+    let version = std::fs::read_to_string(format!("{uacpi}/VERSION")).unwrap_or_default();
+    println!("cargo:rustc-env=NOVA_UACPI_VERSION={}", version.trim());
 }

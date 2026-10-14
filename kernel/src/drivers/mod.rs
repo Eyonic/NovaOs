@@ -25,6 +25,11 @@ pub trait Nic: Send {
     fn receive(&mut self) -> Option<Vec<u8>>;
     /// Queue one Ethernet frame; false if the transmit ring is full.
     fn transmit(&mut self, frame: &[u8]) -> bool;
+    /// Whether a frame can be queued now (link up, room in the ring). While false, the
+    /// network stack keeps its packets instead of handing them over to be dropped.
+    fn can_transmit(&self) -> bool {
+        true
+    }
 }
 
 /// A disk: 512-byte sectors; buffers are whole sectors.
@@ -112,8 +117,18 @@ fn bind_linux(records: &mut [Record], probed: &mut Probed) {
     crate::linuxkpi::spawn_poller();
 }
 
+/// Nova drivers switched off with `nova.disable_driver=name[,name...]` on the kernel
+/// command line (their devices then go to the Linux drivers, if built in).
+fn disabled(driver: &str) -> bool {
+    crate::limine::EXECUTABLE_CMDLINE
+        .get()
+        .and_then(|c| c.split_whitespace().find_map(|a| a.strip_prefix("nova.disable_driver=")))
+        .is_some_and(|list| list.split(',').any(|d| d == driver))
+}
+
 fn bind(dev: &Device, probed: &mut Probed) -> Status {
     if dev.vendor == 0x8086
+        && !disabled("e1000")
         && let Some((_, model)) = e1000::DEVICE_IDS.iter().find(|(id, _)| *id == dev.device)
     {
         return match e1000::E1000::new(dev) {
@@ -129,7 +144,7 @@ fn bind(dev: &Device, probed: &mut Probed) -> Status {
             Err(e) => Status::Failed { driver: "e1000", error: e.into() },
         };
     }
-    if (dev.class, dev.subclass, dev.prog_if) == (0x01, 0x06, 0x01) {
+    if (dev.class, dev.subclass, dev.prog_if) == (0x01, 0x06, 0x01) && !disabled("ahci") {
         return match ahci::probe(dev) {
             Ok(disks) => {
                 let detail = if disks.is_empty() {

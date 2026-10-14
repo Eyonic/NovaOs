@@ -67,7 +67,7 @@ impl phy::Device for NicDevice {
     }
 
     fn transmit(&mut self, _: Instant) -> Option<TxToken<'_>> {
-        Some(TxToken(&mut *self.0))
+        self.0.can_transmit().then(|| TxToken(&mut *self.0))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

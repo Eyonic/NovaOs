@@ -13,8 +13,10 @@ and, in spirit, FreeBSD's LinuxKPI: real Linux subsystems and drivers, Nova unde
   Linux 7.2.9 source (build/linux/, GPL-2.0): drivers + library code, compiled by Kbuild
 ```
 
-Status: **milestone 1 done.** Linux's own `8139cp` network driver (RealTek RTL8139C+) runs
-in Nova and carries Nova's network traffic (`scripts/test.sh --case linuxnet`).
+Status: **milestones 1 and 2a done.** Linux's own network drivers run in Nova and carry its
+traffic: `8139cp` (RealTek RTL8139C+, legacy INTx routed by ACPI through the I/O APIC,
+`scripts/test.sh --case linuxnet`) and `e1000e` (Intel 82574, MSI-X through the local APIC,
+`--case linuxmsi`).
 
 ## Building
 
@@ -23,6 +25,8 @@ scripts/fetch-linux.sh                       # Linux 7.2.9 source into build/lin
 FEATURES=linux-drivers scripts/build.sh      # configure, Kbuild the objects, link them into Nova
 FEATURES=linux-drivers scripts/test.sh --case linuxnet
 NOVA_NIC=rtl8139 scripts/run.sh              # boot with a card the Linux driver handles
+NOVA_NIC=e1000e NOVA_CMDLINE=nova.disable_driver=e1000 FEATURES=linux-drivers scripts/build.sh
+                                             # (e1000e: switch off Nova's own e1000 driver first)
 ```
 
 `scripts/build-linux.sh` (called by `build.sh`) does the Linux side:
@@ -73,15 +77,34 @@ repository plus the pinned Linux release). Kernels built without the feature are
 * **Probing** (`drivers/mod.rs`): Nova's Rust drivers get the first pick; every PCI function
   still missing a driver is offered to Linux (`nova_lx_pci_add`) before the initcalls run, so
   `pci_register_driver()` probes at once, as on Linux at boot. Records show `linux/<driver>`.
-* **Execution**: interrupt handlers, NAPI polls, timers and work items run in one Nova kernel
-  task, "linux", every tick. Handlers are polled (they check their device's status and return
-  `IRQ_NONE` when idle, as shared-interrupt handlers must), with `HARDIRQ_OFFSET` in the
-  preempt count so `in_interrupt()` is right. Work items may sleep. Nothing preempts Linux
-  code, which keeps spinlocks and RCU trivially correct on one CPU.
+* **Interrupts** (Nova core, also without the feature): ACPI comes from uACPI
+  (`kernel/third_party/uacpi`, MIT, vendored; Nova's kernel API for it is `src/acpi.rs`).
+  When the MADT describes an I/O APIC, `src/apic.rs` enables the local APIC and I/O APIC and
+  masks the 8259s; ISA interrupts keep their vectors (32 + IRQ) with ACPI's interrupt source
+  overrides applied. PCI INTx pins are resolved through the firmware's `_PRT` (AML evaluated
+  by uACPI, interrupt link devices included) to a GSI, which is what Linux drivers see as
+  `pdev->irq`, as on Linux/x86. Vectors 48-239 are handed out on demand to GSIs and to
+  MSI/MSI-X messages (IRQ numbers 0x1000 + vector). lx_emul implements
+  `pci_alloc_irq_vectors()`, `pci_irq_vector()`, `pci_enable_msi()` and friends, preferring
+  MSI-X, then MSI, then INTx, like Linux.
+* **Execution**: interrupt handlers run in real interrupt context, with interrupts disabled
+  and `HARDIRQ_OFFSET` in the preempt count (so `in_interrupt()` is right). Deferred work runs
+  in one Nova kernel task, "linux", which every interrupt wakes: threaded handlers, NAPI,
+  timers and work items (which may sleep). Linux's `spin_lock_irqsave()` really disables
+  interrupts, so driver locking keeps its meaning, and lx_emul's own lists (NAPI, timers,
+  work) are updated with interrupts off. The task also polls each handler once per wakeup
+  with interrupts off, as a fallback; a line that keeps firing with no handler claiming it is
+  masked, as Linux's "nobody cared" does. Nothing preempts Linux code, which keeps RCU
+  trivially correct on one CPU.
+* **Pages**: `alloc_pages()` returns real `struct page`s. Pages come from Nova's heap
+  (naturally aligned), and their entries in Linux's `vmemmap` array (at `vmemmap_base`, PML4
+  slot 468) are backed with memory on demand by `memory::populate`. `put_page()` frees through
+  Linux's own refcounting. Compound pages (folios > 1 page) are not supported yet.
 * **Network bridge**: a Linux `net_device` becomes a `LinuxNic` (the `Nic` trait of Nova's
   network stack). Received frames go from `netif_receive_skb()`/`napi_gro_receive()` straight
-  to Nova; Nova transmits through the driver's `ndo_start_xmit`. Linux's protocol stack is not
-  used.
+  to Nova; Nova transmits through the driver's `ndo_start_xmit`. Like Linux's queueing layer,
+  nothing is handed to a driver without carrier or with its queue stopped (`Nic::can_transmit`):
+  Nova's stack keeps the packet instead. Linux's protocol stack is not used.
 * **DMA**: no IOMMU, bus address = physical address. A 16 MiB pool below 4 GiB
   (`memory.rs`, feature only) serves devices with 32-bit masks (Linux's default).
 
@@ -103,9 +126,9 @@ generation), and Steam.
 
 | # | Milestone | Linux code reused | Nova work |
 |---|---|---|---|
-| 1 | Driver layer + netdev (done) | 8139too, 8139cp, mii, eth, lib | lx_emul core, build, Rust bridge |
-| 2 | Interrupts and SMP | irq core helpers | Local APIC, I/O APIC, MSI/MSI-X, real IRQ delivery to Linux handlers, then multiple CPUs |
-| 3 | Real hardware boot | ACPICA (optional) | ACPI tables (MADT, MCFG), PCIe ECAM (extended config space), HPET/TSC deadline |
+| 1 | Driver layer + netdev (done) | 8139too, 8139cp, e1000e, mii, eth, lib | lx_emul core, build, Rust bridge |
+| 2 | Interrupts and SMP | uACPI (MIT) | real IRQ delivery to Linux handlers, ACPI, local APIC + I/O APIC, `_PRT` routing, MSI/MSI-X, page allocation (done); then multiple CPUs |
+| 3 | Real hardware boot | uACPI | PCIe ECAM from MCFG (extended config space), devices behind bridges, HPET/TSC deadline timer, ACPI power off and reboot |
 | 4 | NVMe boot drive | `drivers/nvme/host`, blk-mq | block layer emulation, installer on NVMe |
 | 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core | input bridge to Nova's keyboard/mouse |
 | 6 | The board's network | `r8169` (RTL8168/8125) | firmware loading (`request_firmware` from Nova's disk) |
@@ -113,6 +136,7 @@ generation), and Steam.
 | 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |
 | 9 | Steam | Mesa RADV, Steam runtime, Proton (userspace) | a Wayland compositor or Xwayland path, audio (HDA via ALSA), namespaces for the Steam runtime |
 
-Known limitations of milestone 1: polled interrupts (up to 10 ms latency), no bounce
+Known limitations: one CPU, INTx routing for devices on the root bus only (others need
+MSI), no bounce
 buffers (DMA beyond a device's mask fails cleanly), linear `sk_buff`s only, extended PCI
 configuration space unavailable, no hot unplug.

@@ -38,6 +38,9 @@ u64 nova_task_id(void);
 void nova_log(int level, const char *msg, size_t len);
 u64 nova_random_u64(void);
 
+/* Interrupts: unmask (enable) or mask a PCI line at Nova's interrupt controller. */
+void nova_irq_line(unsigned int line, bool enable);
+
 /* Network: a frame the Linux driver received, for Nova's network stack. */
 void nova_netdev_rx(void *dev, const u8 *frame, size_t len);
 
@@ -54,7 +57,9 @@ void nova_lx_start(void);
 const char *nova_lx_pci_driver(u8 bus, u8 devfn);
 /* Advance jiffies; called from Nova's timer interrupt. */
 void nova_lx_tick(void);
-/* One iteration of interrupt polling, NAPI, timers and work items. */
+/* Run the Linux handlers on a PCI line (from Nova's IRQ dispatcher, interrupts off). */
+bool nova_lx_irq(unsigned int line);
+/* One iteration of deferred work: threaded handlers, NAPI, timers and work items. */
 void nova_lx_poll(void);
 
 /* Network devices registered by Linux drivers, in registration order. */
@@ -62,6 +67,7 @@ void *nova_lx_netdev_get(unsigned int index);
 int nova_lx_netdev_open(void *dev);
 void nova_lx_netdev_mac(void *dev, u8 mac[6]);
 bool nova_lx_netdev_carrier(void *dev);
+bool nova_lx_netdev_tx_ready(void *dev);
 /* 0 = queued, 1 = queue full (try again later), negative = dropped. */
 int nova_lx_netdev_xmit(void *dev, const u8 *frame, size_t len);
 

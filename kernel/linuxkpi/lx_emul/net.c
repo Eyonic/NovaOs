@@ -13,6 +13,7 @@
  */
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/if_vlan.h>
 #include <linux/skbuff.h>
 #include <linux/ethtool.h>
 #include <linux/property.h>
@@ -352,6 +353,153 @@ void skb_copy_and_csum_dev(const struct sk_buff *skb, u8 *to)
 	}
 }
 
+/* Linear skbs: a new head with more room, data copied over. */
+int pskb_expand_head(struct sk_buff *skb, int nhead, int ntail, gfp_t gfp_mask)
+{
+	unsigned int size = skb_end_offset(skb) + nhead + ntail;
+	unsigned int data_size = SKB_DATA_ALIGN(size);
+	long off = skb->data - skb->head;
+	u8 *data;
+
+	if (WARN_ON(skb_shared(skb) || skb_is_nonlinear(skb)))
+		return -EINVAL;
+	data = kmalloc(data_size + SKB_DATA_ALIGN(sizeof(struct skb_shared_info)), gfp_mask);
+	if (!data)
+		return -ENOMEM;
+	memcpy(data + nhead, skb->head, skb_tail_pointer(skb) - skb->head);
+	memcpy(data + data_size, skb_shinfo(skb), offsetof(struct skb_shared_info, frags));
+	kfree(skb->head);
+	skb->head = data;
+	skb->data = data + nhead + off;
+	skb->tail += nhead;
+	skb_set_end_offset(skb, data_size);
+	if (skb_mac_header_was_set(skb))
+		skb->mac_header += nhead;
+	skb->network_header += nhead;
+	if (skb_transport_header_was_set(skb))
+		skb->transport_header += nhead;
+	atomic_set(&skb_shinfo(skb)->dataref, 1);
+	return 0;
+}
+
+int ___pskb_trim(struct sk_buff *skb, unsigned int len)
+{
+	if (WARN_ON(skb_is_nonlinear(skb)))
+		return -EINVAL;
+	__skb_trim(skb, len);
+	return 0;
+}
+
+void skb_trim(struct sk_buff *skb, unsigned int len)
+{
+	if (skb->len > len)
+		__skb_trim(skb, len);
+}
+
+int __skb_pad(struct sk_buff *skb, int pad, bool free_on_error)
+{
+	int ntail = pad - (skb->end - skb->tail);
+
+	if (ntail > 0 && pskb_expand_head(skb, 0, ntail, GFP_ATOMIC)) {
+		if (free_on_error)
+			lx_free_skb(skb);
+		return -ENOMEM;
+	}
+	memset(skb->data + skb->len, 0, pad);
+	return 0;
+}
+
+void skb_tstamp_tx(struct sk_buff *orig_skb, struct skb_shared_hwtstamps *hwtstamps)
+{
+}
+
+struct vlan_type_depth __vlan_get_protocol_offset(const struct sk_buff *skb, __be16 type, int mac_offset)
+{
+	struct vlan_type_depth r = { .type = type, .depth = ETH_HLEN };
+
+	while (eth_type_vlan(r.type)) {
+		struct vlan_hdr vhdr;
+
+		if (skb_copy_bits(skb, mac_offset + r.depth, &vhdr, sizeof(vhdr)) < 0)
+			return (struct vlan_type_depth){ .type = 0 };
+		r.type = vhdr.h_vlan_encapsulated_proto;
+		r.depth += VLAN_HLEN;
+	}
+	return r;
+}
+
+netdev_features_t passthru_features_check(struct sk_buff *skb, struct net_device *dev,
+					  netdev_features_t features)
+{
+	return features;
+}
+
+struct rtnl_link_stats64 *dev_get_stats(struct net_device *dev, struct rtnl_link_stats64 *storage)
+{
+	memset(storage, 0, sizeof(*storage));
+	if (dev->netdev_ops->ndo_get_stats64)
+		dev->netdev_ops->ndo_get_stats64(dev, storage);
+	else
+		netdev_stats_to_stats64(storage, &dev->stats);
+	return storage;
+}
+
+unsigned long dev_trans_start(struct net_device *dev)
+{
+	unsigned long res = READ_ONCE(netdev_get_tx_queue(dev, 0)->trans_start);
+	unsigned int i;
+
+	for (i = 1; i < dev->num_tx_queues; i++) {
+		unsigned long t = READ_ONCE(netdev_get_tx_queue(dev, i)->trans_start);
+
+		if (time_after(t, res))
+			res = t;
+	}
+	return res;
+}
+
+void netdev_rss_key_fill(void *buffer, size_t len)
+{
+	get_random_bytes(buffer, len);
+}
+
+void netif_napi_set_irq_locked(struct napi_struct *napi, int irq)
+{
+	napi->irq = irq;
+}
+
+void netif_queue_set_napi(struct net_device *dev, unsigned int queue_index, enum netdev_queue_type type,
+			  struct napi_struct *napi)
+{
+}
+
+int net_ratelimit(void)
+{
+	static unsigned long last;
+	static int burst;
+
+	if (time_after(jiffies, last + 5 * HZ)) {
+		last = jiffies;
+		burst = 0;
+	}
+	return burst++ < 10;
+}
+
+int ethtool_op_get_ts_info(struct net_device *dev, struct kernel_ethtool_ts_info *info)
+{
+	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE | SOF_TIMESTAMPING_RX_SOFTWARE |
+				SOF_TIMESTAMPING_SOFTWARE;
+	info->phc_index = -1;
+	return 0;
+}
+
+void do_trace_netlink_extack(const char *msg)
+{
+}
+
+/* Per-CPU softnet state: one CPU; only inline helpers touch it (xmit recursion). */
+DEFINE_PER_CPU_ALIGNED(struct softnet_data, softnet_data);
+
 /* ---------------------------------------------------------------- NAPI */
 
 static LIST_HEAD(lx_napi_poll_list);
@@ -388,9 +536,13 @@ void napi_enable(struct napi_struct *n)
 
 void napi_disable_locked(struct napi_struct *n)
 {
+	unsigned long flags;
+
 	set_bit(NAPI_STATE_DISABLE, &n->state);
-	/* Nothing runs concurrently: a scheduled poll is simply dropped. */
+	/* Polls run only in the "linux" task: a scheduled one is simply dropped. */
+	local_irq_save(flags);
 	list_del_init(&n->poll_list);
+	local_irq_restore(flags);
 	set_bit(NAPI_STATE_SCHED, &n->state);
 	set_bit(NAPI_STATE_NPSVC, &n->state);
 	clear_bit(NAPI_STATE_MISSED, &n->state);
@@ -413,10 +565,15 @@ bool napi_schedule_prep(struct napi_struct *n)
 	return true;
 }
 
+/* Called from interrupt handlers (interrupts off) and from task context. */
 void __napi_schedule(struct napi_struct *n)
 {
+	unsigned long flags;
+
+	local_irq_save(flags);
 	if (list_empty(&n->poll_list))
 		list_add_tail(&n->poll_list, &lx_napi_poll_list);
+	local_irq_restore(flags);
 }
 
 void __napi_schedule_irqoff(struct napi_struct *n)
@@ -433,15 +590,25 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
 	return true;
 }
 
+/* Like net_rx_action: poll each scheduled instance with interrupts on. One that used its
+ * whole budget (or was rescheduled from its interrupt meanwhile) stays on the list. */
 void lx_emul_napi_poll(void)
 {
-	struct napi_struct *n, *next;
+	unsigned long flags;
+	LIST_HEAD(list);
+
+	local_irq_save(flags);
+	list_splice_init(&lx_napi_poll_list, &list);
+	local_irq_restore(flags);
 
 	local_bh_disable();
-	list_for_each_entry_safe(n, next, &lx_napi_poll_list, poll_list) {
+	while (!list_empty(&list)) {
+		struct napi_struct *n = list_first_entry(&list, struct napi_struct, poll_list);
+
+		list_del_init(&n->poll_list);
 		n->poll(n, n->weight);
-		if (!test_bit(NAPI_STATE_SCHED, &n->state))
-			list_del_init(&n->poll_list);
+		if (test_bit(NAPI_STATE_SCHED, &n->state))
+			__napi_schedule(n);
 	}
 	local_bh_enable();
 }
@@ -577,6 +744,14 @@ bool nova_lx_netdev_carrier(void *opaque)
 	return netif_carrier_ok(opaque);
 }
 
+/* Whether the driver would take a frame now (Nova's stack keeps packets otherwise). */
+bool nova_lx_netdev_tx_ready(void *opaque)
+{
+	struct net_device *dev = opaque;
+
+	return netif_running(dev) && netif_carrier_ok(dev) && !netif_xmit_stopped(netdev_get_tx_queue(dev, 0));
+}
+
 int nova_lx_netdev_xmit(void *opaque, const u8 *frame, size_t len)
 {
 	struct net_device *dev = opaque;
@@ -586,7 +761,9 @@ int nova_lx_netdev_xmit(void *opaque, const u8 *frame, size_t len)
 
 	if (!netif_running(dev) || len < ETH_HLEN)
 		return -EINVAL;
-	if (netif_xmit_stopped(txq))
+	/* Like Linux's qdisc layer: nothing is sent without carrier (many drivers enable
+	 * their transmitter only on link up), the caller keeps the frame and retries. */
+	if (!netif_carrier_ok(dev) || netif_xmit_stopped(txq))
 		return 1;
 	skb = __alloc_skb(len + NET_SKB_PAD, GFP_ATOMIC, 0, NUMA_NO_NODE);
 	if (!skb)

@@ -6,6 +6,17 @@
 drivers/net/ethernet/realtek/8139cp.o
 drivers/net/ethernet/realtek/8139too.o
 drivers/net/mii.o
+drivers/net/ethernet/intel/e1000e/82571.o
+drivers/net/ethernet/intel/e1000e/ich8lan.o
+drivers/net/ethernet/intel/e1000e/80003es2lan.o
+drivers/net/ethernet/intel/e1000e/mac.o
+drivers/net/ethernet/intel/e1000e/manage.o
+drivers/net/ethernet/intel/e1000e/nvm.o
+drivers/net/ethernet/intel/e1000e/phy.o
+drivers/net/ethernet/intel/e1000e/param.o
+drivers/net/ethernet/intel/e1000e/ethtool.o
+drivers/net/ethernet/intel/e1000e/netdev.o
+drivers/net/ethernet/intel/e1000e/ptp.o
 
 # Subsystem code used as is
 net/ethernet/eth.o
@@ -28,6 +39,8 @@ lib/bitrev.o
 lib/crc/crc32-main.o
 lib/iomap.o
 arch/x86/lib/iomem.o
+arch/x86/lib/cpu.o
 lib/refcount.o
 kernel/time/timeconv.o
+kernel/time/timecounter.o
 arch/x86/lib/csum-partial_64.o

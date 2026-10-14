@@ -114,6 +114,17 @@ pub fn init() -> Result<(u64, usize), &'static str> {
             entry.write_volatile(new_table() | PRESENT | WRITABLE);
         }
     }
+    // The same for Linux's struct page array (filled on demand by `populate`).
+    #[cfg(feature = "linux-drivers")]
+    {
+        let entry = (phys_to_virt(read_cr3()) as *mut u64).wrapping_add(((VMEMMAP_BASE >> 39) & 511) as usize);
+        // SAFETY: as above; slot 468 is unused by Limine.
+        unsafe {
+            if entry.read_volatile() & PRESENT == 0 {
+                entry.write_volatile(new_table() | PRESENT | WRITABLE);
+            }
+        }
+    }
     Ok((region.base, region.length as usize))
 }
 
@@ -288,11 +299,61 @@ pub unsafe fn map_page_in(root: u64, virt: u64, phys: u64, flags: u64, table_fla
     }
 }
 
+/// Where the Linux driver layer keeps its `struct page` array (Linux's default
+/// VMEMMAP_START, PML4 slot 468); lx_emul sets `vmemmap_base` to it.
+#[cfg(feature = "linux-drivers")]
+pub const VMEMMAP_BASE: u64 = 0xFFFF_EA00_0000_0000;
+
+/// Physical address `virt` maps to in the kernel's page tables, if any.
+pub fn translate(virt: u64) -> Option<u64> {
+    let mut table = read_cr3();
+    for level in [39u64, 30, 21, 12] {
+        let entry = (phys_to_virt(table) as *const u64).wrapping_add(((virt >> level) & 511) as usize);
+        // SAFETY: page tables are in RAM covered by the direct map.
+        let value = unsafe { entry.read_volatile() };
+        if value & PRESENT == 0 {
+            return None;
+        }
+        if level == 12 || (level != 39 && value & HUGE != 0) {
+            let page = 1u64 << level;
+            return Some((value & ADDR_MASK & !(page - 1)) + (virt & (page - 1)));
+        }
+        table = value & ADDR_MASK;
+    }
+    None
+}
+
+/// Back every unmapped page of [virt, virt + len) in the kernel's address space with a
+/// zeroed RAM page. False when memory ran out.
+pub fn populate(virt: u64, len: u64) -> bool {
+    let first = virt & !(PAGE_SIZE - 1);
+    let mut page = first;
+    while page < virt + len {
+        if translate(page).is_none() {
+            let Some(frame) = alloc_page() else { return false };
+            // SAFETY: an unmapped kernel address, backed by a fresh zeroed page.
+            unsafe { map_page(page, virt_to_phys(frame as u64), PRESENT | WRITABLE) };
+        }
+        page += PAGE_SIZE;
+    }
+    true
+}
+
 /// Map `len` bytes of device memory at physical `phys` uncached; returns the virtual
 /// address of `phys`. Mappings are never removed.
 pub fn map_mmio(phys: u64, len: u64) -> u64 {
+    map_window(phys, len, PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE)
+}
+
+/// Map `len` bytes of physical RAM outside the direct map (ACPI tables, firmware data)
+/// with normal caching; returns the virtual address of `phys`. Never removed.
+pub fn map_ram(phys: u64, len: u64) -> u64 {
+    map_window(phys, len, PRESENT | WRITABLE)
+}
+
+fn map_window(phys: u64, len: u64, flags: u64) -> u64 {
     let first = phys & !(PAGE_SIZE - 1);
-    let pages = (phys + len - first).div_ceil(PAGE_SIZE);
+    let pages = (phys + len.max(1) - first).div_ceil(PAGE_SIZE);
     let virt = {
         let mut next = MMIO_NEXT.try_lock().expect("map_mmio re-entered");
         let virt = *next;
@@ -300,8 +361,8 @@ pub fn map_mmio(phys: u64, len: u64) -> u64 {
         virt
     };
     for i in 0..pages {
-        // SAFETY: fresh addresses in the MMIO window, device memory.
-        unsafe { map_page(virt + i * PAGE_SIZE, first + i * PAGE_SIZE, PRESENT | WRITABLE | WRITE_THROUGH | CACHE_DISABLE) };
+        // SAFETY: fresh addresses in the MMIO window, device memory or firmware RAM.
+        unsafe { map_page(virt + i * PAGE_SIZE, first + i * PAGE_SIZE, flags) };
     }
     virt + (phys - first)
 }

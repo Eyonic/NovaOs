@@ -101,6 +101,30 @@ pub fn is_genuine(irq: u8) -> bool {
     false
 }
 
+/// Let `irq` (0-15) through to the CPU (for a slave line, the cascade is already open).
+pub fn unmask(irq: u8) {
+    let port = if irq < 8 { MASTER_DATA } else { SLAVE_DATA };
+    // SAFETY: OCW1 read-modify-write of the interrupt mask.
+    unsafe { outb(port, inb(port) & !(1 << (irq & 7))) };
+}
+
+/// Block `irq` (0-15) at the PIC.
+pub fn mask(irq: u8) {
+    let port = if irq < 8 { MASTER_DATA } else { SLAVE_DATA };
+    // SAFETY: OCW1 read-modify-write of the interrupt mask.
+    unsafe { outb(port, inb(port) | 1 << (irq & 7)) };
+}
+
+/// Mask every line (the I/O APIC takes over; the PICs stay remapped away from the
+/// exception vectors, so a stray PIC interrupt cannot look like a CPU exception).
+pub fn mask_all() {
+    // SAFETY: OCW1 on both PICs.
+    unsafe {
+        outb(MASTER_DATA, 0xFF);
+        outb(SLAVE_DATA, 0xFF);
+    }
+}
+
 /// Acknowledge `irq` so the PIC can deliver the next one.
 pub fn end_of_interrupt(irq: u8) {
     // SAFETY: non-specific EOI (OCW2) to the PIC(s) that delivered the IRQ.

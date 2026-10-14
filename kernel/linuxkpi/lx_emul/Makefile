@@ -6,3 +6,4 @@ obj-y += sched.o
 obj-y += pci.o
 obj-y += net.o
 obj-y += thunks.o
+obj-y += mm.o

@@ -5,6 +5,8 @@
 
 extern crate alloc;
 
+mod acpi;
+mod apic;
 mod apps;
 mod bootcell;
 mod browser;
@@ -123,10 +125,20 @@ extern "C" fn kmain() -> ! {
 
     selftest::run(cmdline);
 
+    // ACPI tables first: the MADT says whether an I/O APIC replaces the 8259 PICs.
+    if acpi::init_tables() {
+        println!("[nova] acpi: tables found (uACPI {})", env!("NOVA_UACPI_VERSION"));
+    } else {
+        println!("[nova] acpi: no tables, legacy PC devices only");
+    }
     pic::init();
+    match apic::init() {
+        Some(apic) => println!("[nova] apic: {apic}; 8259 PICs masked"),
+        None => println!("[nova] pic: remapped to vectors 32-47 (local APIC disabled)"),
+    }
     pit::init();
     rtc::init();
-    println!("[nova] pic: remapped to vectors 32-47 (local APIC disabled); pit: {} Hz", pit::HZ);
+    println!("[nova] pit: {} Hz", pit::HZ);
     if keyboard::init() {
         println!("[nova] keyboard: PS/2 port 1 enabled");
     } else {
@@ -139,6 +151,9 @@ extern "C" fn kmain() -> ! {
     interrupts::enable();
     println!("[nova] interrupts: enabled (timer, keyboard, mouse, COM1)");
     println!("[nova] clock: TSC at {} MHz", pit::calibrate() / 1_000_000);
+    if acpi::init_namespace(apic::active()) {
+        println!("[nova] acpi: AML namespace ready ({} interrupt model)", if apic::active() { "I/O APIC" } else { "PIC" });
+    }
     if !rand::hardware() {
         println!("[nova] warning: no RDRAND; random numbers come from timer jitter");
     }

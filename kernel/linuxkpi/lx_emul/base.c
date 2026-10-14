@@ -30,7 +30,14 @@
 #include <linux/trace_events.h>
 #include <linux/rtnetlink.h>
 #include <linux/netdevice.h>
+#include <linux/timekeeping.h>
+#include <linux/math64.h>
+#include <asm/processor.h>
+#include <asm/cpu.h>
+#include <asm/cpuid/api.h>
 #include "nova.h"
+
+static void lx_identify_cpu(void);
 
 /* ---------------------------------------------------------------- layout */
 
@@ -46,10 +53,11 @@ void nova_lx_init(void)
 {
 	page_offset_base = nova_hhdm_offset();
 	phys_base = nova_kernel_phys_base();
-	/* Linux's default vmemmap base (PML4 slot 468, unused by Nova). struct page is not
-	 * backed by memory yet: virt_to_page()/page_to_phys() are pure arithmetic on it,
-	 * which is all streaming DMA mapping needs. Page allocation arrives with DRM/TTM. */
-	vmemmap_base = 0xffffea0000000000UL;
+	/* Linux's default vmemmap base (PML4 slot 468). Entries are backed with memory on
+	 * demand, when pages are allocated (mm.c); for other memory virt_to_page() and
+	 * page_to_phys() are pure arithmetic, which is all streaming DMA mapping needs. */
+	vmemmap_base = 0xffffea0000000000UL; /* memory.rs VMEMMAP_BASE */
+	lx_identify_cpu();
 }
 
 /* Nova has no vmalloc area: every kernel allocation is in the direct map. */
@@ -426,6 +434,89 @@ void usleep_range_state(unsigned long min, unsigned long max, unsigned int state
 		nova_ndelay((u64)min * 1000);
 	else
 		nova_sleep_ticks(usecs_to_jiffies(min) + 1);
+}
+
+unsigned long round_jiffies(unsigned long j)
+{
+	return roundup(j, HZ);
+}
+
+unsigned long round_jiffies_relative(unsigned long j)
+{
+	return round_jiffies(j + jiffies) - jiffies;
+}
+
+struct timespec64 ns_to_timespec64(s64 nsec)
+{
+	struct timespec64 ts = { 0, 0 };
+	s32 rem;
+
+	if (!nsec)
+		return ts;
+	ts.tv_sec = div_s64_rem(nsec, NSEC_PER_SEC, &rem);
+	if (rem < 0) {
+		ts.tv_sec--;
+		rem += NSEC_PER_SEC;
+	}
+	ts.tv_nsec = rem;
+	return ts;
+}
+
+/* Clocks: Nova has one, monotonic since boot (TSC based). Real time arrives with an RTC
+ * offset later; PTP hardware timestamping is not supported. */
+ktime_t ktime_get(void)
+{
+	return nova_nanos();
+}
+
+ktime_t ktime_get_with_offset(enum tk_offsets offs)
+{
+	return nova_nanos();
+}
+
+void ktime_get_snapshot_id(clockid_t clock_id, struct system_time_snapshot *systime_snapshot)
+{
+	memset(systime_snapshot, 0, sizeof(*systime_snapshot));
+	systime_snapshot->systime = systime_snapshot->monoraw = nova_nanos();
+}
+
+int get_device_system_crosststamp(int (*get_time_fn)(ktime_t *device_time, struct system_counterval_t *sys_counterval, void *ctx),
+				  void *ctx, struct system_time_snapshot *history, struct system_device_crosststamp *xtstamp)
+{
+	return -EOPNOTSUPP;
+}
+
+void dump_stack(void)
+{
+	_printk(KERN_WARNING "(stack trace unavailable in Nova)\n");
+}
+
+/* CPU identification for drivers that check it (the boot CPU, from CPUID). */
+struct cpuinfo_x86 boot_cpu_data;
+
+static void lx_identify_cpu(void)
+{
+	unsigned int eax, ebx, ecx, edx;
+
+	cpuid(0, &eax, &ebx, &ecx, &edx);
+	boot_cpu_data.cpuid_level = eax;
+	memcpy(&boot_cpu_data.x86_vendor_id[0], &ebx, 4);
+	memcpy(&boot_cpu_data.x86_vendor_id[4], &edx, 4);
+	memcpy(&boot_cpu_data.x86_vendor_id[8], &ecx, 4);
+	if (!memcmp(boot_cpu_data.x86_vendor_id, "AuthenticAMD", 12))
+		boot_cpu_data.x86_vendor = X86_VENDOR_AMD;
+	else if (!memcmp(boot_cpu_data.x86_vendor_id, "GenuineIntel", 12))
+		boot_cpu_data.x86_vendor = X86_VENDOR_INTEL;
+	else
+		boot_cpu_data.x86_vendor = X86_VENDOR_UNKNOWN;
+	cpuid(1, &eax, &ebx, &ecx, &edx);
+	boot_cpu_data.x86 = x86_family(eax);
+	boot_cpu_data.x86_model = x86_model(eax);
+	boot_cpu_data.x86_stepping = x86_stepping(eax);
+	boot_cpu_data.x86_capability[CPUID_1_EDX] = edx;
+	boot_cpu_data.x86_capability[CPUID_1_ECX] = ecx;
+	boot_cpu_data.x86_clflush_size = 64;
+	boot_cpu_data.x86_cache_alignment = 64;
 }
 
 /* ---------------------------------------------------------------- locking */

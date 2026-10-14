@@ -313,6 +313,23 @@ impl Request<ExecutableAddressResponse> {
 #[unsafe(link_section = ".limine_requests")]
 pub static EXECUTABLE_ADDRESS: Request<ExecutableAddressResponse> = Request::new([0x71ba76863cc55f63, 0xb2644a48c516a487]);
 
+#[repr(C)]
+pub struct RsdpResponse {
+    revision: u64,
+    address: u64,
+}
+
+impl Request<RsdpResponse> {
+    /// Physical address of the ACPI RSDP (base revision 3 reports it physical).
+    pub fn address(&self) -> Option<u64> {
+        self.response().map(|r| r.address).filter(|&a| a != 0)
+    }
+}
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static RSDP: Request<RsdpResponse> = Request::new([0xc5e77b6b397e7b43, 0x27637845accdcf3c]);
+
 /// Stack for kmain. Limine's default (64 KiB) is too small for TLS and the script engine.
 pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024;
 

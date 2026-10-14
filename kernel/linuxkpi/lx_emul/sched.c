@@ -2,13 +2,19 @@
 /*
  * lx_emul scheduling: timers, workqueues and interrupt handlers.
  *
- * All of it runs in one Nova kernel task ("linux", started by kernel/src/linuxkpi.rs),
- * which calls nova_lx_poll() every timer tick: interrupt handlers are polled (each
- * handler checks its device's status register and returns IRQ_NONE when it has nothing,
- * as shared-interrupt handlers must), then NAPI, expired timers and queued work items.
- * Work items may sleep (msleep, mutexes): that parks the "linux" task, nothing else.
- * Polling costs up to one tick (10 ms) of latency; interrupt delivery through the APIC
- * and MSI replaces it in milestone 2 (docs/linux-drivers.md).
+ * Interrupt handlers run in real interrupt context: request_irq() unmasks the device's
+ * PCI line at Nova's PIC, and Nova's IRQ dispatcher calls nova_lx_irq() for it, with
+ * interrupts disabled as on Linux. Everything deferred runs in one Nova kernel task
+ * ("linux", kernel/src/linuxkpi.rs), which every interrupt wakes: threaded handlers,
+ * NAPI, expired timers and queued work items. Work items may sleep (msleep, mutexes):
+ * that parks the "linux" task, nothing else.
+ *
+ * The task also polls each handler once per wakeup, with interrupts off. A handler checks
+ * its device's status and returns IRQ_NONE when idle (as shared handlers must), so this
+ * only matters for lines Nova could not wire (APIC and MSI arrive in milestone 2).
+ *
+ * The lists here are also touched from interrupt handlers (a handler may schedule NAPI,
+ * queue work or arm a timer), so task-side list updates run with interrupts disabled.
  */
 #include <linux/timer.h>
 #include <linux/workqueue.h>
@@ -41,10 +47,14 @@ static int lx_timer_detach(struct timer_list *timer)
 
 int mod_timer(struct timer_list *timer, unsigned long expires)
 {
-	int was_pending = lx_timer_detach(timer);
+	unsigned long flags;
+	int was_pending;
 
+	local_irq_save(flags);
+	was_pending = lx_timer_detach(timer);
 	timer->expires = expires;
 	hlist_add_head(&timer->entry, &lx_timers);
+	local_irq_restore(flags);
 	return was_pending;
 }
 
@@ -67,19 +77,25 @@ void add_timer_on(struct timer_list *timer, int cpu)
 
 int timer_delete(struct timer_list *timer)
 {
-	return lx_timer_detach(timer);
+	unsigned long flags;
+	int ret;
+
+	local_irq_save(flags);
+	ret = lx_timer_detach(timer);
+	local_irq_restore(flags);
+	return ret;
 }
 
 /* A timer callback only runs inside lx_emul_timers_run, which never yields, so once a
  * timer is detached its callback cannot be running elsewhere. */
 int timer_delete_sync(struct timer_list *timer)
 {
-	return lx_timer_detach(timer);
+	return timer_delete(timer);
 }
 
 int timer_shutdown(struct timer_list *timer)
 {
-	int ret = lx_timer_detach(timer);
+	int ret = timer_delete(timer);
 
 	timer->function = NULL;
 	return ret;
@@ -92,23 +108,25 @@ int timer_shutdown_sync(struct timer_list *timer)
 
 void lx_emul_timers_run(void)
 {
-	struct timer_list *timer;
-	struct hlist_node *next;
-	bool again;
+	struct timer_list *timer, *expired;
+	unsigned long flags;
 
 	do {
-		again = false;
-		hlist_for_each_entry_safe(timer, next, &lx_timers, entry) {
-			if (time_before(jiffies, timer->expires))
-				continue;
-			hlist_del_init(&timer->entry);
-			if (timer->function)
-				timer->function(timer);
-			/* The callback may have added or removed other timers. */
-			again = true;
-			break;
+		/* Take one expired timer off the list, then run it with interrupts on (the
+		 * callback may add or remove timers, so the scan restarts afterwards). */
+		expired = NULL;
+		local_irq_save(flags);
+		hlist_for_each_entry(timer, &lx_timers, entry) {
+			if (!time_before(jiffies, timer->expires)) {
+				hlist_del_init(&timer->entry);
+				expired = timer;
+				break;
+			}
 		}
-	} while (again);
+		local_irq_restore(flags);
+		if (expired && expired->function)
+			expired->function(expired);
+	} while (expired);
 }
 
 /* ---------------------------------------------------------------- workqueues */
@@ -149,11 +167,20 @@ struct workqueue_struct *alloc_workqueue_noprof(const char *fmt, unsigned int fl
 	return wq;
 }
 
+static void lx_work_enqueue(struct work_struct *work)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	list_add_tail(&work->entry, &lx_work_list);
+	local_irq_restore(flags);
+}
+
 bool queue_work_on(int cpu, struct workqueue_struct *wq, struct work_struct *work)
 {
 	if (test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
 		return false;
-	list_add_tail(&work->entry, &lx_work_list);
+	lx_work_enqueue(work);
 	return true;
 }
 
@@ -161,7 +188,7 @@ void delayed_work_timer_fn(struct timer_list *t)
 {
 	struct delayed_work *dwork = container_of(t, struct delayed_work, timer);
 
-	list_add_tail(&dwork->work.entry, &lx_work_list);
+	lx_work_enqueue(&dwork->work);
 }
 
 bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed_work *dwork,
@@ -172,7 +199,7 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed_
 	dwork->wq = wq;
 	dwork->cpu = cpu;
 	if (!delay)
-		list_add_tail(&dwork->work.entry, &lx_work_list);
+		lx_work_enqueue(&dwork->work);
 	else
 		mod_timer(&dwork->timer, jiffies + delay);
 	return true;
@@ -181,11 +208,17 @@ bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed_
 /* Remove a work item from wherever it waits (timer or list); true if it was pending. */
 static bool lx_work_unqueue(struct work_struct *work, struct timer_list *timer)
 {
-	if (!test_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
+	unsigned long flags;
+
+	local_irq_save(flags);
+	if (!test_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work))) {
+		local_irq_restore(flags);
 		return false;
+	}
 	if (!(timer && lx_timer_detach(timer)))
 		list_del_init(&work->entry);
 	clear_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work));
+	local_irq_restore(flags);
 	return true;
 }
 
@@ -245,10 +278,18 @@ bool flush_delayed_work(struct delayed_work *dwork)
 
 void lx_emul_work_run(void)
 {
-	while (!list_empty(&lx_work_list)) {
-		struct work_struct *work = list_first_entry(&lx_work_list, struct work_struct, entry);
+	for (;;) {
+		struct work_struct *work = NULL;
+		unsigned long flags;
 
-		list_del_init(&work->entry);
+		local_irq_save(flags);
+		if (!list_empty(&lx_work_list)) {
+			work = list_first_entry(&lx_work_list, struct work_struct, entry);
+			list_del_init(&work->entry);
+		}
+		local_irq_restore(flags);
+		if (!work)
+			return;
 		lx_work_execute(work);
 	}
 }
@@ -273,14 +314,32 @@ struct lx_irq {
 	void *dev_id;
 	const char *name;
 	bool used;
+	bool thread_pending;
 };
 
 static struct lx_irq lx_irqs[32];
-static unsigned int lx_irq_disabled[256];
+static unsigned int lx_irq_disabled_count[512];
+/* Disable depth per IRQ number: GSIs/PIC lines and MSI numbers (0x1000 + vector) apart. */
+#define lx_irq_disabled lx_irq_disabled_count
+#define LX_IRQ_SLOT(irq) ((irq) >= 0x1000 ? 256 + ((irq) & 255) : (irq) & 255)
+
+/* Provided by Nova (linuxkpi.rs): unmask/mask a PCI line at the PIC. */
+void nova_irq_line(unsigned int line, bool enable);
+
+static bool lx_irq_line_used(unsigned int irq)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(lx_irqs); i++)
+		if (lx_irqs[i].used && lx_irqs[i].irq == irq)
+			return true;
+	return false;
+}
 
 int request_threaded_irq(unsigned int irq, irq_handler_t handler, irq_handler_t thread_fn,
 			 unsigned long flags, const char *name, void *dev)
 {
+	unsigned long irqflags;
 	unsigned int i;
 
 	if (!handler && !thread_fn)
@@ -288,7 +347,12 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler, irq_handler_t 
 	for (i = 0; i < ARRAY_SIZE(lx_irqs); i++) {
 		if (lx_irqs[i].used)
 			continue;
-		lx_irqs[i] = (struct lx_irq){ irq, handler, thread_fn, dev, name, true };
+		local_irq_save(irqflags);
+		lx_irqs[i] = (struct lx_irq){ .irq = irq, .handler = handler, .thread_fn = thread_fn,
+					      .dev_id = dev, .name = name, .used = true };
+		local_irq_restore(irqflags);
+		if (!lx_irq_disabled[LX_IRQ_SLOT(irq)])
+			nova_irq_line(irq, true);
 		return 0;
 	}
 	return -EBUSY;
@@ -296,20 +360,27 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler, irq_handler_t 
 
 const void *free_irq(unsigned int irq, void *dev_id)
 {
+	unsigned long flags;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(lx_irqs); i++) {
 		if (lx_irqs[i].used && lx_irqs[i].irq == irq && lx_irqs[i].dev_id == dev_id) {
+			local_irq_save(flags);
 			lx_irqs[i].used = false;
+			local_irq_restore(flags);
+			if (!lx_irq_line_used(irq))
+				nova_irq_line(irq, false);
 			return lx_irqs[i].name;
 		}
 	}
 	return NULL;
 }
 
+/* As on Linux, disabling an interrupt masks the line at the interrupt controller. */
 void disable_irq_nosync(unsigned int irq)
 {
-	lx_irq_disabled[irq & 255]++;
+	if (lx_irq_disabled[LX_IRQ_SLOT(irq)]++ == 0)
+		nova_irq_line(irq, false);
 }
 
 void disable_irq(unsigned int irq)
@@ -319,23 +390,27 @@ void disable_irq(unsigned int irq)
 
 void enable_irq(unsigned int irq)
 {
-	if (lx_irq_disabled[irq & 255])
-		lx_irq_disabled[irq & 255]--;
+	if (lx_irq_disabled[LX_IRQ_SLOT(irq)] && --lx_irq_disabled[LX_IRQ_SLOT(irq)] == 0 && lx_irq_line_used(irq))
+		nova_irq_line(irq, true);
 }
 
+/* A handler runs either from the interrupt or from the poll below, both with interrupts
+ * off, so once this returns no handler can still be running. */
 void synchronize_irq(unsigned int irq)
 {
 }
 
-void lx_emul_irq_poll(void)
+/* Run the handlers on `irq`; interrupts are disabled. True if one claimed it. */
+static bool lx_irq_run(unsigned int irq, bool any_line)
 {
+	bool claimed = false;
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(lx_irqs); i++) {
 		struct lx_irq *a = &lx_irqs[i];
 		irqreturn_t ret = IRQ_WAKE_THREAD;
 
-		if (!a->used || lx_irq_disabled[a->irq & 255])
+		if (!a->used || (!any_line && a->irq != irq) || lx_irq_disabled[LX_IRQ_SLOT(a->irq)])
 			continue;
 		if (a->handler) {
 			__preempt_count_add(HARDIRQ_OFFSET);
@@ -343,7 +418,36 @@ void lx_emul_irq_poll(void)
 			__preempt_count_sub(HARDIRQ_OFFSET);
 		}
 		if (ret == IRQ_WAKE_THREAD && a->thread_fn)
+			a->thread_pending = true;
+		if (ret != IRQ_NONE)
+			claimed = true;
+	}
+	return claimed;
+}
+
+/* Called by Nova's IRQ dispatcher for a PCI line, with interrupts disabled. */
+bool nova_lx_irq(unsigned int line)
+{
+	return lx_irq_run(line, false);
+}
+
+void lx_emul_irq_poll(void)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	local_irq_save(flags);
+	lx_irq_run(0, true);
+	local_irq_restore(flags);
+
+	/* Threaded handlers run in task context, like Linux's irq threads. */
+	for (i = 0; i < ARRAY_SIZE(lx_irqs); i++) {
+		struct lx_irq *a = &lx_irqs[i];
+
+		if (a->used && a->thread_pending) {
+			a->thread_pending = false;
 			a->thread_fn(a->irq, a->dev_id);
+		}
 	}
 }
 
