@@ -293,6 +293,13 @@ pub struct Memory {
     foreign: alloc::collections::BTreeSet<u64>,
     /// Shared memory objects mapped here (kept alive while mapped).
     shared: Vec<crate::ipc::SharedRef>,
+    /// File mappings: start -> (end, path, file offset), to name the code a fault is in.
+    pub labels: BTreeMap<u64, (u64, String, u64)>,
+    /// The last unmapped ranges (debugging: a fault in one of them is reported).
+    pub unmapped: alloc::collections::VecDeque<(u64, u64, u64)>,
+    /// The last mapped ranges with where they came from (debugging, as `unmapped`).
+    pub mapped: alloc::collections::VecDeque<(u64, u64, &'static str)>,
+    full_reported: bool,
     pub areas: Vec<Area>,
     pub brk_start: u64,
     pub brk: u64,
@@ -310,6 +317,8 @@ pub struct Process {
     pub name: String,
     /// Path of the executable (for /proc/self/exe), without the leading '/'.
     pub exe: SpinLock<String>,
+    /// The arguments of its last execve (/proc/<pid>/cmdline).
+    pub argv: SpinLock<Vec<String>>,
     /// Page-table root; execve gives the process a new address space.
     pub cr3: AtomicU64,
     pub mem: SpinLock<Memory>,
@@ -333,6 +342,9 @@ pub struct Process {
     pub ns: SpinLock<Arc<crate::vfs::Namespace>>,
     /// User and group ids (Nova does not check them against file permissions).
     pub cred: SpinLock<Cred>,
+    /// execve in a multi-threaded process: the thread that stays (the others leave as
+    /// on exit_group); 0 otherwise.
+    pub exec_tid: AtomicU64,
 }
 
 /// Credentials of a process. Ids are kept as seen from the initial user namespace; in a
@@ -353,6 +365,9 @@ pub struct Cred {
     /// The enclosing namespace's maps while a nested one has none yet: the ids a nested
     /// map names as `outside` are translated through them.
     pub parent_maps: Option<(Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>)>,
+    /// Capability sets set with capset (two 32-bit words each: effective, permitted,
+    /// inheritable); None: the default for the credentials (see capget).
+    pub caps: Option<[u32; 6]>,
 }
 
 /// Programs run as the user "nova" (uid and gid 1000), not as root: Steam refuses root.
@@ -360,7 +375,7 @@ pub const NOVA_UID: u32 = 1000;
 
 impl Cred {
     pub fn user() -> Self {
-        Self { uid: NOVA_UID, euid: NOVA_UID, suid: NOVA_UID, gid: NOVA_UID, egid: NOVA_UID, sgid: NOVA_UID, groups: alloc::vec![NOVA_UID], userns: None, parent_maps: None }
+        Self { uid: NOVA_UID, euid: NOVA_UID, suid: NOVA_UID, gid: NOVA_UID, egid: NOVA_UID, sgid: NOVA_UID, groups: alloc::vec![NOVA_UID], userns: None, parent_maps: None, caps: None }
     }
 
     /// An id as the process sees it (65534, the overflow id, if its namespace has no
@@ -423,6 +438,12 @@ pub struct UserState {
     pub in_syscall: u64,
     pub syscall_arg: u64,
     pub syscall_arg2: u64,
+    /// While sleeping (nanosleep and friends): when it wakes, in monotonic nanoseconds.
+    pub wake_at: u64,
+    /// Where in the kernel the thread is (debugging).
+    pub phase: &'static str,
+    /// set_robust_list head.
+    pub robust_list: u64,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -449,7 +470,7 @@ pub fn oom_scratch_page() -> *mut u8 {
 
 impl Memory {
     fn new(cr3: u64) -> Self {
-        Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP, compat: false }
+        Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), labels: BTreeMap::new(), unmapped: alloc::collections::VecDeque::new(), mapped: alloc::collections::VecDeque::new(), full_reported: false, areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP, compat: false }
     }
 
     /// Map a zeroed page at `va` (page aligned) if not mapped yet; returns its kernel pointer.
@@ -485,6 +506,16 @@ impl Memory {
         }
         // SAFETY: as above, the leaf table.
         unsafe { (memory::phys_to_virt(table) as *const u64).add(((va >> 12) & 511) as usize).read() }
+    }
+
+    /// The frame backing `va`, if mapped.
+    pub fn page_frame(&self, va: u64) -> Option<*mut u8> {
+        self.pages.get(&(va & !(PAGE - 1))).copied()
+    }
+
+    /// Whether `va` is in a shared mapping (memfd, POSIX or SysV shared memory).
+    pub fn is_shared_page(&self, va: u64) -> bool {
+        self.foreign.contains(&(va & !(PAGE - 1)))
     }
 
     /// mremap: move the pages mapped in [from, from+len) to [to, to+len) without copying
@@ -589,6 +620,7 @@ impl Memory {
         child.shared = self.shared.clone();
         child.areas = self.areas.clone();
         child.brk_start = self.brk_start;
+        child.labels = self.labels.clone();
         child.brk = self.brk;
         child.mmap_next = self.mmap_next;
         child.compat = self.compat;
@@ -680,8 +712,13 @@ impl Memory {
         self.mmap_next = MMAP_TOP32;
     }
 
-    pub fn reserve(&mut self, len: u64) -> u64 {
-        self.reserve_with(len, true)
+    /// Reserve a kernel-only area (a 32-bit thread's scratch buffers): above 4 GiB for
+    /// 32-bit programs, so it never takes their scarce address space.
+    pub fn reserve_kernel_only(&mut self, len: u64) -> Option<u64> {
+        let len = len.next_multiple_of(PAGE);
+        let start = if self.compat { self.highest_gap(len, 1 << 32, MMAP_TOP)? } else { self.find_gap(len)? };
+        self.areas.push(Area { start, end: start + len, writable: true });
+        Some(start)
     }
 
     /// Is [start, start+len) free (no area overlaps it, inside the user range)?
@@ -692,21 +729,56 @@ impl Memory {
 
     /// Reserve `len` bytes at `hint` if that range is free (mmap address hints, as on
     /// Linux), else anywhere.
-    pub fn reserve_at(&mut self, hint: u64, len: u64, writable: bool) -> u64 {
+    pub fn note_map(&mut self, start: u64, end: u64, why: &'static str) {
+        if self.mapped.len() >= 256 {
+            self.mapped.pop_front();
+        }
+        self.mapped.push_back((start, end, why));
+    }
+
+    pub fn reserve_at(&mut self, hint: u64, len: u64, writable: bool) -> Option<u64> {
         let len = len.next_multiple_of(PAGE);
         if hint != 0 && hint % PAGE == 0 && self.is_free(hint, len) {
             self.areas.push(Area { start: hint, end: hint + len, writable });
-            return hint;
+            self.note_map(hint, hint + len, "hint");
+            return Some(hint);
         }
         self.reserve_with(len, writable)
     }
 
-    pub fn reserve_with(&mut self, len: u64, writable: bool) -> u64 {
+    /// Reserve `len` bytes anywhere free; None when the address space is full (ENOMEM).
+    pub fn reserve_with(&mut self, len: u64, writable: bool) -> Option<u64> {
         let len = len.next_multiple_of(PAGE);
-        let start = self.find_gap(len);
+        let Some(start) = self.find_gap(len) else {
+            if self.compat && !self.full_reported {
+                // Debugging: where did a 32-bit program's address space go?
+                self.full_reported = true;
+                let mut a = self.areas.clone();
+                a.sort_by_key(|a| a.start);
+                let total: u64 = a.iter().map(|a| a.end - a.start).sum();
+                crate::log::warn(&format!("mmap: no room for {len:#x} bytes; {} areas, {} MiB, brk {:#x}-{:#x}", a.len(), total >> 20, self.brk_start, self.brk));
+                let mut big = a.clone();
+                big.sort_by_key(|a| a.start.wrapping_sub(a.end));
+                for x in big.iter().take(12) {
+                    let label = self.labels.get(&x.start).map(|(_, p, _)| p.clone()).unwrap_or_default();
+                    crate::log::warn(&format!("  {:#x}-{:#x} {} KiB {label}", x.start, x.end, (x.end - x.start) >> 10));
+                }
+                let mut sizes: BTreeMap<u64, usize> = BTreeMap::new();
+                for x in &a {
+                    *sizes.entry(x.end - x.start).or_default() += 1;
+                }
+                let mut common: Vec<_> = sizes.into_iter().collect();
+                common.sort_by_key(|&(sz, n)| core::cmp::Reverse(sz * n as u64));
+                for (sz, n) in common.iter().take(8) {
+                    crate::log::warn(&format!("  {n} areas of {} KiB", sz >> 10));
+                }
+            }
+            return None;
+        };
         self.mmap_next = start;
         self.areas.push(Area { start, end: start + len, writable });
-        start
+        self.note_map(start, start + len, "gap");
+        Some(start)
     }
 
     /// Highest address mappings are placed below.
@@ -725,35 +797,51 @@ impl Memory {
     /// free (the common case), else the highest free gap (address space that munmap gave
     /// back), keeping a guard page above it. Freed space is reused, so a 32-bit program
     /// that maps and unmaps a lot never runs down into its heap.
-    fn find_gap(&self, len: u64) -> u64 {
+    fn find_gap(&self, len: u64) -> Option<u64> {
         let (top, floor) = (self.mmap_top(), self.mmap_floor());
         if let Some(start) = self.mmap_next.min(top).checked_sub(len + PAGE)
             && start >= floor
             && self.is_free(start, len + PAGE)
         {
-            return start;
+            return Some(start);
         }
+        if let Some(start) = self.highest_gap(len, floor, top) {
+            return Some(start);
+        }
+        // Nothing left above the heap's room: anywhere free below it (32-bit programs have
+        // space below their executable), never over a mapping or the heap itself.
+        let heap_end = self.brk.max(self.brk_start);
+        if let Some(start) = self.highest_gap(len, USER_MIN, top).filter(|&s| s + len <= self.brk_start || s >= heap_end) {
+            return Some(start);
+        }
+        // Linux fails with ENOMEM here; never place a mapping over another one.
+        self.highest_gap(len, USER_MIN, self.brk_start.max(USER_MIN))
+    }
+
+    /// The highest free range of `len` bytes (with a guard page above it) in [floor, top).
+    fn highest_gap(&self, len: u64, floor: u64, top: u64) -> Option<u64> {
         let mut spans: Vec<(u64, u64)> = self.areas.iter().filter(|a| a.start < top && a.end > floor).map(|a| (a.start, a.end)).collect();
         spans.sort_unstable_by(|a, b| b.cmp(a));
         let mut cursor = top;
         for (s, e) in spans {
             // The gap between this area (plus a guard page) and the cursor.
-            let gap_lo = e.saturating_add(PAGE);
+            let gap_lo = e.saturating_add(PAGE).max(floor);
             if cursor >= gap_lo && cursor - gap_lo >= len + PAGE {
-                return cursor - len - PAGE;
+                return Some(cursor - len - PAGE);
             }
             cursor = cursor.min(s);
         }
-        if cursor >= floor && cursor - floor >= len + PAGE {
-            return cursor - len - PAGE;
-        }
-        // Out of address space above the heap: below it, if anything is left there.
-        self.mmap_next.saturating_sub(len + PAGE).max(USER_MIN)
+        (cursor >= floor && cursor - floor >= len + PAGE).then(|| cursor - len - PAGE)
     }
 
     /// Free the pages in [start, start+len) but keep the areas (they read as zero again).
     pub fn discard(&mut self, start: u64, len: u64) {
         let end = start.saturating_add(len.next_multiple_of(PAGE));
+        if self.unmapped.len() >= 256 {
+            self.unmapped.pop_front();
+        }
+        let nr = task::current_user().map_or(u64::MAX, |u| u.in_syscall);
+        self.unmapped.push_back((start, end, nr | 0x10000));
         let doomed: Vec<u64> = self.pages.range(start..end).map(|(&va, _)| va).collect();
         for va in doomed {
             if let Some(p) = self.pages.remove(&va) {
@@ -820,6 +908,11 @@ impl Memory {
     /// Remove [start, start+len) from the areas and free its pages.
     pub fn unmap(&mut self, start: u64, len: u64) {
         let end = start.saturating_add(len.next_multiple_of(PAGE));
+        if self.unmapped.len() >= 256 {
+            self.unmapped.pop_front();
+        }
+        let nr = task::current_user().map_or(u64::MAX, |u| u.in_syscall);
+        self.unmapped.push_back((start, end, nr));
         let mut kept = Vec::new();
         for a in self.areas.drain(..) {
             if a.end <= start || a.start >= end {
@@ -907,6 +1000,7 @@ impl Process {
             pid: NEXT_PID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
             exe: SpinLock::new(exe.into()),
+            argv: SpinLock::new(Vec::new()),
             cr3: AtomicU64::new(cr3),
             mem: SpinLock::new(Memory::new(cr3)),
             fds: SpinLock::new(FdTable::new()),
@@ -920,6 +1014,7 @@ impl Process {
             vfork_done: AtomicBool::new(false),
             ns: SpinLock::new(crate::vfs::root()),
             cred: SpinLock::new(Cred::user()),
+            exec_tid: AtomicU64::new(0),
         });
         TABLE.lock().insert(p.pid, Entry { parent, process: Arc::downgrade(&p), status: None });
         p
@@ -944,6 +1039,7 @@ pub fn unshare_user(pid: u64) {
         let mut c = p.cred.lock();
         c.parent_maps = c.userns.take();
         c.userns = Some((Vec::new(), Vec::new()));
+        c.caps = None; // a new user namespace starts with every capability in it
     }
 }
 
@@ -1056,7 +1152,7 @@ pub fn terminate(p: &Process, sig: u32) {
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0 })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0 })
     }
 }
 
@@ -1273,6 +1369,10 @@ pub fn exit_thread(code: i32) -> ! {
         }
         crate::linux::futex_wake(&u.process, tid_addr, 1);
     }
+    if u.compat_scratch != 0 {
+        u.process.mem.lock().unmap(u.compat_scratch, crate::linux::COMPAT_SCRATCH_SIZE);
+        u.compat_scratch = 0;
+    }
     let ctx = u.exit_ctx;
     // SAFETY: ctx was saved by enter_user on this same kernel stack, further up;
     // everything below it (this handler's frames) is abandoned.
@@ -1293,6 +1393,7 @@ pub fn exit(code: i32) -> ! {
 pub fn check_exiting() {
     if let Some(u) = task::current_user()
         && u.process.exiting.load(Ordering::SeqCst)
+        && u.process.exec_tid.load(Ordering::SeqCst) != u.tid
     {
         let code = u.process.exit_code.load(Ordering::SeqCst);
         exit_thread(code);
@@ -1320,6 +1421,12 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
         }
         a => {
             let what = if error & 2 != 0 { "write" } else if error & 16 != 0 { "instruction fetch" } else { "read" };
+            for &(s, e, nr) in mem.unmapped.iter().filter(|&&(s, e, _)| addr >= s && addr < e) {
+                crate::log::warn(&format!("{}: {addr:#x} was unmapped ({s:#x}-{e:#x}) by syscall {nr:#x}", u.process.name));
+            }
+            for &(s, e, why) in mem.mapped.iter().filter(|&&(s, e, _)| addr >= s && addr < e) {
+                crate::log::warn(&format!("{}: {addr:#x} was mapped ({why}) at {s:#x}-{e:#x}", u.process.name));
+            }
             crate::log::warn(&format!(
                 "{}: invalid {what} at {addr:#x}: {}",
                 u.process.name,
@@ -1331,8 +1438,75 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
 }
 
 /// Kill the current program after a fault it caused.
+/// The user stack pointer of the last faulting thread (to find a jump to 0's caller).
+pub static FAULT_RSP: AtomicU64 = AtomicU64::new(0);
+
 pub fn fault(what: &str, rip: u64, addr: Option<u64>) -> ! {
     let name = task::current_user().map(|u| u.process.name.clone()).unwrap_or_default();
+    if let Some(u) = task::current_user() {
+        crate::log::warn(&format!("{name}: pid {} thread {} running /{} faults", u.process.pid, u.tid, *u.process.exe.lock()));
+        if u.compat {
+            // Pointers on the stack into recently unmapped or discarded memory (debugging).
+            let sp = FAULT_RSP.load(Ordering::Relaxed);
+            if let Some(mut m) = u.process.mem.try_lock() {
+                for i in 0..24u64 {
+                    let a = sp + i * 4;
+                    if !m.ensure(a, 4, false) {
+                        break;
+                    }
+                    // SAFETY: mapped user memory of the current address space.
+                    let v = unsafe { (a as *const u32).read_unaligned() } as u64;
+                    for &(s, e, nr) in m.unmapped.iter().filter(|&&(s, e, _)| v >= s && v < e) {
+                        crate::log::warn(&format!("{name}: stack word {i} = {v:#x} is in {s:#x}-{e:#x}, {} by syscall {:#x}", if nr & 0x10000 != 0 { "discarded" } else { "unmapped" }, nr & 0xffff));
+                    }
+                }
+            }
+        }
+        if rip < 0x1000 {
+            // A call through a null pointer: the return address on the stack is the caller.
+            let sp = FAULT_RSP.load(Ordering::Relaxed);
+            let width = if u.compat { 4 } else { 8 };
+            if let Some(mut m) = u.process.mem.try_lock()
+                && m.ensure(sp, width, false)
+            {
+                // SAFETY: mapped user memory of the current address space.
+                let ret = unsafe { if width == 4 { (sp as *const u32).read_unaligned() as u64 } else { (sp as *const u64).read_unaligned() } };
+                let place = m.labels.range(..=ret).next_back().filter(|(_, (end, _, _))| ret < *end).map(|(start, (_, path, off))| format!(" (/{path} at offset {:#x})", ret - start + off)).unwrap_or_default();
+                crate::log::warn(&format!("{name}: called from {ret:#x}{place}"));
+                if width == 4 {
+                    // A virtual call: name the object's class from its vtable's typeinfo.
+                    let mut rd = |a: u64| if a >= 0x1000 && m.ensure(a, 4, false) { Some(unsafe { (a as *const u32).read_unaligned() } as u64) } else { None };
+                    let obj = rd(sp + 4).unwrap_or(0);
+                    let vt = rd(obj).unwrap_or(0);
+                    let ti = rd(vt.wrapping_sub(4)).unwrap_or(0);
+                    let tn = rd(ti + 4).unwrap_or(0);
+                    let mut cls = alloc::string::String::new();
+                    for i in 0..80 {
+                        match rd(tn + i).map(|w| w as u8) { Some(0) | None => break, Some(c) => cls.push(c as char) }
+                    }
+                    let vplace = m.labels.range(..=vt).next_back().filter(|(_, (end, _, _))| vt < *end).map(|(start, (_, path, off))| format!(" (/{path} at offset {:#x})", vt - start + off)).unwrap_or_default();
+                    crate::log::warn(&format!("{name}: this {obj:#x} vtable {vt:#x}{vplace} class {cls}"));
+                    let vp = vt & !(PAGE - 1);
+                    let zeros = if m.ensure(vp, PAGE, false) { (0..PAGE / 4).filter(|i| unsafe { ((vp + i * 4) as *const u32).read() } == 0).count() } else { 9999 };
+                    crate::log::warn(&format!("{name}: vtable page {vp:#x}: present {} borrowed {} foreign {} zero words {zeros}/1024", m.pages.contains_key(&vp), m.borrowed.contains(&vp), m.foreign.contains(&vp)));
+                    for &(s, e, nr) in m.unmapped.iter().filter(|&&(s, e, _)| vp >= s && vp < e) {
+                        crate::log::warn(&format!("{name}: vtable page in {s:#x}-{e:#x}, {} by syscall {:#x}", if nr & 0x10000 != 0 { "discarded" } else { "unmapped" }, nr & 0xffff));
+                    }
+                    for &(s, e, why) in m.mapped.iter().filter(|&&(s, e, _)| vp >= s && vp < e) {
+                        crate::log::warn(&format!("{name}: vtable page mapped ({why}) at {s:#x}-{e:#x}"));
+                    }
+                }
+            }
+        }
+    }
+    // Name the file the faulting code was mapped from (shared libraries).
+    if let Some(u) = task::current_user()
+        && let Some(m) = u.process.mem.try_lock()
+        && let Some((start, (end, path, off))) = m.labels.range(..=rip).next_back()
+        && rip < *end
+    {
+        crate::log::warn(&format!("{name}: fault at {rip:#x} is in /{path} at offset {:#x}", rip - start + off));
+    }
     match addr {
         Some(a) => crate::println!("\n{name}: {what} at address {a:#x} (instruction {rip:#x})"),
         None => crate::println!("\n{name}: {what} (instruction {rip:#x})"),
@@ -1737,6 +1911,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     let me = task::current_user().expect("fork outside a process");
     let parent = me.process.clone();
     let child = Process::new(&parent.name, &parent.exe.lock(), parent.pid);
+    *child.argv.lock() = parent.argv.lock().clone();
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
     *child.ns.lock() = parent.ns.lock().clone();
     *child.cred.lock() = parent.cred.lock().clone();
@@ -1766,6 +1941,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     unsafe { save_fpu(fx.ptr) };
     let (fs, sigmask, altstack) = (tls.unwrap_or(me.fs_base), me.sigmask, me.altstack);
     let (compat, tls32, sel) = (me.compat, me.tls, current_fs_gs(me));
+    let robust = me.robust_list;
     let pid = child.pid;
     let name = format!("{}[{pid}]", child.name);
     let c = child.clone();
@@ -1777,6 +1953,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
             t.altstack = altstack;
             t.compat = compat;
             t.tls = tls32;
+            t.robust_list = robust; // the child's thread keeps its robust list (fork)
             (t.user_fs, t.user_gs) = sel;
         }, |_| {});
     });
@@ -1819,8 +1996,24 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
     if !elf.starts_with(b"\x7fELF") {
         return Err(8); // ENOEXEC
     }
+    let argv = args.clone();
     if process.threads.load(Ordering::SeqCst) > 1 {
-        return Err(11); // EAGAIN: multi-threaded execve is not supported yet
+        // As on Linux, execve ends the other threads first: they leave at their next
+        // kernel entry (blocked ones are woken), and this one waits for them.
+        let me = task::current_user().map_or(0, |u| u.tid);
+        process.exec_tid.store(me, Ordering::SeqCst);
+        process.exiting.store(true, Ordering::SeqCst);
+        crate::linux::futex_wake_all(&process);
+        crate::ipc::notify();
+        let deadline = crate::pit::ticks() + 5 * crate::pit::HZ;
+        while process.threads.load(Ordering::SeqCst) > 1 && crate::pit::ticks() < deadline {
+            task::wait_event();
+        }
+        process.exiting.store(false, Ordering::SeqCst);
+        process.exec_tid.store(0, Ordering::SeqCst);
+        if process.threads.load(Ordering::SeqCst) > 1 {
+            return Err(11); // EAGAIN: a thread did not leave in time
+        }
     }
     // The old address space goes: SysV shared-memory attachments with it.
     crate::linux::sysv::process_gone(task::current_user().map_or(0, |u| u.process.pid));
@@ -1835,7 +2028,15 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
     // SAFETY: the new tables map the kernel's upper half like every address space.
     unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
     drop(old);
+    // nova.trace=NAME on the kernel command line: trace every program whose path
+    // contains NAME from its execve on (for programs started deep inside others).
+    if let Some(name) = crate::setup::cmdline_flag("nova.trace")
+        && path.contains(name)
+    {
+        process.trace.store(true, Ordering::Relaxed);
+    }
     *process.exe.lock() = path;
+    *process.argv.lock() = argv;
     process.fds.lock().close_on_exec();
     process.signals.lock().reset_handlers();
     let u = task::current_user().unwrap();

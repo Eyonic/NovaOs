@@ -48,6 +48,20 @@ fn now_ms() -> u32 {
 
 /// What the `wayland` shell command shows.
 static STATUS: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
+/// The largest window's pixels, refreshed with the status (for `wayland save`).
+static SNAPSHOT: SpinLock<Option<(usize, usize, Vec<u32>)>> = SpinLock::new(None);
+
+/// Save the largest client window as a PPM image at `path` (a file-system path).
+pub fn save(path: &str) -> Result<String, String> {
+    let Some((w, h, px)) = SNAPSHOT.lock().clone() else { return Err("no client window to save".into()) };
+    let mut data = format!("P6\n{w} {h}\n255\n").into_bytes();
+    data.reserve(w * h * 3);
+    for p in px {
+        data.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, p as u8]);
+    }
+    crate::vfs::write_file(path.trim_start_matches('/'), &data).map_err(|e| format!("error {e}"))?;
+    Ok(format!("saved {w}x{h} to {path}"))
+}
 
 /// Start the compositor (once): bind the socket and serve clients in a task.
 pub fn start() {
@@ -175,6 +189,9 @@ struct Surface {
     title: String,
     canvas: Option<Canvas>,
     window: Option<WindowRef>,
+    /// Commits so far, and how many brought a buffer (for the status).
+    commits: u32,
+    frames_shown: u32,
 }
 
 struct Global {
@@ -285,7 +302,7 @@ impl Client {
             self.dead = true;
             return;
         }
-        c.push(ipc::Message { data: core::mem::take(&mut self.out), fds: core::mem::take(&mut self.outfds) });
+        c.push(ipc::Message { data: core::mem::take(&mut self.out), fds: core::mem::take(&mut self.outfds), pid: 0 });
         drop(c);
         ipc::notify();
     }
@@ -597,6 +614,7 @@ impl Client {
 
     fn commit(&mut self, id: u32) {
         let Some(s) = self.surfaces.get_mut(&id) else { return };
+        s.commits += 1;
         let frames = core::mem::take(&mut s.pending_frames);
         s.frames.extend(frames);
         // The first commit of an xdg toplevel gets its configure; then buffers follow.
@@ -630,6 +648,7 @@ impl Client {
         // Copied: the client may reuse the buffer at once.
         self.event(bid, 0, &[]);
         let s = self.surfaces.get_mut(&id).unwrap();
+        s.frames_shown += 1;
         if s.toplevel.is_some() && wm::running() {
             let win = s.window.get_or_insert_with(|| {
                 let title = if s.title.is_empty() { "Linux program".to_string() } else { s.title.clone() };
@@ -770,7 +789,7 @@ impl Client {
             if let Some(c) = &s.canvas {
                 let crc = crate::storage::crc32(&c.pixels.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>());
                 let center = c.pixels[(c.height / 2) * c.width + c.width / 2];
-                v.push(format!("  surface {id}: {}x{} {} \"{}\" center #{center:06x} crc {crc:08x}", c.width, c.height, if s.toplevel.is_some() { "toplevel" } else { "surface" }, s.title));
+                v.push(format!("  surface {id}: {}x{} {} \"{}\" center #{center:06x} crc {crc:08x}, {} commits, {} buffers", c.width, c.height, if s.toplevel.is_some() { "toplevel" } else { "surface" }, s.title, s.commits, s.frames_shown));
             }
         }
         v
@@ -813,6 +832,8 @@ fn serve(listener: ListenerRef) {
         if pit::ticks() >= next_status {
             next_status = pit::ticks() + pit::HZ / 2;
             *STATUS.lock() = clients.iter().flat_map(|c| c.describe()).collect();
+            let largest = clients.iter().flat_map(|c| c.surfaces.values()).filter_map(|s| s.canvas.as_ref()).max_by_key(|c| c.width * c.height);
+            *SNAPSHOT.lock() = largest.map(|c| (c.width, c.height, c.pixels.clone()));
         }
         ipc::wait(Some(next_frame));
     }

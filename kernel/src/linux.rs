@@ -48,6 +48,8 @@ const ENOSYS: i64 = 38;
 const EAFNOSUPPORT: i64 = 97;
 const ENOTSOCK: i64 = 88;
 const ENOMEM_ERR: i64 = 12;
+/// Size of each 32-bit thread's kernel scratch mapping (see compat32::scratch).
+pub const COMPAT_SCRATCH_SIZE: u64 = 256 * 1024;
 const EROFS: i64 = 30;
 const EOPNOTSUPP: i64 = 95;
 const EPERM: i64 = 1;
@@ -204,7 +206,7 @@ fn open_fifo(m: &vfs::Mount, rel: &str, acc: u64) -> Kind {
     }
     let rx = (acc != 1).then(|| chan.clone());
     let tx = (acc != 0).then_some(chan);
-    Kind::Channel(ipc::End { rx, tx, kind: ipc::SockType::Stream })
+    Kind::Channel(ipc::End { rx, tx, kind: ipc::SockType::Stream, inet: None })
 }
 
 /// The shared-memory object behind a descriptor (memfd, POSIX shm, tmpfs file).
@@ -254,6 +256,33 @@ fn sockaddr_in(b: &[u8]) -> Result<(smoltcp::wire::Ipv4Address, u16), i64> {
         return Err(EAFNOSUPPORT);
     }
     Ok((smoltcp::wire::Ipv4Address::new(b[4], b[5], b[6], b[7]), u16::from_be_bytes([b[2], b[3]])))
+}
+
+/// OpenFile flag (above the O_ flags): SO_PASSCRED is set on this socket.
+const PASSCRED: u64 = 1 << 40;
+
+/// ENOTSOCK unless `file` is a socket (programs fall back from send() to write() on it).
+fn need_socket(file: &FileRef) -> Result<(), i64> {
+    match &file.lock().kind {
+        Kind::Inet(_) | Kind::Unix(_) => Ok(()),
+        Kind::Channel(e) if e.rx.is_some() && e.tx.is_some() => Ok(()),
+        _ => Err(ENOTSOCK),
+    }
+}
+
+/// A free loopback TCP port (ephemeral range).
+fn loopback_port() -> u16 {
+    static NEXT: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(32768);
+    loop {
+        let p = NEXT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if p < 32768 {
+            NEXT.store(32768, core::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+        if !ipc::name_bound(&format!("tcp:{p}")) {
+            return p;
+        }
+    }
 }
 
 fn encode_sockaddr_in(ip: smoltcp::wire::Ipv4Address, port: u16) -> Vec<u8> {
@@ -706,7 +735,10 @@ fn proc_file(name: &str) -> Option<String> {
         ),
         "proc/self/stat" => format!("{} ({}) R 1 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 0 0\n", proc().pid, proc().name, proc().pid, proc().pid, proc().threads.load(core::sync::atomic::Ordering::Relaxed)),
         "proc/self/statm" => "1000 500 100 10 0 400 0\n".into(),
-        "proc/self/cmdline" => format!("{}\0", *proc().exe.lock()),
+        "proc/self/cmdline" => {
+            let argv = proc().argv.lock();
+            if argv.is_empty() { format!("/{}\0", *proc().exe.lock()) } else { argv.iter().map(|a| format!("{a}\0")).collect() }
+        }
         "proc/self/comm" => format!("{}\n", proc().name),
         "proc/self/oom_score_adj" => "0\n".into(),
         "proc/self/limits" => "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1024                 4096                 files\n".into(),
@@ -788,7 +820,7 @@ fn fd_link(n: i64) -> Option<String> {
 
 const PROC_DIRS: &[&str] = &["", "self", "self/fd", "self/ns", "self/task", "sys", "sys/kernel", "sys/kernel/yama", "sys/vm", "sys/fs", "sys/fs/inotify", "sys/user"];
 const PROC_ROOT: &[&str] = &["self", "thread-self", "cpuinfo", "meminfo", "mounts", "stat", "uptime", "loadavg", "filesystems", "sys"];
-const PROC_SELF: &[&str] = &["exe", "fd", "ns", "maps", "status", "stat", "statm", "cmdline", "comm", "mountinfo", "mounts", "limits", "oom_score_adj", "uid_map", "gid_map", "setgroups", "cgroup"];
+const PROC_SELF: &[&str] = &["exe", "root", "cwd", "fd", "ns", "maps", "status", "stat", "statm", "cmdline", "comm", "mountinfo", "mounts", "limits", "oom_score_adj", "uid_map", "gid_map", "setgroups", "cgroup"];
 const NAMESPACES: &[&str] = &["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"];
 
 struct ProcFs;
@@ -800,7 +832,13 @@ impl vfs::Backend for ProcFs {
     fn lstat(&self, p: &str) -> Result<vfs::Meta, i64> {
         let n = proc_norm(p);
         if PROC_DIRS.contains(&n.as_str()) || (p.split('/').next().is_some_and(|f| f.bytes().all(|b| b.is_ascii_digit())) && n == "self") {
-            return Ok(meta(vfs::Type::Dir, 0o555, 0, p));
+            let mut m = meta(vfs::Type::Dir, 0o555, 0, p);
+            if n == "self/task" {
+                // ".", ".." and one entry per thread: programs count threads this way
+                // (Chromium's sandbox wants exactly 3 before it forks).
+                m.nlink = 2 + proc().threads.load(core::sync::atomic::Ordering::Relaxed) as u32;
+            }
+            return Ok(m);
         }
         if let Some(t) = self.readlink(p) {
             return Ok(meta(vfs::Type::Lnk, 0o777, t.len() as u64, p));
@@ -817,6 +855,12 @@ impl vfs::Backend for ProcFs {
         let n = proc_norm(p);
         if n == "self/exe" {
             return Some(format!("/{}", *proc().exe.lock()));
+        }
+        if n == "self/root" {
+            return Some("/".into());
+        }
+        if n == "self/cwd" {
+            return Some(format!("/{}", fds().cwd));
         }
         let fd: i64 = n.strip_prefix("self/fd/")?.parse().ok()?;
         let file = fds().get(fd).ok()?;
@@ -1065,8 +1109,15 @@ impl vfs::Backend for SysFs {
 /// a directory Nova tracks by path: the working directory, as openat does).
 fn at_path(dirfd: i64, p: &str) -> Result<String, i64> {
     if dirfd != AT_FDCWD && !p.starts_with('/') {
-        if let Kind::Dir { at } = &fds().get(dirfd)?.lock().kind {
-            return Ok(resolve(&format!("/{}/{p}", dir_path(at))));
+        let file = fds().get(dirfd)?;
+        let f = file.lock();
+        if let Some(at) = f.at.as_ref().or(match &f.kind {
+            Kind::Dir { at } => Some(at),
+            _ => None,
+        }) {
+            let base = dir_path(at);
+            drop(f);
+            return Ok(resolve(&format!("/{base}/{p}")));
         }
     }
     Ok(resolve(p))
@@ -1075,9 +1126,14 @@ fn at_path(dirfd: i64, p: &str) -> Result<String, i64> {
 /// [`at_path`], following a symbolic link in the last component only if `follow`.
 fn at_path_nf(dirfd: i64, p: &str, follow: bool) -> Result<String, i64> {
     let p = if dirfd != AT_FDCWD && !p.starts_with('/') {
-        match &fds().get(dirfd)?.lock().kind {
-            Kind::Dir { at } => format!("/{}/{p}", dir_path(at)),
-            _ => String::from(p),
+        let file = fds().get(dirfd)?;
+        let f = file.lock();
+        match f.at.as_ref().or(match &f.kind {
+            Kind::Dir { at } => Some(at),
+            _ => None,
+        }) {
+            Some(at) => format!("/{}/{p}", dir_path(at)),
+            None => String::from(p),
         }
     } else {
         String::from(p)
@@ -1156,6 +1212,8 @@ fn stat_file(f: &OpenFile) -> Vec<u8> {
 }
 
 fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
+    // O_PATH only names the file: the access mode, O_CREAT and O_TRUNC are ignored.
+    let flags = if flags & O_PATH != 0 { flags & (O_PATH | O_CLOEXEC | O_NOFOLLOW | 0o200000) } else { flags };
     let acc = flags & 3;
     let (creat, excl, trunc, append, directory) = (flags & 0o100 != 0, flags & 0o200 != 0, flags & 0o1000 != 0, flags & 0o2000 != 0, flags & 0o200000 != 0);
     let name = if flags & O_NOFOLLOW != 0 || (creat && excl) { resolve_nofollow(path) } else { resolve(path) };
@@ -1350,7 +1408,7 @@ fn channel_write(file: &FileRef, data: &[u8], fds: Vec<FileRef>, dontwait: bool)
                         return Err(EPIPE);
                     }
                     if c.writable() {
-                        c.push(ipc::Message { data: data.to_vec(), fds: fds.take().unwrap_or_default() });
+                        c.push(ipc::Message { data: data.to_vec(), fds: fds.take().unwrap_or_default(), pid: proc().pid as u32 });
                         drop(c);
                         ipc::notify();
                         return Ok(data.len());
@@ -1551,10 +1609,19 @@ fn now_ns(clock: u64) -> u64 {
 /// TSC clock at each one: counting whole ticks alone would end up to one tick early.
 fn sleep_ns(ns: u64) {
     let end = pit::nanos().saturating_add(ns);
-    while pit::nanos() < end {
-        let left = end - pit::nanos();
-        task::sleep_ticks(left.div_ceil(1_000_000_000 / pit::HZ).max(1));
+    thread().wake_at = end;
+    thread().phase = "sleep";
+    loop {
+        // One reading of the clock: checking it and then subtracting a second reading
+        // could underflow (the deadline passing in between) into an endless sleep.
+        let now = pit::nanos();
+        if now >= end {
+            break;
+        }
+        process::check_exiting(); // exit_group or execve by another thread
+        task::sleep_ticks((end - now).div_ceil(1_000_000_000 / pit::HZ).max(1));
     }
+    thread().phase = "slept";
 }
 
 fn uname() -> Vec<u8> {
@@ -1844,11 +1911,18 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         let end = sa[2..].iter().position(|&b| b == 0).unwrap_or(sa.len() - 2);
                         stat_path(&resolve(&String::from_utf8_lossy(&sa[2..2 + end])))?;
                     }
-                    let end = ipc::connect_name(&key, kind)?;
+                    let end = ipc::connect_name(&key, kind, None)?;
                     file.lock().kind = Kind::Channel(end);
                     return Ok(0);
                 }
                 let (ip, port) = sockaddr_in(&read_user(a1, (a2 as usize).min(128))?)?;
+                if ip.octets()[0] == 127 && matches!(&file.lock().kind, Kind::Inet(s) if !s.udp) {
+                    // Loopback TCP: an in-kernel stream to a socket listening on this machine.
+                    let local = loopback_port();
+                    let end = ipc::connect_name(&format!("tcp:{port}"), ipc::SockType::Stream, Some((local, port)))?;
+                    file.lock().kind = Kind::Channel(end);
+                    return Ok(0);
+                }
                 let nonblock = {
                     let mut f = file.lock();
                     let nonblock = f.flags & O_NONBLOCK != 0;
@@ -1883,6 +1957,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             44 => {
                 // sendto(fd, buf, len, flags, addr, addrlen)
                 let file = fds().get(a0 as i64)?;
+                need_socket(&file)?;
                 let data = read_user(a1, a2 as usize)?;
                 if is_inet(&file) {
                     let to = if a4 != 0 { Some(sockaddr_in(&read_user(a4, (a5 as usize).min(128))?)?) } else { None };
@@ -1894,6 +1969,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             45 => {
                 // recvfrom(fd, buf, len, flags, addr, addrlen)
                 let file = fds().get(a0 as i64)?;
+                need_socket(&file)?;
                 if is_inet(&file) {
                     // flags: MSG_PEEK 0x2, MSG_DONTWAIT 0x40
                     let (data, from) = inet_recv(&file, a2 as usize, a3 & 0x40 != 0, a3 & 0x2 != 0)?;
@@ -1972,6 +2048,21 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     return Ok(0);
                 }
                 let mut f = file.lock();
+                if let Kind::Inet(s) = &f.kind
+                    && !s.udp
+                {
+                    // TCP servers on 127.0.0.1 or any address listen on loopback (connections
+                    // from the network are not supported).
+                    let sa = read_user(a1, (a2 as usize).min(128))?;
+                    let (ip, port) = sockaddr_in(&sa)?;
+                    let o = ip.octets();
+                    if o[0] == 127 || (o == [0; 4] && port != 0) {
+                        let port = if port == 0 { loopback_port() } else { port };
+                        let l = ipc::bind_name(&format!("tcp:{port}"), ipc::SockType::Stream).map_err(|_| EADDRINUSE)?;
+                        f.kind = Kind::Unix(UnixSocket { kind: ipc::SockType::Stream, listener: Some(l), name: encode_sockaddr_in(ip, port) });
+                    }
+                    return Ok(0);
+                }
                 if let Kind::Inet(s) = &mut f.kind
                     && s.udp
                 {
@@ -1982,7 +2073,14 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             }
             50 => {
                 // listen(fd, backlog)
-                if let Kind::Unix(u) = &fds().get(a0 as i64)?.lock().kind {
+                let file = fds().get(a0 as i64)?;
+                if matches!(&file.lock().kind, Kind::Inet(s) if !s.udp) {
+                    // A TCP socket not bound to a port: listen on a free loopback port.
+                    let port = loopback_port();
+                    let l = ipc::bind_name(&format!("tcp:{port}"), ipc::SockType::Stream).map_err(|_| EADDRINUSE)?;
+                    file.lock().kind = Kind::Unix(UnixSocket { kind: ipc::SockType::Stream, listener: Some(l), name: encode_sockaddr_in(smoltcp::wire::Ipv4Address::new(0, 0, 0, 0), port) });
+                }
+                if let Kind::Unix(u) = &file.lock().kind {
                     let l = u.listener.as_ref().ok_or(EINVAL)?;
                     let mut l = l.lock();
                     l.listening = true;
@@ -2017,7 +2115,10 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     }
                 };
                 let flags = if nr == 288 { a3 } else { 0 };
-                put_addr(a1, a2, &1u16.to_le_bytes())?;
+                match end.inet {
+                    Some((_, peer)) => put_addr(a1, a2, &encode_sockaddr_in(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1), peer))?,
+                    None => put_addr(a1, a2, &1u16.to_le_bytes())?,
+                }
                 let mut t = fds();
                 let fd = t.add(new_file(Kind::Channel(end), (flags & O_NONBLOCK) | 2), 0);
                 t.set_cloexec(fd, flags & O_CLOEXEC != 0);
@@ -2033,12 +2134,23 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         encode_sockaddr_in(ip, port)
                     }
                     Kind::Unix(u) if nr == 51 && !u.name.is_empty() => u.name.clone(),
+                    Kind::Channel(ipc::End { inet: Some((local, peer)), .. }) => encode_sockaddr_in(smoltcp::wire::Ipv4Address::new(127, 0, 0, 1), if nr == 51 { *local } else { *peer }),
                     _ => 1u16.to_le_bytes().to_vec(), // unnamed AF_UNIX
                 };
                 put_addr(a1, a2, &sa)?;
                 0
             }
-            54 => 0, // setsockopt
+            54 => {
+                // setsockopt: SO_PASSCRED is kept (credentials come with received
+                // messages); other options are accepted and ignored.
+                if a1 == 1 && a2 == 16 {
+                    let on = read_u32(a3)? != 0;
+                    let file = fds().get(a0 as i64)?;
+                    let mut f = file.lock();
+                    f.flags = if on { f.flags | PASSCRED } else { f.flags & !PASSCRED };
+                }
+                0
+            }
             55 => {
                 // getsockopt(fd, level, name, value, len*)
                 let so_error = {
@@ -2054,6 +2166,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 };
                 let v: Vec<u8> = match (a1, a2) {
                     (1, 4) => (so_error as i32).to_le_bytes().to_vec(), // SO_ERROR
+                    (1, 16) => ((fds().get(a0 as i64)?.lock().flags & PASSCRED != 0) as i32).to_le_bytes().to_vec(),
                     (1, 3) => {
                         let t = match &fds().get(a0 as i64)?.lock().kind {
                             Kind::Channel(ipc::End { kind, .. }) | Kind::Unix(UnixSocket { kind, .. }) => match kind { ipc::SockType::Stream => 1, ipc::SockType::Datagram => 2, ipc::SockType::SeqPacket => 5 },
@@ -2075,8 +2188,11 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     }
                     _ => 0i32.to_le_bytes().to_vec(),
                 };
-                write_user(a3, &v)?;
-                write_user(a4, &(v.len() as u32).to_le_bytes())?;
+                // Never more than the caller's buffer holds (*optlen).
+                let cap = read_u32(a4)? as usize;
+                let n = v.len().min(cap);
+                write_user(a3, &v[..n])?;
+                write_user(a4, &(n as u32).to_le_bytes())?;
                 0
             }
             284 | 290 => {
@@ -2198,12 +2314,16 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         m.unmap(a0, len);
                         // Writable while we fill it; the requested protection is applied below.
                         m.areas.push(process::Area { start: a0, end: a0 + len, writable: true });
+                        m.note_map(a0, a0 + len, "fixed");
                         a0
                     } else {
-                        m.reserve_at(a0, len, true)
+                        m.reserve_at(a0, len, true).ok_or(ENOMEM_ERR)?
                     }
                 };
                 if flags & 0x20 == 0 && fd >= 0 {
+                    if let Ok(Some(p)) = fd_path(fd) {
+                        mem().labels.insert(addr, (addr + len, p, a5));
+                    }
                     // File mapping. Read-only system files: map their pages directly
                     // (copy on write). Other files: copy the contents in.
                     let file = fds().get(fd)?;
@@ -2287,6 +2407,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     }
                     if m.is_free(old + old_len, new_len - old_len) {
                         m.areas.push(process::Area { start: old + old_len, end: old + new_len, writable: area.writable });
+                        m.note_map(old + old_len, old + new_len, "mremap-grow");
                         return Ok(old as i64);
                     }
                     if a3 & MAYMOVE == 0 {
@@ -2301,7 +2422,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     m.areas.push(process::Area { start: a4, end: a4 + new_len, writable: area.writable });
                     a4
                 } else {
-                    m.reserve_with(new_len, area.writable)
+                    m.reserve_with(new_len, area.writable).ok_or(ENOMEM_ERR)?
                 };
                 m.move_pages(old, to, old_len.min(new_len));
                 m.unmap(old, old_len);
@@ -2322,6 +2443,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                             return Ok(u.brk as i64);
                         }
                         u.areas.push(process::Area { start: old, end: new, writable: true });
+                        u.note_map(old, new, "brk");
                     }
                     u.brk = new;
                     a0 as i64
@@ -2586,9 +2708,20 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     t.set_cloexec(a0 as i64, a2 & 1 != 0);
                     0
                 }
+                // Record locks (F_SETLK, F_SETLKW, F_OFD_SETLK, F_OFD_SETLKW; i386 *64 forms):
+                // granted. Programs coordinate with them, but one system with one user has
+                // nobody to contend with yet. F_GETLK reports the range unlocked.
+                6 | 7 | 13 | 14 | 37 | 38 => 0,
+                5 | 12 | 36 => {
+                    write_user(a2, &2i16.to_le_bytes())?; // l_type = F_UNLCK
+                    0
+                }
+                8 | 9 | 15 | 16 => 0,  // F_SETOWN, F_GETOWN, F_SETOWN_EX, F_GETOWN_EX
+                1031 => a2 as i64,     // F_SETPIPE_SZ: pipes hold 512 KiB anyway
+                1032 => 512 * 1024,    // F_GETPIPE_SZ
                 1033 => 0, // F_ADD_SEALS (memfd sealing: accepted, not enforced)
                 1034 => 0, // F_GET_SEALS
-                3 => fds().get(a0 as i64)?.lock().flags as i64,
+                3 => (fds().get(a0 as i64)?.lock().flags & !PASSCRED) as i64,
                 4 => {
                     let file = fds().get(a0 as i64)?;
                     let mut f = file.lock();
@@ -2821,13 +2954,22 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 if a1 != 0 {
                     // Root, and a process in a user namespace of its own, have every
                     // capability; other users none (as on Linux).
-                    let full = { let c = proc().cred.lock(); c.euid == 0 || c.userns.is_some() };
-                    let caps = if full { [u32::MAX, u32::MAX, 0, (1u32 << (CAP_LAST - 31)) - 1, (1u32 << (CAP_LAST - 31)) - 1, 0] } else { [0; 6] };
+                    let (full, set) = { let c = proc().cred.lock(); (c.euid == 0 || c.userns.is_some(), c.caps) };
+                    let caps = set.unwrap_or(if full { [u32::MAX, u32::MAX, 0, (1u32 << (CAP_LAST - 31)) - 1, (1u32 << (CAP_LAST - 31)) - 1, 0] } else { [0; 6] });
                     write_user(a1, &caps.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
                 }
                 0
             }
-            126 => 0, // capset: accepted
+            126 => {
+                // capset(header, data): remembered, so capget reports what was set (programs
+                // drop capabilities and check that they are gone)
+                if a1 != 0 && read_u32(a0)? == 0x2008_0522 {
+                    let raw = read_user(a1, 24)?;
+                    let w: Vec<u32> = raw.chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+                    proc().cred.lock().caps = Some([w[0], w[1], w[2], w[3], w[4], w[5]]);
+                }
+                0
+            }
             64 => sysv::semget(a0 as i32, a1, a2)?,
             65 => sysv::semop(a0 as i32, a1, a2, None)?,
             220 => {
@@ -2941,7 +3083,15 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             89 | 267 => {
                 // readlink(at): only /proc/self/exe (and /proc/self/fd/N) are links
                 let (path, buf, size) = if nr == 89 { (a0, a1, a2) } else { (a1, a2, a3) };
-                let p = if nr == 89 { resolve_nofollow(&read_cstr(path)?) } else { at_path_nf(a0 as i32 as i64, &read_cstr(path)?, false)? };
+                let rel = read_cstr(path)?;
+                let p = if nr == 89 {
+                    resolve_nofollow(&rel)
+                } else if rel.is_empty() && a0 as i32 as i64 != AT_FDCWD {
+                    // readlinkat(fd, ""): the link an O_PATH descriptor names
+                    fd_path(a0 as i32 as i64)?.ok_or(ENOENT)?
+                } else {
+                    at_path_nf(a0 as i32 as i64, &rel, false)?
+                };
                 let target = {
                     let (m, rel) = ns().find_mount(&p);
                     m.fs.readlink(&rel).ok_or_else(|| EINVAL_OR_NOENT(&p))?
@@ -3191,7 +3341,21 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 0
             }
-            273 => 0,         // set_robust_list
+            273 => {
+                // set_robust_list(head, len): remembered for get_robust_list (robust futexes
+                // are not cleaned up at exit yet)
+                thread().robust_list = a0;
+                0
+            }
+            274 => {
+                // get_robust_list(pid, head**, len*): the caller's own (pid 0 or its tid)
+                if a0 != 0 && a0 != thread().tid {
+                    return Err(EPERM);
+                }
+                write_user(a1, &thread().robust_list.to_le_bytes())?;
+                write_user(a2, &24u64.to_le_bytes())?;
+                0
+            }
             140 => 20,        // getpriority: nice 0
             141 | 203 => 0,   // setpriority, sched_setaffinity
             // Scheduling policy: every thread is SCHED_OTHER with priority 0; requests to
@@ -3444,7 +3608,12 @@ const EINTR: i64 = 4;
 const ESRCH: i64 = 3;
 
 struct Waiter {
+    /// The waiting thread's process (woken when it exits).
     process: usize,
+    /// Futex key: (owner, address). Private futexes: the process and the virtual address;
+    /// shared ones in shared memory: 0 and the physical address, so waiters in different
+    /// processes (mapping it at different places) meet.
+    owner: usize,
     addr: u64,
     bitset: u32,
     task: usize,
@@ -3457,20 +3626,37 @@ fn key(p: &Process) -> usize {
     p as *const Process as usize
 }
 
-/// Wake up to `n` threads of `p` waiting on `addr` (matching `bitset`). Returns how many.
-fn wake_matching(p: &Process, addr: u64, n: usize, bitset: u32) -> usize {
+/// The futex key of `addr` in the calling process (see [`Waiter`]).
+fn futex_key(addr: u64, shared: bool) -> (usize, u64) {
+    if shared {
+        let mut m = mem();
+        if m.is_shared_page(addr) && m.ensure(addr, 4, false)
+            && let Some(frame) = m.page_frame(addr)
+        {
+            return (0, frame as u64 + (addr & (PAGE - 1)));
+        }
+    }
+    (key(proc()), addr)
+}
+
+fn wake_key(owner: usize, addr: u64, n: usize, bitset: u32) -> usize {
     let mut woken = 0;
     for w in WAITERS.lock().iter_mut() {
         if woken >= n {
             break;
         }
-        if !w.woken && w.process == key(p) && w.addr == addr && w.bitset & bitset != 0 {
+        if !w.woken && w.owner == owner && w.addr == addr && w.bitset & bitset != 0 {
             w.woken = true;
             task::wake(w.task);
             woken += 1;
         }
     }
     woken
+}
+
+/// Wake up to `n` threads of `p` waiting on `addr` (matching `bitset`). Returns how many.
+fn wake_matching(p: &Process, addr: u64, n: usize, bitset: u32) -> usize {
+    wake_key(key(p), addr, n, bitset)
 }
 
 /// A pipe end usable by the kernel itself (the browser's DevTools pipe): returns the
@@ -3508,16 +3694,17 @@ fn deadline(ts: u64, absolute: bool, clock: u64) -> Result<Option<u64>, i64> {
     Ok(Some(pit::ticks() + rel.div_ceil(1_000_000_000 / pit::HZ)))
 }
 
-fn futex_wait(addr: u64, val: u32, until: Option<u64>, bitset: u32) -> Result<i64, i64> {
+fn futex_wait(addr: u64, val: u32, until: Option<u64>, bitset: u32, shared: bool) -> Result<i64, i64> {
     if read_u32(addr)? != val {
         return Err(EAGAIN);
     }
     let p = proc();
     let me = task::current_id();
-    WAITERS.lock().push(Waiter { process: key(p), addr, bitset, task: me, woken: false });
+    let (owner, kaddr) = futex_key(addr, shared);
+    WAITERS.lock().push(Waiter { process: key(p), owner, addr: kaddr, bitset, task: me, woken: false });
     let remove = || {
         let mut ws = WAITERS.lock();
-        let i = ws.iter().position(|w| w.task == me && w.process == key(p) && w.addr == addr);
+        let i = ws.iter().position(|w| w.task == me && w.process == key(p));
         i.map(|i| ws.remove(i).woken).unwrap_or(false)
     };
     loop {
@@ -3539,24 +3726,33 @@ fn futex_wait(addr: u64, val: u32, until: Option<u64>, bitset: u32) -> Result<i6
 
 fn futex(addr: u64, op: u64, val: u32, a3: u64, addr2: u64, val3: u32) -> Result<i64, i64> {
     let realtime = op & 256 != 0;
+    // FUTEX_PRIVATE_FLAG absent: the futex may be in memory shared between processes.
+    let shared = op & 128 == 0;
     match op & 0x7F {
-        0 => futex_wait(addr, val, deadline(a3, false, 1)?, u32::MAX),
-        9 => futex_wait(addr, val, deadline(a3, true, if realtime { 0 } else { 1 })?, val3),
-        1 => Ok(futex_wake(proc(), addr, val as usize) as i64),
-        10 => Ok(wake_matching(proc(), addr, val as usize, val3) as i64),
+        0 => futex_wait(addr, val, deadline(a3, false, 1)?, u32::MAX, shared),
+        9 => futex_wait(addr, val, deadline(a3, true, if realtime { 0 } else { 1 })?, val3, shared),
+        1 => {
+            let (o, k) = futex_key(addr, shared);
+            Ok(wake_key(o, k, val as usize, u32::MAX) as i64)
+        }
+        10 => {
+            let (o, k) = futex_key(addr, shared);
+            Ok(wake_key(o, k, val as usize, val3) as i64)
+        }
         3 | 4 => {
             // REQUEUE / CMP_REQUEUE: wake `val`, move up to `a3` waiters to addr2.
             if op & 0x7F == 4 && read_u32(addr)? != val3 {
                 return Err(EAGAIN);
             }
-            let woken = futex_wake(proc(), addr, val as usize);
+            let ((o1, k1), (o2, k2)) = (futex_key(addr, shared), futex_key(addr2, shared));
+            let woken = wake_key(o1, k1, val as usize, u32::MAX);
             let mut moved = 0;
             for w in WAITERS.lock().iter_mut() {
                 if moved >= a3 as usize {
                     break;
                 }
-                if !w.woken && w.process == key(proc()) && w.addr == addr {
-                    w.addr = addr2;
+                if !w.woken && w.owner == o1 && w.addr == k1 {
+                    (w.owner, w.addr) = (o2, k2);
                     moved += 1;
                 }
             }
@@ -3611,6 +3807,7 @@ fn sock_type(t: u64) -> Result<ipc::SockType, i64> {
 /// sendmsg(fd, msghdr*, flags): gathers the iovecs, passes SCM_RIGHTS descriptors.
 fn sendmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
     let file = fds().get(fd)?;
+    need_socket(&file)?;
     let h = read_user(msg, 56)?;
     let w = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
     let (iov, iovlen, control, controllen) = (w(16), w(24), w(32), w(40));
@@ -3650,6 +3847,7 @@ fn sendmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
 /// recvmsg(fd, msghdr*, flags): scatters into the iovecs, installs passed descriptors.
 fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
     let file = fds().get(fd)?;
+    need_socket(&file)?;
     let h = read_user(msg, 56)?;
     let w = |o: usize| u64::from_le_bytes(h[o..o + 8].try_into().unwrap());
     let (iov, iovlen, control, controllen) = (w(16), w(24), w(32), w(40));
@@ -3683,13 +3881,28 @@ fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
         off += n;
     }
     let mut msg_flags: u32 = if truncated { 0x20 } else { 0 }; // MSG_TRUNC
-    let mut used = 0u64;
+    let mut c = Vec::new();
+    if file.lock().flags & PASSCRED != 0 {
+        // SCM_CREDENTIALS: struct ucred { pid, uid, gid } of the sender. Programs talking
+        // over local sockets run as the same user, so the receiver's ids stand in.
+        let sender = match &file.lock().kind {
+            Kind::Channel(e) => e.rx.as_ref().map_or(0, |rx| rx.lock().last_sender),
+            _ => 0,
+        };
+        let (uid, gid) = { let cr = proc().cred.lock(); (cr.show(cr.euid, false), cr.show(cr.egid, true)) };
+        c.extend_from_slice(&28u64.to_le_bytes());
+        c.extend_from_slice(&1i32.to_le_bytes());
+        c.extend_from_slice(&2i32.to_le_bytes());
+        c.extend_from_slice(&(sender as i32).to_le_bytes());
+        c.extend_from_slice(&uid.to_le_bytes());
+        c.extend_from_slice(&gid.to_le_bytes());
+        c.resize(32, 0);
+    }
     if !passed.is_empty() {
         let need = 16 + passed.len() * 4;
-        if control == 0 || (controllen as usize) < need {
+        if control == 0 || (controllen as usize) < c.len() + need {
             msg_flags |= 0x8; // MSG_CTRUNC: descriptors dropped
         } else {
-            let mut c = Vec::with_capacity(need.next_multiple_of(8));
             c.extend_from_slice(&(need as u64).to_le_bytes());
             c.extend_from_slice(&1i32.to_le_bytes());
             c.extend_from_slice(&1i32.to_le_bytes());
@@ -3697,11 +3910,19 @@ fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
                 let n = fds().add(f, 0);
                 c.extend_from_slice(&(n as i32).to_le_bytes());
             }
-            c.resize(need.next_multiple_of(8), 0);
-            write_user(control, &c)?;
-            used = need.next_multiple_of(8) as u64;
+            c.resize(c.len().next_multiple_of(8), 0);
         }
     }
+    if control == 0 || (controllen as usize) < c.len() {
+        if !c.is_empty() {
+            msg_flags |= 0x8;
+        }
+        c.clear();
+    }
+    if !c.is_empty() {
+        write_user(control, &c)?;
+    }
+    let used = c.len() as u64;
     write_user(msg + 40, &used.to_le_bytes())?;
     write_user(msg + 48, &msg_flags.to_le_bytes())?;
     if h[8..12] != [0, 0, 0, 0] && !is_inet(&file) {

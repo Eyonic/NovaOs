@@ -278,7 +278,7 @@ pub fn shmat(id: i32, addr: u64, flags: u64) -> Result<u64, i64> {
             m.areas.push(crate::process::Area { start: a, end: a + len, writable: true });
             a
         } else {
-            m.reserve_at(0, len, true)
+            m.reserve_at(0, len, true).ok_or(super::ENOMEM_ERR)?
         };
         m.map_shared(va, mem, 0, len);
         if readonly {

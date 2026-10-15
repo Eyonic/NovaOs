@@ -49,7 +49,7 @@ pub fn cpu_usage() -> u64 {
     100 - (idle.wrapping_sub(i0) * 100 / total).min(100)
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum State {
     Ready,
     /// Parked until IRQ_COUNT differs from the stored value.
@@ -70,6 +70,8 @@ struct Task {
     tty: Option<crate::tty::TtyRef>,
     /// CPU state of the user program this task runs, if any (see process.rs).
     user: Option<Box<crate::process::UserState>>,
+    /// Times switched in (debugging: `ps`).
+    runs: u64,
 }
 
 struct Scheduler {
@@ -94,7 +96,7 @@ pub fn init() {
     // SAFETY: called once, before any other task exists.
     unsafe {
         *SCHEDULER.0.get() = Some(Scheduler {
-            tasks: alloc::vec![Task { id: 0, name: "kernel".into(), state: State::Ready, rsp: 0, stack: None, entry: None, tty: None, user: None }],
+            tasks: alloc::vec![Task { id: 0, name: "kernel".into(), state: State::Ready, rsp: 0, stack: None, entry: None, tty: None, user: None, runs: 0 }],
             current: 0,
             next_id: 1,
         });
@@ -121,7 +123,7 @@ pub fn spawn_with_tty(name: &str, tty: Option<crate::tty::TtyRef>, f: impl FnOnc
     unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), rsp as *mut u64, frame.len()) };
     let id = s.next_id;
     s.next_id += 1;
-    s.tasks.push(Task { id, name: name.into(), state: State::Ready, rsp, stack: Some(stack), entry: Some(Box::new(f)), tty, user: None });
+    s.tasks.push(Task { id, name: name.into(), state: State::Ready, rsp, stack: Some(stack), entry: Some(Box::new(f)), tty, user: None, runs: 0 });
     id
 }
 
@@ -210,6 +212,7 @@ fn schedule() {
             Some(next) => {
                 s.tasks[next].state = State::Ready;
                 if next != s.current {
+                    s.tasks[next].runs += 1;
                     let old = s.current;
                     s.current = next;
                     crate::process::switch_out(s.tasks[old].user.as_deref_mut());
@@ -300,16 +303,18 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
                     let futex = if u.in_syscall & 0x1000 != 0 { matches!(n, 240 | 422) } else { n == 202 };
                     let what = if fd_call {
                         alloc::format!(" fd {} = {}", u.syscall_arg, crate::linux::describe_fd(&u.process, u.syscall_arg))
+                    } else if u.wake_at != 0 && matches!(n, 35 | 230 | 267 | 162 | 407) {
+                        alloc::format!(" wake at {} ms, now {} ms", u.wake_at / 1_000_000, crate::pit::nanos() / 1_000_000)
                     } else if futex {
                         alloc::format!(" futex {:#x} op {}", u.syscall_arg, u.syscall_arg2)
                     } else {
                         String::new()
                     };
-                    alloc::format!("{} (in syscall {}{}{what})", t.name, n, if u.in_syscall & 0x1000 != 0 { " i386" } else { "" })
+                    alloc::format!("{} (in syscall {}{}{what}, {})", t.name, n, if u.in_syscall & 0x1000 != 0 { " i386" } else { "" }, u.phase)
                 }
                 _ => t.name.clone(),
             };
-            (t.id, name, state)
+            (t.id, alloc::format!("{name} [runs {}, {:?}]", t.runs, t.state), state)
         })
         .collect()
 }

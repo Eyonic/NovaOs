@@ -625,6 +625,25 @@ impl Namespace {
     }
 }
 
+/// Write a whole file at canonical path `p` in the initial namespace (kernel use: the
+/// `wayland save` command), creating it if needed.
+pub fn write_file(p: &str, data: &[u8]) -> Result<(), i64> {
+    let ns = root();
+    let (m, rel) = ns.find_mount(p);
+    if m.fs.lstat(&rel).is_err() {
+        m.fs.create(&rel, 0o644)?;
+    }
+    match m.fs.open(&rel)? {
+        Content::Shared(s) => {
+            let mut s = s.lock();
+            s.truncate(0);
+            s.write(0, data);
+            Ok(())
+        }
+        _ => m.fs.write_back(&rel, data),
+    }
+}
+
 // ---------------------------------------------------------------- NovaFS
 
 /// NovaFS and the system files, with symbolic links, permissions and empty directories

@@ -169,16 +169,27 @@ if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
     mkdir -p "$SYSROOT/etc/ssl/certs"
     cp -L /etc/ssl/certs/ca-certificates.crt "$SYSROOT/etc/ssl/certs/"
 fi
+# PulseAudio clients (Steam): Nova has no sound server yet, and each failed connection
+# attempt reserves a shared memory pool (64 MiB by default; Steam's 32-bit client retries
+# every fraction of a second until it runs out of address space). Keep the pools small.
+mkdir -p "$SYSROOT/etc/pulse"
+printf 'shm-size-bytes = 262144\n' > "$SYSROOT/etc/pulse/client.conf"
 # The rest of glibc (64- and 32-bit): libraries that older programs and Steam's runtime
 # link (libdl, librt, libpthread are stubs in today's glibc), and /bin/bash.
 for dir in /usr/lib /usr/lib32; do
     for lib in libc.so.6 libdl.so.2 librt.so.1 libpthread.so.0 libutil.so.1 libresolv.so.2 libanl.so.1 libm.so.6 \
-               libnss_files.so.2 libnss_dns.so.2 libgcc_s.so.1 libstdc++.so.6 libz.so.1; do
+               libnss_files.so.2 libnss_dns.so.2 libgcc_s.so.1 libstdc++.so.6 libz.so.1 libnsl.so.1 libnsl.so.3; do
         [[ -f "$dir/$lib" ]] && { mkdir -p "$SYSROOT$dir"; cp -L "$dir/$lib" "$SYSROOT$dir/$lib"; }
     done
 done
 [[ -f /usr/lib32/ld-linux.so.2 ]] && { mkdir -p "$SYSROOT/usr/lib32" "$SYSROOT/lib"; cp -L /usr/lib32/ld-linux.so.2 "$SYSROOT/usr/lib32/"; [[ -e "$SYSROOT/lib/ld-linux.so.2" ]] || cp -L /usr/lib32/ld-linux.so.2 "$SYSROOT/lib/"; }
 [[ -x "$SYSROOT/usr/bin/bash" ]] && { mkdir -p "$SYSROOT/bin"; ln -sf ../usr/bin/bash "$SYSROOT/bin/bash"; }
+# glibc's ldd (a bash script; Steam checks its libraries with it) and the loader paths it
+# names.
+if [[ -f /usr/bin/ldd ]]; then
+    cp /usr/bin/ldd "$SYSROOT/usr/bin/ldd"
+    [[ -f /usr/lib32/ld-linux.so.2 && ! -e "$SYSROOT/usr/lib/ld-linux.so.2" ]] && { mkdir -p "$SYSROOT/usr/lib"; ln -s ../lib32/ld-linux.so.2 "$SYSROOT/usr/lib/ld-linux.so.2"; }
+fi
 # ldconfig (Steam's runtime lists the system libraries with it), its configuration, and the
 # compiled locales (the host's locale-archive).
 if [[ -x /usr/bin/ldconfig ]]; then
@@ -207,10 +218,15 @@ copy_with_deps() {
         done
     done
 }
-# The host's 32-bit OpenGL stack (libglvnd + Mesa with its software rasterizer): 32-bit
-# programs (Steam's steamui.so) link libGL; the graphics driver always comes from the
+# NOVA_STEAM=1: the host's OpenGL stacks (libglvnd + Mesa with its software rasterizer,
+# about 200 MB each), for Steam. 32-bit programs (steamui.so) link libGL, and Xwayland
+# offers GLX through Mesa's swrast driver; the graphics driver always comes from the
 # system, not from Steam's runtime.
-if [[ -f /usr/lib32/libGL.so.1 ]]; then
+if [[ "${NOVA_STEAM:-0}" == 1 && -f /usr/lib/libGL.so.1 ]]; then
+    copy_with_deps /usr/lib/libGL.so.1 /usr/lib/libGLX.so.0 /usr/lib/libGLdispatch.so.0 /usr/lib/libGLX_mesa.so.0 \
+        /usr/lib/libEGL.so.1 /usr/lib/libEGL_mesa.so.0 /usr/lib/libgbm.so.1 /usr/lib/dri/swrast_dri.so /usr/lib/dri/kms_swrast_dri.so
+fi
+if [[ "${NOVA_STEAM:-0}" == 1 && -f /usr/lib32/libGL.so.1 ]]; then
     copy_with_deps /usr/lib32/libGL.so.1 /usr/lib32/libGLX.so.0 /usr/lib32/libGLdispatch.so.0 /usr/lib32/libGLX_mesa.so.0 \
         /usr/lib32/libEGL.so.1 /usr/lib32/libEGL_mesa.so.0 /usr/lib32/libva.so.2 /usr/lib32/libdrm.so.2 \
         /usr/lib32/dri/swrast_dri.so /usr/lib32/dri/kms_swrast_dri.so
@@ -277,6 +293,13 @@ if [[ -x "$BUILD/busybox/busybox" ]]; then
 fi
 # The dynamic loader looks in /usr/lib: make sure every library is there.
 if [[ -d "$SYSROOT/usr/lib64" ]]; then mkdir -p "$SYSROOT/usr/lib"; cp -n "$SYSROOT"/usr/lib64/* "$SYSROOT/usr/lib/" 2>/dev/null || true; fi
+
+# The dynamic linker's cache for the image's own libraries (Steam's container tools read
+# it to find the graphics drivers).
+if [[ -x /usr/bin/ldconfig && -f "$SYSROOT/etc/ld.so.conf" ]]; then
+    ldconfig -r "$SYSROOT" -X 2>/dev/null || true
+    [[ -f "$SYSROOT/etc/ld.so.cache" ]] && { mkdir -p "$SYSROOT/var/cache/ldconfig"; ln -sf ../../../etc/ld.so.cache "$SYSROOT/var/cache/ldconfig/ld.so.cache"; }
+fi
 
 "$ROOT/scripts/mkimage.sh" "$IMAGE" "${NOVA_CMDLINE:-}" || fail "image creation failed (log: $BUILD_LOG)"
 log "Image ready: $IMAGE (build log: $BUILD_LOG)"

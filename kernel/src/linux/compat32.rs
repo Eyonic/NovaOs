@@ -94,7 +94,9 @@ pub fn syscall32(f: &mut Frame32) -> i64 {
     thread().in_syscall = 0x1000 | nr; // i386 numbers shown as 0x1000 + nr
     thread().syscall_arg = a0;
     thread().syscall_arg2 = a1;
+    thread().phase = "convert";
     let r = res(convert(f, nr, a0, a1, a2, a3, a4, a5));
+    thread().phase = "returned";
     thread().in_syscall = u64::MAX;
     if trace {
         crate::log::info(&alloc::format!("[{}] i386 {}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}, {a4:#x}) = {r}", thread().tid, name32(nr)));
@@ -121,7 +123,7 @@ fn wr32(addr: u64, v: u32) -> Result<(), i64> {
 }
 
 /// Size of each 32-bit thread's scratch mapping.
-const SCRATCH_SIZE: u64 = 256 * 1024;
+const SCRATCH_SIZE: u64 = super::COMPAT_SCRATCH_SIZE;
 
 /// A user buffer in Nova's own (64-bit) layout for a call whose result is converted: the
 /// 64-bit implementation writes here. It is a private mapping per thread (below 4 GiB is
@@ -133,7 +135,7 @@ fn scratch(_f: &Frame32, len: u64) -> Result<u64, i64> {
     }
     let t = thread();
     if t.compat_scratch == 0 {
-        t.compat_scratch = mem().reserve(SCRATCH_SIZE);
+        t.compat_scratch = mem().reserve_kernel_only(SCRATCH_SIZE).ok_or(super::ENOMEM_ERR)?;
     }
     let addr = (t.compat_scratch + SCRATCH_SIZE - len) & !15;
     if !mem().ensure(addr, len, true) {
@@ -490,6 +492,47 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
             };
             if nr == 320 { native(f, 280, [sx(a0) as u64, a1, t64, a3, 0, 0]) } else { native(f, 280, [AT_FDCWD as u64, a0, t64, 0, 0, 0]) }
         }
+        93 => native(f, 77, [a0, a1 as u32 as u64, 0, 0, 0, 0]), // ftruncate (32-bit length)
+        324 => native(f, 285, [a0, a1, a2 | a3 << 32, a4 | a5 << 32, 0, 0]), // fallocate (64-bit offset and length in register pairs)
+        312 => {
+            // get_robust_list(pid, head**, len*): the caller's own (Steam checks it)
+            if a0 != 0 && a0 != thread().tid {
+                return Err(EPERM);
+            }
+            wr32(a1, thread().robust_list as u32)?;
+            wr32(a2, 12)?;
+            0
+        }
+        77 => {
+            // getrusage(who, struct rusage32*): Nova does not account usage
+            write_user(a1, &[0u8; 72])?;
+            0
+        }
+        116 => {
+            // sysinfo(struct sysinfo32*): from the x86-64 one, in 4 KiB units
+            let buf = scratch(f, 112)?;
+            let r = native(f, 99, [buf, 0, 0, 0, 0, 0]);
+            if r < 0 {
+                return Err(-r);
+            }
+            let raw = read_user(buf, 112)?;
+            let q = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+            let unit = (u32::from_le_bytes(raw[104..108].try_into().unwrap()).max(1)) as u64;
+            let pages = |v: u64| ((v * unit) / 4096).min(u32::MAX as u64) as u32;
+            let mut out = Vec::new();
+            for v in [q(0) as u32, q(1) as u32, q(2) as u32, q(3) as u32, pages(q(4)), pages(q(5)), pages(q(6)), pages(q(7)), pages(q(8)), pages(q(9))] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out.extend_from_slice(&(u16::from_le_bytes(raw[80..82].try_into().unwrap())).to_le_bytes());
+            out.extend_from_slice(&[0u8; 2]);
+            out.extend_from_slice(&0u32.to_le_bytes()); // totalhigh
+            out.extend_from_slice(&0u32.to_le_bytes()); // freehigh
+            out.extend_from_slice(&4096u32.to_le_bytes()); // mem_unit
+            out.resize(64, 0);
+            write_user(a0, &out)?;
+            0
+        }
+        92 => native(f, 76, [a0, a1 as u32 as u64, 0, 0, 0, 0]), // truncate
         241 | 242 => native(f, if nr == 241 { 203 } else { 204 }, [a0, a1, a2, 0, 0, 0]), // sched_setaffinity, sched_getaffinity
         371 => native(f, 45, [a0, a1, a2, a3, a4, a5]), // recvfrom
         370 => {
@@ -511,7 +554,12 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
         394 => super::sysv::semctl(a0 as i32, a1, a2 & !0x100, a3, true)?,
         396 => super::sysv::shmctl(a0 as i32, a1 & !0x100, a2, true)?,
         397 => super::sysv::shmat(a0 as i32, a1, a2)? as i64,
-        311 => 0, // set_robust_list (robust futexes are not cleaned up at exit yet)
+        311 => {
+            // set_robust_list(head, len): remembered for get_robust_list (robust futexes are
+            // not cleaned up at exit yet)
+            thread().robust_list = a0;
+            0
+        }
         244 => {
             // get_thread_area
             let entry = rd32(a0)? as usize;

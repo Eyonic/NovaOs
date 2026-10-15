@@ -55,6 +55,8 @@ pub fn wait(deadline: Option<u64>) {
 pub struct Message {
     pub data: Vec<u8>,
     pub fds: Vec<FileRef>,
+    /// Sending process (SCM_CREDENTIALS); 0 for the kernel's own servers.
+    pub pid: u32,
 }
 
 #[derive(Default)]
@@ -66,6 +68,8 @@ pub struct Channel {
     /// No reader left.
     pub reader_closed: bool,
     pub generation: u64,
+    /// Sender of the last message read (for SCM_CREDENTIALS).
+    pub last_sender: u32,
 }
 
 pub type ChannelRef = Arc<SpinLock<Channel>>;
@@ -93,6 +97,9 @@ impl Channel {
         let mut fds = Vec::new();
         while out.len() < max {
             let Some(front) = self.queue.front_mut() else { break };
+            if out.is_empty() && fds.is_empty() {
+                self.last_sender = front.pid;
+            }
             // Like Linux, never merge data across a message that carries descriptors:
             // they must arrive with the bytes they were sent with.
             if !out.is_empty() && !front.fds.is_empty() {
@@ -116,6 +123,7 @@ impl Channel {
     /// Datagram read: one whole message (truncated to `max`).
     pub fn read_message(&mut self, max: usize) -> Option<(Vec<u8>, Vec<FileRef>, bool)> {
         let m = self.queue.pop_front()?;
+        self.last_sender = m.pid;
         self.bytes -= m.data.len();
         self.generation = next_gen();
         let truncated = m.data.len() > max;
@@ -137,6 +145,8 @@ pub struct End {
     pub rx: Option<ChannelRef>,
     pub tx: Option<ChannelRef>,
     pub kind: SockType,
+    /// Loopback TCP connection: (local port, peer port), for getsockname/getpeername.
+    pub inet: Option<(u16, u16)>,
 }
 
 impl Drop for End {
@@ -187,13 +197,13 @@ impl End {
 /// A pipe: (read end, write end).
 pub fn pipe() -> (End, End) {
     let c = channel();
-    (End { rx: Some(c.clone()), tx: None, kind: SockType::Stream }, End { rx: None, tx: Some(c), kind: SockType::Stream })
+    (End { rx: Some(c.clone()), tx: None, kind: SockType::Stream, inet: None }, End { rx: None, tx: Some(c), kind: SockType::Stream, inet: None })
 }
 
 /// A connected pair of Unix sockets.
 pub fn socketpair(kind: SockType) -> (End, End) {
     let (a, b) = (channel(), channel());
-    (End { rx: Some(a.clone()), tx: Some(b.clone()), kind }, End { rx: Some(b), tx: Some(a), kind })
+    (End { rx: Some(a.clone()), tx: Some(b.clone()), kind, inet: None }, End { rx: Some(b), tx: Some(a), kind, inet: None })
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +252,11 @@ pub fn bind_name(key: &str, kind: SockType) -> Result<ListenerRef, ()> {
     Ok(l)
 }
 
+/// Whether `key` is bound (a live socket holds it).
+pub fn name_bound(key: &str) -> bool {
+    NAMES.lock().get(key).is_some_and(|w| w.strong_count() > 0)
+}
+
 /// Forget the name (the socket file was removed): new connections fail.
 pub fn unbind_name(key: &str) {
     NAMES.lock().remove(key);
@@ -249,7 +264,8 @@ pub fn unbind_name(key: &str) {
 
 /// Connect to the socket bound at `key`: the client's end, or the error number
 /// (ECONNREFUSED 111, EPROTOTYPE 91, EAGAIN 11 with a full backlog).
-pub fn connect_name(key: &str, kind: SockType) -> Result<End, i64> {
+/// `inet`: a loopback TCP connection's (client port, server port).
+pub fn connect_name(key: &str, kind: SockType, inet: Option<(u16, u16)>) -> Result<End, i64> {
     let l = NAMES.lock().get(key).and_then(|w| w.upgrade()).ok_or(111i64)?;
     let mut l = l.lock();
     if !l.listening {
@@ -261,7 +277,9 @@ pub fn connect_name(key: &str, kind: SockType) -> Result<End, i64> {
     if l.queue.len() >= l.backlog {
         return Err(11);
     }
-    let (client, server) = socketpair(kind);
+    let (mut client, mut server) = socketpair(kind);
+    client.inet = inet;
+    server.inet = inet.map(|(c, s)| (s, c));
     l.queue.push_back(server);
     l.generation = next_gen();
     drop(l);
@@ -425,7 +443,7 @@ impl End {
         if c.reader_closed {
             return Err(());
         }
-        c.push(Message { data: data.to_vec(), fds: Vec::new() });
+        c.push(Message { data: data.to_vec(), fds: Vec::new(), pid: 0 });
         drop(c);
         notify();
         Ok(())

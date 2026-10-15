@@ -44,7 +44,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "install", args: "[disk]", help: "install Nova onto a disk", run: cmd_install },
     Command { name: "run", args: "<file> [args]", help: "run a Linux x86-64 program (C/C++, static or dynamic)", run: cmd_run },
     Command { name: "strace", args: "<file> [args]", help: "run a program, logging its system calls to serial", run: cmd_strace },
-    Command { name: "wayland", args: "", help: "Wayland compositor status: clients and their windows", run: cmd_wayland },
+    Command { name: "wayland", args: "[save <file.ppm>]", help: "Wayland compositor status, or save the largest window as an image", run: cmd_wayland },
     Command { name: "netstat", args: "", help: "TCP sockets: state, endpoints, queued bytes", run: cmd_netstat },
     Command { name: "trace", args: "<pid> on|off", help: "log a running program's system calls to serial", run: cmd_trace },
     Command { name: "browser", args: "[url]", help: "open Nova Browser (Chromium engine)", run: cmd_browser },
@@ -138,8 +138,13 @@ fn cmd_netstat(_: &str, _: &History) {
     }
 }
 
-fn cmd_wayland(_: &str, _: &History) {
-    println!("{}", crate::wayland::status());
+fn cmd_wayland(args: &str, _: &History) {
+    match args.split_whitespace().collect::<alloc::vec::Vec<_>>().as_slice() {
+        ["save", path] => match crate::wayland::save(path) {
+            Ok(m) | Err(m) => println!("{m}"),
+        },
+        _ => println!("{}", crate::wayland::status()),
+    }
 }
 
 fn cmd_strace(args: &str, _: &History) {

@@ -26,7 +26,7 @@ const BOLD: &str = "\x1b[1m";
 const GREEN: &str = "\x1b[32m";
 const ORANGE: &str = "\x1b[33m";
 
-fn cmdline_flag(name: &str) -> Option<&'static str> {
+pub fn cmdline_flag(name: &str) -> Option<&'static str> {
     limine::EXECUTABLE_CMDLINE.get()?.split_whitespace().find_map(|a| a.strip_prefix(name)?.strip_prefix('='))
 }
 
@@ -215,6 +215,7 @@ pub fn run() -> ! {
     if cmdline_flag("nova.mode") == Some("shell") || crate::console::screen().is_none() {
         println!("[nova] starting shell");
         crate::wayland::start(); // headless: no windows, the `wayland` command shows clients
+        crate::pulse::start();
         loop {
             crate::shell::run();
         }

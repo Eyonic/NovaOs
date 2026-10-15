@@ -367,7 +367,10 @@ extern "C" fn exception_dispatch(frame: &ExceptionFrame) {
     if frame.cs & 3 == 3 {
         match frame.vector {
             14 if crate::process::page_fault(cr2, frame.error_code) => return,
-            14 => crate::process::fault("segmentation fault", frame.rip, Some(cr2)),
+            14 => {
+                crate::process::FAULT_RSP.store(frame.rsp, core::sync::atomic::Ordering::Relaxed);
+                crate::process::fault("segmentation fault", frame.rip, Some(cr2))
+            }
             0 => crate::process::fault("division by zero", frame.rip, None),
             6 => crate::process::fault("illegal instruction", frame.rip, None),
             13 => crate::process::fault("segmentation fault (general protection)", frame.rip, None),

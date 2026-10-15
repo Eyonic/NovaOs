@@ -441,6 +441,7 @@ pub fn start() -> bool {
     *SCREEN_SIZE.lock() = (screen.width as i32, screen.height as i32);
     RUNNING.store(true, Ordering::Relaxed);
     crate::wayland::start();
+    crate::pulse::start();
     crate::console::suspend();
     task::spawn("desktop", move || {
         let mut home = crate::home::Home::new(screen.width as i32, screen.height as i32);

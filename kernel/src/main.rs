@@ -43,6 +43,7 @@ mod net;
 mod pci;
 mod pic;
 mod pit;
+mod pulse;
 mod port;
 mod power;
 mod process;

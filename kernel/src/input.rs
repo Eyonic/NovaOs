@@ -32,7 +32,7 @@ pub enum Key {
     F1,
 }
 
-const RING_SIZE: usize = 256; // power of two
+const RING_SIZE: usize = 4096; // power of two (serial input can arrive a long line at a time)
 
 pub struct Ring {
     buf: UnsafeCell<[u8; RING_SIZE]>,
