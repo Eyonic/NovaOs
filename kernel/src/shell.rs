@@ -45,6 +45,8 @@ const COMMANDS: &[Command] = &[
     Command { name: "run", args: "<file> [args]", help: "run a Linux x86-64 program (C/C++, static or dynamic)", run: cmd_run },
     Command { name: "strace", args: "<file> [args]", help: "run a program, logging its system calls to serial", run: cmd_strace },
     Command { name: "wayland", args: "", help: "Wayland compositor status: clients and their windows", run: cmd_wayland },
+    Command { name: "netstat", args: "", help: "TCP sockets: state, endpoints, queued bytes", run: cmd_netstat },
+    Command { name: "trace", args: "<pid> on|off", help: "log a running program's system calls to serial", run: cmd_trace },
     Command { name: "browser", args: "[url]", help: "open Nova Browser (Chromium engine)", run: cmd_browser },
     Command { name: "download", args: "<url> <file>", help: "save a URL to a file (e.g. a Shields filter list)", run: cmd_download },
     Command { name: "crash", args: "<case>", help: "trigger a CPU exception or panic", run: cmd_crash },
@@ -111,6 +113,29 @@ fn cmd_browser(args: &str, _: &History) {
         return;
     }
     crate::browser::launch(if args.is_empty() { None } else { Some(String::from(args)) });
+}
+
+fn cmd_trace(args: &str, _: &History) {
+    let mut it = args.split_whitespace();
+    let (Some(pid), on) = (it.next().and_then(|p| p.parse::<u64>().ok()), it.next() != Some("off")) else {
+        println!("usage: trace <pid> on|off");
+        return;
+    };
+    match crate::process::find(pid) {
+        Some(p) => {
+            p.trace.store(on, core::sync::atomic::Ordering::Relaxed);
+            println!("tracing of process {pid} ({}) {}", p.name, if on { "on" } else { "off" });
+        }
+        None => println!("no process {pid}"),
+    }
+}
+
+fn cmd_netstat(_: &str, _: &History) {
+    let (rx, tx) = crate::net::counters();
+    println!("received {rx} bytes, sent {tx} bytes");
+    for line in crate::net::tcp_sockets() {
+        println!("{line}");
+    }
 }
 
 fn cmd_wayland(_: &str, _: &History) {

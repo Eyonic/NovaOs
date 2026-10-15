@@ -53,6 +53,8 @@ pub enum Type {
     Lnk,
     /// Character device (DevFs): opening it gives the device named by Content::Device.
     Chr,
+    /// Named pipe (mkfifo).
+    Fifo,
 }
 
 impl Type {
@@ -63,6 +65,7 @@ impl Type {
             Type::Dir => 0o040000,
             Type::Lnk => 0o120000,
             Type::Chr => 0o020000,
+            Type::Fifo => 0o010000,
         }
     }
     /// The d_type of a directory entry.
@@ -72,6 +75,7 @@ impl Type {
             Type::Dir => 4,
             Type::Lnk => 10,
             Type::Chr => 2,
+            Type::Fifo => 1,
         }
     }
 }
@@ -133,6 +137,10 @@ pub trait Backend: Send + Sync {
     /// Rename within this backend, replacing a non-directory (or empty directory) target.
     fn rename(&self, from: &str, to: &str) -> Result<(), i64>;
     fn symlink(&self, target: &str, p: &str) -> Result<(), i64>;
+    /// A named pipe (mkfifo).
+    fn mkfifo(&self, _p: &str, _perm: u32) -> Result<(), i64> {
+        Err(EPERM)
+    }
     /// A hard link: `to` names the same file as `from`.
     fn link(&self, from: &str, to: &str) -> Result<(), i64>;
     fn chmod(&self, p: &str, perm: u32) -> Result<(), i64>;
@@ -631,6 +639,7 @@ struct NovaMeta {
     links: BTreeMap<String, String>,
     modes: BTreeMap<String, u32>,
     dirs: BTreeMap<String, ()>,
+    fifos: BTreeMap<String, ()>,
 }
 
 const META_FILE: &str = ".nova-vfs";
@@ -656,6 +665,9 @@ impl NovaFsBackend {
                     (Some("D"), Some(p), None) => {
                         m.dirs.insert(p.into(), ());
                     }
+                    (Some("P"), Some(p), None) => {
+                        m.fifos.insert(p.into(), ());
+                    }
                     _ => {}
                 }
             }
@@ -678,6 +690,9 @@ impl NovaFsBackend {
             for p in m.dirs.keys() {
                 text.push_str(&format!("D\t{p}\n"));
             }
+            for p in m.fifos.keys() {
+                text.push_str(&format!("P\t{p}\n"));
+            }
             (r, text)
         });
         crate::fs::write(META_FILE, text.as_bytes()).map_err(|_| ENOSPC)?;
@@ -696,7 +711,12 @@ impl NovaFsBackend {
     }
 
     fn exists(&self, p: &str) -> bool {
-        self.link_target(p).is_some() || self.is_file(p).is_some() || self.is_dir(p)
+        self.link_target(p).is_some() || self.is_file(p).is_some() || self.is_dir(p) || self.with_meta(|m| m.fifos.contains_key(p))
+    }
+
+    /// NovaFS keeps no owners: its files belong to the user, system files to root.
+    fn owner(p: &str) -> u32 {
+        if crate::fs::system_file(p).is_some() { 0 } else { crate::process::NOVA_UID }
     }
 
     fn default_perm(p: &str) -> u32 {
@@ -721,15 +741,20 @@ impl Backend for NovaFsBackend {
 
     fn lstat(&self, p: &str) -> Result<Meta, i64> {
         let ino = ino_of(p);
+        let u = Self::owner(p);
         if let Some(t) = self.link_target(p) {
-            return Ok(Meta { ty: Type::Lnk, perm: 0o777, size: t.len() as u64, mtime: 0, ino, nlink: 1, uid: 0, gid: 0 });
+            return Ok(Meta { ty: Type::Lnk, perm: 0o777, size: t.len() as u64, mtime: 0, ino, nlink: 1, uid: u, gid: u });
         }
         let perm = self.with_meta(|m| m.modes.get(p).copied());
+        if self.with_meta(|m| m.fifos.contains_key(p)) {
+            return Ok(Meta { ty: Type::Fifo, perm: perm.unwrap_or(0o644), size: 0, mtime: 0, ino, nlink: 1, uid: u, gid: u });
+        }
         if let Some((size, mtime)) = self.is_file(p) {
-            return Ok(Meta { ty: Type::Reg, perm: perm.unwrap_or_else(|| Self::default_perm(p)), size, mtime, ino, nlink: 1, uid: 0, gid: 0 });
+            return Ok(Meta { ty: Type::Reg, perm: perm.unwrap_or_else(|| Self::default_perm(p)), size, mtime, ino, nlink: 1, uid: u, gid: u });
         }
         if self.is_dir(p) {
-            return Ok(Meta { ty: Type::Dir, perm: perm.unwrap_or(if p == "tmp" { 0o1777 } else { 0o755 }), size: 4096, mtime: 0, ino, nlink: 2, uid: 0, gid: 0 });
+            let u = if matches!(p, "" | "etc" | "tmp" | "bin" | "usr" | "lib" | "lib64") { 0 } else { u };
+            return Ok(Meta { ty: Type::Dir, perm: perm.unwrap_or(if p == "tmp" { 0o1777 } else { 0o755 }), size: 4096, mtime: 0, ino, nlink: 2, uid: u, gid: u });
         }
         if let Some(text) = crate::linux::etc_file(p) {
             return Ok(Meta { ty: Type::Reg, perm: 0o644, size: text.len() as u64, mtime: 0, ino, nlink: 1, uid: 0, gid: 0 });
@@ -775,6 +800,11 @@ impl Backend for NovaFsBackend {
                     Some((d, _)) => names.insert(d.into(), Type::Dir),
                     None => names.insert(l[prefix.len()..].into(), Type::Lnk),
                 };
+            }
+            for (f, _) in m.fifos.range(prefix.clone()..).take_while(|(f, _)| f.starts_with(&prefix)) {
+                if !f[prefix.len()..].contains('/') {
+                    names.insert(f[prefix.len()..].into(), Type::Fifo);
+                }
             }
             for (d, _) in m.dirs.range(prefix.clone()..).take_while(|(d, _)| d.starts_with(&prefix)) {
                 if let Some(first) = d[prefix.len()..].split('/').next() {
@@ -851,6 +881,11 @@ impl Backend for NovaFsBackend {
                 m.links.remove(p);
             });
         }
+        if self.with_meta(|m| m.fifos.contains_key(p)) {
+            return self.update(|m| {
+                m.fifos.remove(p);
+            });
+        }
         if self.is_file(p).is_none() {
             return Err(if self.is_dir(p) { EISDIR } else { ENOENT });
         }
@@ -924,6 +959,16 @@ impl Backend for NovaFsBackend {
         })
     }
 
+    fn mkfifo(&self, p: &str, perm: u32) -> Result<(), i64> {
+        if self.exists(p) {
+            return Err(EEXIST);
+        }
+        self.update(|m| {
+            m.fifos.insert(p.into(), ());
+            m.modes.insert(p.into(), perm & 0o7777);
+        })
+    }
+
     fn link(&self, from: &str, to: &str) -> Result<(), i64> {
         // NovaFS has no inodes: a hard link is a copy.
         if self.exists(to) {
@@ -984,7 +1029,9 @@ struct Node {
 
 impl Node {
     fn new(ty: Type, perm: u32) -> Self {
-        Self { ty, perm: perm & 0o7777, uid: 0, gid: 0, mtime: now(), nlink: 1, data: (ty == Type::Reg).then(ipc::memfd), children: BTreeMap::new(), target: String::new() }
+        // Owned by whoever creates it (root for the kernel's own files).
+        let (uid, gid) = crate::linux::creator_ids();
+        Self { ty, perm: perm & 0o7777, uid, gid, mtime: now(), nlink: 1, data: (ty == Type::Reg).then(ipc::memfd), children: BTreeMap::new(), target: String::new() }
     }
 }
 
@@ -1001,8 +1048,8 @@ const ROOT_INO: u64 = 1;
 impl TmpFs {
     pub fn new() -> Self {
         let mut nodes = BTreeMap::new();
-        let mut root = Node::new(Type::Dir, 0o755);
-        root.nlink = 2;
+        let mut root = Node::new(Type::Dir, 0o1777);
+        (root.uid, root.gid, root.nlink) = (0, 0, 2);
         nodes.insert(ROOT_INO, root);
         Self { inner: SpinLock::new(nodes), next: AtomicU64::new(2), base: TMPFS_COUNT.fetch_add(1, Ordering::Relaxed) << 40 }
     }
@@ -1080,7 +1127,7 @@ impl Backend for TmpFs {
             Type::Reg => n.data.as_ref().unwrap().lock().size,
             Type::Dir => 4096,
             Type::Lnk => n.target.len() as u64,
-            Type::Chr => 0,
+            Type::Chr | Type::Fifo => 0,
         };
         Ok(Meta { ty: n.ty, perm: n.perm, size, mtime: n.mtime, ino: self.base | ino, nlink: n.nlink, uid: n.uid, gid: n.gid })
     }
@@ -1107,7 +1154,7 @@ impl Backend for TmpFs {
             Type::Reg => Ok(Content::Shared(n.data.clone().unwrap())),
             Type::Dir => Err(EISDIR),
             Type::Lnk => Err(ELOOP),
-            Type::Chr => Err(EINVAL),
+            Type::Chr | Type::Fifo => Err(EINVAL),
         }
     }
 
@@ -1191,6 +1238,10 @@ impl Backend for TmpFs {
         let mut n = Node::new(Type::Lnk, 0o777);
         n.target = target.into();
         self.add(p, n)
+    }
+
+    fn mkfifo(&self, p: &str, perm: u32) -> Result<(), i64> {
+        self.add(p, Node::new(Type::Fifo, perm))
     }
 
     fn link(&self, from: &str, to: &str) -> Result<(), i64> {

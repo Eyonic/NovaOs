@@ -91,7 +91,11 @@ pub fn syscall32(f: &mut Frame32) -> i64 {
     let nr = f.rax & 0xFFFF_FFFF;
     let [a0, a1, a2, a3, a4, a5] = a(f);
     let trace = proc().trace.load(core::sync::atomic::Ordering::Relaxed);
+    thread().in_syscall = 0x1000 | nr; // i386 numbers shown as 0x1000 + nr
+    thread().syscall_arg = a0;
+    thread().syscall_arg2 = a1;
     let r = res(convert(f, nr, a0, a1, a2, a3, a4, a5));
+    thread().in_syscall = u64::MAX;
     if trace {
         crate::log::info(&alloc::format!("[{}] i386 {}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}, {a4:#x}) = {r}", thread().tid, name32(nr)));
     }
@@ -116,10 +120,22 @@ fn wr32(addr: u64, v: u32) -> Result<(), i64> {
     write_user(addr, &v.to_le_bytes())
 }
 
+/// Size of each 32-bit thread's scratch mapping.
+const SCRATCH_SIZE: u64 = 256 * 1024;
+
 /// A user buffer in Nova's own (64-bit) layout for a call whose result is converted: the
-/// 64-bit implementation writes here, below the program's stack pointer, inside its stack.
-fn scratch(f: &Frame32, len: u64) -> Result<u64, i64> {
-    let addr = (f.rsp - 4096 - len) & !15;
+/// 64-bit implementation writes here. It is a private mapping per thread (below 4 GiB is
+/// not needed: only the kernel touches it), never the program's stack, which may be small.
+/// Every call uses the end of it, so one call's buffers must come from one scratch().
+fn scratch(_f: &Frame32, len: u64) -> Result<u64, i64> {
+    if len > SCRATCH_SIZE {
+        return Err(EINVAL);
+    }
+    let t = thread();
+    if t.compat_scratch == 0 {
+        t.compat_scratch = mem().reserve(SCRATCH_SIZE);
+    }
+    let addr = (t.compat_scratch + SCRATCH_SIZE - len) & !15;
     if !mem().ensure(addr, len, true) {
         return Err(EFAULT);
     }
@@ -357,6 +373,9 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
                 if flags & super::CLONE_NEWNS != 0 {
                     process::unshare_ns(pid);
                 }
+                if flags & super::CLONE_NEWUSER != 0 {
+                    process::unshare_user(pid);
+                }
                 if flags & CLONE_PARENT_SETTID != 0 {
                     wr32(ptid, pid as u32)?;
                 }
@@ -380,6 +399,118 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
             process::fork(&sf, nr == 190, 0, None)? as i64
         }
         243 => set_thread_area(a0)?,
+        126 => {
+            // sigprocmask(how, set, old) with 32-bit (old-style) signal sets
+            let buf = scratch(f, 16)?;
+            let set = if a1 != 0 { write_user(buf, &(rd32(a1)? as u64).to_le_bytes())?; buf } else { 0 };
+            let r = native(f, 14, [a0, set, if a2 != 0 { buf + 8 } else { 0 }, 8, 0, 0]);
+            if r < 0 {
+                return Err(-r);
+            }
+            if a2 != 0 {
+                wr32(a2, read_u64(buf + 8)? as u32)?;
+            }
+            0
+        }
+        117 => {
+            // ipc(call, first, second, third, ptr, fifth): the SysV IPC multiplexer
+            let (call, first, second, third, ptr, fifth) = (a0 & 0xFFFF, a1, a2, a3, a4, a5);
+            match call {
+                1 => super::sysv::semop(first as i32, ptr, second, None)?,
+                2 => super::sysv::semget(first as i32, second, third)?,
+                3 => super::sysv::semctl(first as i32, second, third & !0x100, if ptr == 0 { 0 } else { rd32(ptr)? as u64 }, true)?,
+                4 => {
+                    let d = if fifth == 0 { None } else { Some(crate::pit::ticks() + (rd32(fifth)? as u64 * 1000 + rd32(fifth + 4)? as u64 / 1_000_000).max(1)) };
+                    super::sysv::semop(first as i32, ptr, second, d)?
+                }
+                21 => {
+                    let va = super::sysv::shmat(first as i32, ptr, second)?;
+                    wr32(third, va as u32)?;
+                    0
+                }
+                22 => super::sysv::shmdt(ptr)?,
+                23 => super::sysv::shmget(first as i32, second, third)?,
+                24 => super::sysv::shmctl(first as i32, second & !0x100, ptr, true)?,
+                _ => return Err(ENOSYS),
+            }
+        }
+        268 | 269 | 99 | 100 => {
+            // statfs64(path, size, buf), fstatfs64(fd, size, buf), statfs, fstatfs: from the
+            // x86-64 struct statfs (all 8-byte fields)
+            let buf = scratch(f, 128)?;
+            let r = native(f, if nr == 268 || nr == 99 { 137 } else { 138 }, [a0, buf, 0, 0, 0, 0]);
+            if r < 0 {
+                return Err(-r);
+            }
+            let raw = read_user(buf, 120)?;
+            let q = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap());
+            let mut out = Vec::new();
+            let wide = nr == 268 || nr == 269;
+            out.extend_from_slice(&(q(0) as u32).to_le_bytes());
+            out.extend_from_slice(&(q(1) as u32).to_le_bytes());
+            for i in 2..7 {
+                if wide { out.extend_from_slice(&q(i).to_le_bytes()) } else { out.extend_from_slice(&(q(i).min(u32::MAX as u64) as u32).to_le_bytes()) }
+            }
+            out.extend_from_slice(&q(7).to_le_bytes()); // fsid
+            for i in 8..11 {
+                out.extend_from_slice(&(q(i) as u32).to_le_bytes());
+            }
+            out.resize(if wide { 84 } else { 64 }, 0);
+            write_user(if wide { a2 } else { a1 }, &out)?;
+            0
+        }
+        142 | 308 => {
+            // _newselect(n, r, w, e, timeval32*), pselect6(n, r, w, e, timespec32*, sigmask)
+            let d = if a4 == 0 {
+                None
+            } else {
+                let (sec, frac) = (rd32(a4)? as u64, rd32(a4 + 4)? as u64);
+                let us = sec * 1_000_000 + if nr == 142 { frac } else { frac / 1000 };
+                Some(crate::pit::ticks() + us.div_ceil(1_000_000 / crate::pit::HZ))
+            };
+            super::select_fds(a0 as usize, a1, a2, a3, d)?
+        }
+        320 | 271 | 30 => {
+            // utimensat(dirfd, path, timespec32[2], flags), utimes(path, timeval32[2]),
+            // utime(path, utimbuf32 { actime, modtime })
+            let times = if nr == 320 { a2 } else { a1 };
+            let t64 = if times == 0 {
+                0
+            } else {
+                let buf = scratch(f, 32)?;
+                let (a_s, a_f, m_s, m_f) = if nr == 30 {
+                    (rd32(times)? as i32 as i64, 0, rd32(times + 4)? as i32 as i64, 0)
+                } else {
+                    (rd32(times)? as i32 as i64, rd32(times + 4)? as i32 as i64, rd32(times + 8)? as i32 as i64, rd32(times + 12)? as i32 as i64)
+                };
+                // utimes gives microseconds; the x86-64 utimensat call takes nanoseconds.
+                let scale = if nr == 271 { 1000 } else { 1 };
+                write_user(buf, &[a_s, a_f * scale, m_s, m_f * scale].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
+                buf
+            };
+            if nr == 320 { native(f, 280, [sx(a0) as u64, a1, t64, a3, 0, 0]) } else { native(f, 280, [AT_FDCWD as u64, a0, t64, 0, 0, 0]) }
+        }
+        241 | 242 => native(f, if nr == 241 { 203 } else { 204 }, [a0, a1, a2, 0, 0, 0]), // sched_setaffinity, sched_getaffinity
+        371 => native(f, 45, [a0, a1, a2, a3, a4, a5]), // recvfrom
+        370 => {
+            // sendmsg(fd, msghdr32*, flags)
+            let (m, _, _) = msghdr64(f, a1, false)?;
+            native(f, 46, [a0, m, a2, 0, 0, 0])
+        }
+        372 => {
+            // recvmsg(fd, msghdr32*, flags)
+            let (m, _, _) = msghdr64(f, a1, true)?;
+            let r = native(f, 47, [a0, m, a2, 0, 0, 0]);
+            if r >= 0 {
+                msghdr32_out(a1, m)?;
+            }
+            r
+        }
+        365 => native(f, 55, [a0, a1, a2, a3, a4, 0]), // getsockopt
+        366 => native(f, 54, [a0, a1, a2, a3, a4, 0]), // setsockopt
+        394 => super::sysv::semctl(a0 as i32, a1, a2 & !0x100, a3, true)?,
+        396 => super::sysv::shmctl(a0 as i32, a1 & !0x100, a2, true)?,
+        397 => super::sysv::shmat(a0 as i32, a1, a2)? as i64,
         311 => 0, // set_robust_list (robust futexes are not cleaned up at exit yet)
         244 => {
             // get_thread_area
@@ -461,6 +592,15 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
                 14 => 54, // setsockopt
                 15 => 55, // getsockopt
                 18 => 288, // accept4
+                16 | 17 => {
+                    // sendmsg, recvmsg
+                    let (m, _, _) = msghdr64(f, w(1), a0 == 17)?;
+                    let r = native(f, if a0 == 16 { 46 } else { 47 }, [w(0), m, w(2), 0, 0, 0]);
+                    if a0 == 17 && r >= 0 {
+                        msghdr32_out(w(1), m)?;
+                    }
+                    return Ok(r);
+                }
                 _ => return Err(EINVAL),
             };
             native(f, nr64, [w(0), w(1), w(2), w(3), w(4), w(5)])
@@ -470,6 +610,102 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
             return Err(ENOSYS);
         }
     })
+}
+
+// ---------------------------------------------------------------- sendmsg / recvmsg
+
+/// struct msghdr (i386: seven 32-bit fields) as the x86-64 one, laid out in one scratch
+/// block: msghdr (56 bytes), iovecs, then the control buffer. Control messages (cmsghdr:
+/// 32-bit length on i386, 64-bit on x86-64) are converted for sendmsg. Returns (scratch
+/// address of the msghdr, control buffer address, its capacity).
+fn msghdr64(f: &Frame32, m: u64, for_recv: bool) -> Result<(u64, u64, u64), i64> {
+    let h = read_user(m, 28)?;
+    let w = |i: usize| u32::from_le_bytes(h[i * 4..i * 4 + 4].try_into().unwrap()) as u64;
+    let (name, namelen, iov, iovlen, control, controllen) = (w(0), w(1), w(2), w(3), w(4), w(5));
+    if iovlen > 1024 || controllen > 65536 {
+        return Err(EINVAL);
+    }
+    // Control messages: 32-bit headers (len, level, type) and 4-byte alignment on i386;
+    // 64-bit length and 8-byte alignment on x86-64.
+    let mut ctl = Vec::new();
+    if !for_recv && control != 0 && controllen >= 12 {
+        let raw = read_user(control, controllen as usize)?;
+        let mut at = 0;
+        while at + 12 <= raw.len() {
+            let len = u32::from_le_bytes(raw[at..at + 4].try_into().unwrap()) as usize;
+            if len < 12 || at + len > raw.len() {
+                break;
+            }
+            let data = &raw[at + 12..at + len];
+            ctl.extend_from_slice(&((16 + data.len()) as u64).to_le_bytes());
+            ctl.extend_from_slice(&raw[at + 4..at + 12]); // level, type
+            ctl.extend_from_slice(data);
+            ctl.resize(ctl.len().next_multiple_of(8), 0);
+            at += len.next_multiple_of(4);
+        }
+    }
+    let ctl_cap = if for_recv { controllen * 2 + 64 } else { ctl.len() as u64 };
+    let total = 56 + iovlen * 16 + ctl_cap;
+    let base = scratch(f, total)?;
+    let (iov64, ctl64) = (base + 56, base + 56 + iovlen * 16);
+    let raw = read_user(iov, iovlen as usize * 8)?;
+    let mut b = Vec::with_capacity(iovlen as usize * 16);
+    for c in raw.chunks_exact(8) {
+        b.extend_from_slice(&(u32::from_le_bytes(c[0..4].try_into().unwrap()) as u64).to_le_bytes());
+        b.extend_from_slice(&(u32::from_le_bytes(c[4..8].try_into().unwrap()) as u64).to_le_bytes());
+    }
+    write_user(iov64, &b)?;
+    if !ctl.is_empty() {
+        write_user(ctl64, &ctl)?;
+    }
+    let has_ctl = if for_recv { control != 0 } else { !ctl.is_empty() };
+    let mut hdr = Vec::with_capacity(56);
+    for v in [name, namelen, iov64, iovlen, if has_ctl { ctl64 } else { 0 }, if has_ctl { ctl_cap } else { 0 }, 0] {
+        hdr.extend_from_slice(&v.to_le_bytes());
+    }
+    // namelen and flags are 32-bit fields followed by padding in the x86-64 layout.
+    write_user(base, &hdr)?;
+    Ok((base, ctl64, ctl_cap))
+}
+
+/// After recvmsg: copy namelen, flags and the (converted) control messages back.
+fn msghdr32_out(m: u64, base: u64) -> Result<(), i64> {
+    let h = read_user(base, 56)?;
+    let q = |i: usize| u64::from_le_bytes(h[i * 8..i * 8 + 8].try_into().unwrap());
+    let (namelen, ctl64, ctllen, flags) = (q(1) as u32, q(4), q(5), q(6) as u32);
+    wr32(m + 4, namelen)?;
+    let control = rd32(m + 16)? as u64;
+    let cap = rd32(m + 20)? as usize;
+    let mut out = Vec::new();
+    let mut truncated = false;
+    if ctl64 != 0 && ctllen > 0 {
+        let raw = read_user(ctl64, ctllen as usize)?;
+        let mut at = 0;
+        while at + 16 <= raw.len() {
+            let len = u64::from_le_bytes(raw[at..at + 8].try_into().unwrap()) as usize;
+            if len < 16 || at + len > raw.len() {
+                break;
+            }
+            let data = &raw[at + 16..at + len];
+            let mut c = Vec::new();
+            c.extend_from_slice(&((12 + data.len()) as u32).to_le_bytes());
+            c.extend_from_slice(&raw[at + 8..at + 16]);
+            c.extend_from_slice(data);
+            c.resize(c.len().next_multiple_of(4), 0);
+            if out.len() + c.len() > cap {
+                truncated = true;
+                break;
+            }
+            out.extend_from_slice(&c);
+            at += len.next_multiple_of(8);
+        }
+    }
+    if control != 0 && !out.is_empty() {
+        write_user(control, &out)?;
+    }
+    wr32(m + 20, out.len() as u32)?;
+    wr32(m + 24, flags | if truncated { 8 } else { 0 })?; // MSG_CTRUNC
+    Ok(())
 }
 
 // ---------------------------------------------------------------- signals

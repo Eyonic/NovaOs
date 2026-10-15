@@ -331,6 +331,60 @@ pub struct Process {
     pub vfork_done: AtomicBool,
     /// Mount namespace (shared with the parent unless unshared).
     pub ns: SpinLock<Arc<crate::vfs::Namespace>>,
+    /// User and group ids (Nova does not check them against file permissions).
+    pub cred: SpinLock<Cred>,
+}
+
+/// Credentials of a process. Ids are kept as seen from the initial user namespace; in a
+/// user namespace (unshare/clone with CLONE_NEWUSER) the uid_map/gid_map written for the
+/// process translate them for the system calls.
+#[derive(Clone)]
+pub struct Cred {
+    pub uid: u32,
+    pub euid: u32,
+    pub suid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub sgid: u32,
+    pub groups: Vec<u32>,
+    /// In a user namespace: (inside, outside, count) maps, with `outside` in the initial
+    /// namespace's ids; None outside one.
+    pub userns: Option<(Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>)>,
+    /// The enclosing namespace's maps while a nested one has none yet: the ids a nested
+    /// map names as `outside` are translated through them.
+    pub parent_maps: Option<(Vec<(u32, u32, u32)>, Vec<(u32, u32, u32)>)>,
+}
+
+/// Programs run as the user "nova" (uid and gid 1000), not as root: Steam refuses root.
+pub const NOVA_UID: u32 = 1000;
+
+impl Cred {
+    pub fn user() -> Self {
+        Self { uid: NOVA_UID, euid: NOVA_UID, suid: NOVA_UID, gid: NOVA_UID, egid: NOVA_UID, sgid: NOVA_UID, groups: alloc::vec![NOVA_UID], userns: None, parent_maps: None }
+    }
+
+    /// An id as the process sees it (65534, the overflow id, if its namespace has no
+    /// mapping for it).
+    pub fn show(&self, id: u32, gid: bool) -> u32 {
+        match &self.userns {
+            None => id,
+            Some((u, g)) => {
+                let map = if gid { g } else { u };
+                map.iter().find(|&&(_, out, n)| id >= out && id - out < n).map_or(65534, |&(inside, out, _)| inside + (id - out))
+            }
+        }
+    }
+
+    /// An id the process passes (setuid ...) in the initial namespace's terms.
+    pub fn take(&self, id: u32, gid: bool) -> u32 {
+        match &self.userns {
+            None => id,
+            Some((u, g)) => {
+                let map = if gid { g } else { u };
+                map.iter().find(|&&(inside, _, n)| id >= inside && id - inside < n).map_or(id, |&(inside, out, _)| out + (id - inside))
+            }
+        }
+    }
 }
 
 /// Per-thread user state, owned by the kernel task that runs the thread.
@@ -362,6 +416,13 @@ pub struct UserState {
     pub user_gs: u16,
     /// SIMD state of the interrupted code while 32-bit signal handlers run (innermost last).
     sigfpu: Vec<Box<FxArea>>,
+    /// 32-bit threads: a private mapping where compat32.rs builds the 64-bit structures a
+    /// converted call needs (0 until first used).
+    pub compat_scratch: u64,
+    /// The system call this thread is in (u64::MAX: none) and its first argument, for `ps`.
+    pub in_syscall: u64,
+    pub syscall_arg: u64,
+    pub syscall_arg2: u64,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -409,6 +470,43 @@ impl Memory {
         unsafe { memory::map_page_in(self.cr3, va, memory::virt_to_phys(page as u64), flags, PRESENT | WRITABLE | USER, &mut |t| tables.push(t)) };
         self.pages.insert(va, page);
         page
+    }
+
+    /// The leaf page-table entry of `va` (0 if not mapped).
+    fn pte(&self, va: u64) -> u64 {
+        let mut table = self.cr3;
+        for level in [39, 30, 21] {
+            // SAFETY: walking this process's own page tables in direct-mapped RAM.
+            let e = unsafe { (memory::phys_to_virt(table) as *const u64).add(((va >> level) & 511) as usize).read() };
+            if e & PRESENT == 0 {
+                return 0;
+            }
+            table = e & 0x000F_FFFF_FFFF_F000;
+        }
+        // SAFETY: as above, the leaf table.
+        unsafe { (memory::phys_to_virt(table) as *const u64).add(((va >> 12) & 511) as usize).read() }
+    }
+
+    /// mremap: move the pages mapped in [from, from+len) to [to, to+len) without copying
+    /// them (their frames are remapped); the areas are the caller's business.
+    pub fn move_pages(&mut self, from: u64, to: u64, len: u64) {
+        let moving: Vec<(u64, *mut u8)> = self.pages.range(from..from + len).map(|(&va, &p)| (va, p)).collect();
+        for (va, page) in moving {
+            let flags = self.pte(va) & (PRESENT | USER | WRITABLE);
+            self.unmap_page(va);
+            self.pages.remove(&va);
+            let new = to + (va - from);
+            let tables = &mut self.tables;
+            // SAFETY: `new` is in this space's lower half; the frame stays owned by it.
+            unsafe { memory::map_page_in(self.cr3, new, memory::virt_to_phys(page as u64), flags | PRESENT | USER, PRESENT | WRITABLE | USER, &mut |t| tables.push(t)) };
+            self.pages.insert(new, page);
+            if self.borrowed.remove(&va) {
+                self.borrowed.insert(new);
+            }
+            if self.foreign.remove(&va) {
+                self.foreign.insert(new);
+            }
+        }
     }
 
     /// No memory left for a program page: kill the program (like Linux's OOM killer)
@@ -605,10 +703,52 @@ impl Memory {
 
     pub fn reserve_with(&mut self, len: u64, writable: bool) -> u64 {
         let len = len.next_multiple_of(PAGE);
-        self.mmap_next -= len + PAGE; // one guard page between areas
-        let start = self.mmap_next;
+        let start = self.find_gap(len);
+        self.mmap_next = start;
         self.areas.push(Area { start, end: start + len, writable });
         start
+    }
+
+    /// Highest address mappings are placed below.
+    fn mmap_top(&self) -> u64 {
+        if self.compat { MMAP_TOP32 } else { MMAP_TOP }
+    }
+
+    /// Lowest address for mappings: room above the brk heap so it can grow (as on Linux,
+    /// mappings are placed top-down, and brk fails rather than overlap one).
+    fn mmap_floor(&self) -> u64 {
+        let heap_room = if self.compat { 256 << 20 } else { 1 << 36 };
+        self.brk.max(self.brk_start).saturating_add(heap_room).max(USER_MIN)
+    }
+
+    /// Where a new mapping of `len` bytes goes: just below the previous one if that is
+    /// free (the common case), else the highest free gap (address space that munmap gave
+    /// back), keeping a guard page above it. Freed space is reused, so a 32-bit program
+    /// that maps and unmaps a lot never runs down into its heap.
+    fn find_gap(&self, len: u64) -> u64 {
+        let (top, floor) = (self.mmap_top(), self.mmap_floor());
+        if let Some(start) = self.mmap_next.min(top).checked_sub(len + PAGE)
+            && start >= floor
+            && self.is_free(start, len + PAGE)
+        {
+            return start;
+        }
+        let mut spans: Vec<(u64, u64)> = self.areas.iter().filter(|a| a.start < top && a.end > floor).map(|a| (a.start, a.end)).collect();
+        spans.sort_unstable_by(|a, b| b.cmp(a));
+        let mut cursor = top;
+        for (s, e) in spans {
+            // The gap between this area (plus a guard page) and the cursor.
+            let gap_lo = e.saturating_add(PAGE);
+            if cursor >= gap_lo && cursor - gap_lo >= len + PAGE {
+                return cursor - len - PAGE;
+            }
+            cursor = cursor.min(s);
+        }
+        if cursor >= floor && cursor - floor >= len + PAGE {
+            return cursor - len - PAGE;
+        }
+        // Out of address space above the heap: below it, if anything is left there.
+        self.mmap_next.saturating_sub(len + PAGE).max(USER_MIN)
     }
 
     /// Free the pages in [start, start+len) but keep the areas (they read as zero again).
@@ -779,6 +919,7 @@ impl Process {
             term_signal: AtomicI32::new(0),
             vfork_done: AtomicBool::new(false),
             ns: SpinLock::new(crate::vfs::root()),
+            cred: SpinLock::new(Cred::user()),
         });
         TABLE.lock().insert(p.pid, Entry { parent, process: Arc::downgrade(&p), status: None });
         p
@@ -793,6 +934,16 @@ pub fn unshare_ns(pid: u64) {
     if let Some(p) = p {
         let copy = p.ns.lock().copy();
         *p.ns.lock() = copy;
+    }
+}
+
+/// Put process `pid` in a new user namespace (clone with CLONE_NEWUSER): no ids are
+/// mapped until its uid_map and gid_map are written.
+pub fn unshare_user(pid: u64) {
+    if let Some(p) = find(pid) {
+        let mut c = p.cred.lock();
+        c.parent_maps = c.userns.take();
+        c.userns = Some((Vec::new(), Vec::new()));
     }
 }
 
@@ -824,6 +975,7 @@ pub fn processes() -> Vec<Arc<Process>> {
 /// End of a process: record its wait status for the parent, hand its children to no
 /// one, and tell the parent (SIGCHLD).
 fn finish(process: &Process, status: i32) {
+    crate::linux::sysv::process_gone(process.pid);
     let parent = process.parent.load(Ordering::SeqCst);
     {
         let mut table = TABLE.lock();
@@ -904,7 +1056,7 @@ pub fn terminate(p: &Process, sig: u32) {
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new() })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0 })
     }
 }
 
@@ -1158,6 +1310,7 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
             mem.unshare(page);
             return true;
         }
+        crate::log::warn(&format!("{}: protection fault ({}) at {addr:#x}", u.process.name, if error & 2 != 0 { "write to a read-only page" } else { "access" }));
         return false;
     }
     match mem.area_at(page) {
@@ -1165,7 +1318,15 @@ pub fn page_fault(addr: u64, error: u64) -> bool {
             mem.map_zero_page(page, a.writable);
             true
         }
-        _ => false,
+        a => {
+            let what = if error & 2 != 0 { "write" } else if error & 16 != 0 { "instruction fetch" } else { "read" };
+            crate::log::warn(&format!(
+                "{}: invalid {what} at {addr:#x}: {}",
+                u.process.name,
+                a.map_or(String::from("no mapping there"), |a| format!("area {:#x}-{:#x} {}", a.start, a.end, if a.writable { "writable" } else { "read-only" }))
+            ));
+            false
+        }
     }
 }
 
@@ -1578,6 +1739,8 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     let child = Process::new(&parent.name, &parent.exe.lock(), parent.pid);
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
     *child.ns.lock() = parent.ns.lock().clone();
+    *child.cred.lock() = parent.cred.lock().clone();
+    crate::linux::sysv::process_forked(parent.pid, child.pid);
     {
         let src = parent.mem.lock();
         let mut dst = child.mem.lock();
@@ -1659,6 +1822,8 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
     if process.threads.load(Ordering::SeqCst) > 1 {
         return Err(11); // EAGAIN: multi-threaded execve is not supported yet
     }
+    // The old address space goes: SysV shared-memory attachments with it.
+    crate::linux::sysv::process_gone(task::current_user().map_or(0, |u| u.process.pid));
     let cr3 = new_address_space();
     let mut mem = Memory::new(cr3);
     let env = if env.is_empty() { DEFAULT_ENV.map(String::from).to_vec() } else { env };
@@ -1694,6 +1859,7 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
     let u = task::current_user().unwrap();
     u.compat = compat;
     u.tls = [0; gdt::TLS_ENTRIES];
+    u.compat_scratch = 0; // the old address space (and its scratch mapping) is gone
     (u.user_fs, u.user_gs) = (0, 0);
     load_fs_gs(0, 0);
     let regs = *f;

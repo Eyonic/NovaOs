@@ -190,7 +190,8 @@ define_case() {
                 INPUT=("wait:$PROMPT" "ser:sh" "sleep:1" "ser:wltest" "wait:wltest: done"
                        "ser:wltest 20 > /dev/null &" "sleep:2" "ser:exit" "wait:$PROMPT" "ser:wayland" "wait:toplevel"
                        "ser:sh" "sleep:1" "ser:Xwayland :0 -shm -geometry 800x600 > /run/xw.log 2>&1 &" "sleep:5"
-                       "ser:DISPLAY=:0 xtest" "wait:xtest: done" "ser:exit" "wait:$PROMPT" "ser:wayland" "wait:Xwayland on")
+                       "ser:DISPLAY=:0 xtest 10 &" "wait:xtest: window mapped" "sleep:2" "ser:exit" "wait:$PROMPT"
+                       "ser:wayland" "wait:Xwayland on")
                 EXPECT=("${shell[@]}" "wltest: connected, configured, keymap received, XRGB8888 offered"
                         "wltest: buffer shown (320x240), frame callback done, buffer released"
                         "xtest: connected to :0, screen 800x600, vendor The X.Org Foundation"

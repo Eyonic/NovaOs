@@ -500,7 +500,19 @@ multi-threaded, including the Chromium engine (`process.rs`, `linux.rs`, `ipc.rs
   (`Xwayland :0 -shm`) runs on it, so X11 programs get a display (`DISPLAY=:0`). Tests:
   `wltest` (libwayland-client + xdg-shell) and `xtest` (Xlib on Xwayland), case `wayland`.
 * **Timers and credentials.** `alarm`, `setitimer`/`getitimer` (ITIMER_REAL, SIGALRM with
-  1 ms resolution); the uid/gid setters are accepted (permissions are not checked).
+  1 ms resolution). Programs run as the user `nova` (uid/gid 1000; Steam refuses root), with
+  real uid/gid setters and user namespaces: `uid_map`/`gid_map` written through
+  `/proc/<pid>` translate ids (nested namespaces compose), and only root or a process in its
+  own user namespace reports capabilities, as unprivileged bubblewrap expects. Permissions
+  are recorded (owners of tmpfs files, modes) but not enforced.
+* **More IPC.** System V semaphores and shared memory (`linux/sysv.rs`, also through the
+  i386 `ipc` multiplexer), named pipes (`mkfifo`/`mknod`), `select`/`pselect6`,
+  `MSG_WAITALL`, `close_range`, `O_PATH` descriptors of symbolic links.
+* **Address space.** New mappings go top-down into the highest free gap (freed space is
+  reused) and stay clear of the brk heap, which never grows over a mapping; `mremap`
+  moves pages without copying. (32-bit programs that map and unmap a lot, like Steam,
+  used to run their mappings down into their own heap.) `memstress`/`memstress32` check
+  data integrity under glibc's allocator with threads.
 * **Diagnostics.** `strace <program>` logs every system call with arguments and results to
   the serial console; unimplemented calls return `-ENOSYS` and are logged once.
 

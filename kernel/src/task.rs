@@ -292,7 +292,24 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
                     State::Finished => "finished",
                 }
             };
-            (t.id, t.name.clone(), state)
+            let name = match t.user.as_deref() {
+                Some(u) if u.in_syscall != u64::MAX => {
+                    let n = u.in_syscall & 0xFFF;
+                    // read, write, poll-family and socket calls: show what the descriptor is.
+                    let fd_call = if u.in_syscall & 0x1000 != 0 { matches!(n, 3 | 4 | 146 | 145 | 371 | 372 | 370) } else { matches!(n, 0 | 1 | 19 | 20 | 45 | 46 | 47 | 44) };
+                    let futex = if u.in_syscall & 0x1000 != 0 { matches!(n, 240 | 422) } else { n == 202 };
+                    let what = if fd_call {
+                        alloc::format!(" fd {} = {}", u.syscall_arg, crate::linux::describe_fd(&u.process, u.syscall_arg))
+                    } else if futex {
+                        alloc::format!(" futex {:#x} op {}", u.syscall_arg, u.syscall_arg2)
+                    } else {
+                        String::new()
+                    };
+                    alloc::format!("{} (in syscall {}{}{what})", t.name, n, if u.in_syscall & 0x1000 != 0 { " i386" } else { "" })
+                }
+                _ => t.name.clone(),
+            };
+            (t.id, name, state)
         })
         .collect()
 }

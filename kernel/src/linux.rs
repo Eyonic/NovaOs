@@ -29,6 +29,7 @@ use crate::gdt;
 use crate::vfs;
 
 pub mod compat32;
+pub mod sysv;
 use crate::sync::SpinLock;
 use crate::{ipc, pit, rand, rtc, task};
 
@@ -48,12 +49,15 @@ const EAFNOSUPPORT: i64 = 97;
 const ENOTSOCK: i64 = 88;
 const ENOMEM_ERR: i64 = 12;
 const EROFS: i64 = 30;
+const EOPNOTSUPP: i64 = 95;
+const EPERM: i64 = 1;
 const EADDRINUSE: i64 = 98;
 const EISCONN: i64 = 106;
 const EACCES: i64 = 13;
 const ENODEV: i64 = 19;
 const ELOOP: i64 = 40;
 const O_NOFOLLOW: u64 = 0o400000;
+const O_PATH: u64 = 0o10000000;
 
 const AT_FDCWD: i64 = -100;
 
@@ -109,6 +113,9 @@ pub enum Kind {
     Unix(UnixSocket),
     /// /dev/zero (and /dev/full): reads zeros, writes are discarded.
     Zero,
+    /// O_PATH descriptor of a symbolic link (O_PATH | O_NOFOLLOW): only names the link
+    /// (fstat, *at calls, /proc/self/fd); its location is in OpenFile::at.
+    Path,
     /// A regular file read into memory (NovaFS) or used in place (system files); `at`
     /// is where it is written back.
     File { path: String, at: vfs::At, data: FileData, writable: bool, append: bool, dirty: bool },
@@ -155,6 +162,49 @@ fn unix_key(sa: &[u8]) -> Result<(String, bool), i64> {
 pub fn root_socket_key(p: &str) -> String {
     let (m, rel) = vfs::root().find_mount(p);
     format!("{:p}:{rel}", Arc::as_ptr(&m.fs) as *const u8)
+}
+
+/// What descriptor `fd` of process `p` is (for `ps`), if its table is free to look at.
+pub fn describe_fd(p: &Process, fd: u64) -> String {
+    let Some(t) = p.fds.try_lock() else { return String::from("?") };
+    match t.fds.get(fd as usize).and_then(|f| f.clone()) {
+        Some(f) => f.try_lock().map_or(String::from("?"), |f| kind_name(&f.kind)),
+        None => String::from("-"),
+    }
+}
+
+/// (effective uid, gid) of the calling process, for the owner of files it creates; root
+/// for the kernel's own tasks.
+pub fn creator_ids() -> (u32, u32) {
+    match task::current_user() {
+        Some(u) => {
+            let c = u.process.cred.lock();
+            (c.euid, c.egid)
+        }
+        None => (0, 0),
+    }
+}
+
+/// Named pipes: the channel of each FIFO node, by file system and path.
+static FIFOS: SpinLock<BTreeMap<String, ipc::ChannelRef>> = SpinLock::new(BTreeMap::new());
+
+/// Open a FIFO: the reading end, the writing end, or both (O_RDWR), of its one channel.
+fn open_fifo(m: &vfs::Mount, rel: &str, acc: u64) -> Kind {
+    let key = format!("{:p}:{rel}", Arc::as_ptr(&m.fs) as *const u8);
+    let chan = FIFOS.lock().entry(key).or_insert_with(ipc::channel).clone();
+    {
+        // A new reader or writer reopens the pipe after the last one closed it.
+        let mut c = chan.lock();
+        if acc != 1 {
+            c.reader_closed = false;
+        }
+        if acc != 0 {
+            c.writer_closed = false;
+        }
+    }
+    let rx = (acc != 1).then(|| chan.clone());
+    let tx = (acc != 0).then_some(chan);
+    Kind::Channel(ipc::End { rx, tx, kind: ipc::SockType::Stream })
 }
 
 /// The shared-memory object behind a descriptor (memfd, POSIX shm, tmpfs file).
@@ -646,11 +696,13 @@ fn proc_file(name: &str) -> Option<String> {
     Some(match name.as_str() {
         "proc/self/maps" => mem().maps(),
         "proc/self/status" => format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t1\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t1\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
             proc().name,
             proc().threads.load(core::sync::atomic::Ordering::Relaxed),
             used / 1024,
-            p = proc().pid
+            p = proc().pid,
+            u = { let c = proc().cred.lock(); c.show(c.uid, false) },
+            g = { let c = proc().cred.lock(); c.show(c.gid, true) }
         ),
         "proc/self/stat" => format!("{} ({}) R 1 {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 0 0\n", proc().pid, proc().name, proc().pid, proc().pid, proc().threads.load(core::sync::atomic::Ordering::Relaxed)),
         "proc/self/statm" => "1000 500 100 10 0 400 0\n".into(),
@@ -660,7 +712,10 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/self/limits" => "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1024                 4096                 files\n".into(),
         "proc/mounts" | "proc/self/mounts" => ns().mounts(),
         "proc/self/mountinfo" => ns().mountinfo(),
-        "proc/self/uid_map" | "proc/self/gid_map" => "         0          0 4294967295\n".into(),
+        "proc/self/uid_map" | "proc/self/gid_map" => match &proc().cred.lock().userns {
+            None => "         0          0 4294967295\n".into(),
+            Some((u, g)) => (if name.ends_with("gid_map") { g } else { u }).iter().map(|(i, o, n)| format!("{i:>10} {o:>10} {n:>10}\n")).collect(),
+        },
         "proc/self/setgroups" => "allow\n".into(),
         "proc/self/cgroup" => "0::/\n".into(),
         "proc/filesystems" => "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevpts\nnodev\tmqueue\n\tnovafs\n".into(),
@@ -717,6 +772,7 @@ fn fd_link(n: i64) -> Option<String> {
     }
     Some(match &f.kind {
         Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at)) => format!("/{}", ns().vpath(at).unwrap_or_default()),
+        Kind::Path => "/".into(), // fd_link returns OpenFile::at's path first
         Kind::Tty => "/dev/tty".into(),
         Kind::Null => "/dev/null".into(),
         Kind::Zero => "/dev/zero".into(),
@@ -827,6 +883,40 @@ impl vfs::Backend for ProcFs {
     }
     fn truncate(&self, _: &str, _: u64) -> Result<(), i64> {
         Ok(()) // writing uid_map and friends opens them with O_TRUNC
+    }
+    fn write_back(&self, p: &str, data: &[u8]) -> Result<(), i64> {
+        // /proc/<pid>/uid_map and gid_map: "inside outside count" lines for a process in a
+        // user namespace.
+        let (first, file) = p.split_once('/').ok_or(EACCES)?;
+        let pid = if first == "self" || first == "thread-self" { proc().pid } else { first.parse().map_err(|_| EACCES)? };
+        let gid = match file {
+            "uid_map" => false,
+            "gid_map" => true,
+            "setgroups" | "oom_score_adj" => return Ok(()),
+            _ => return Err(EACCES),
+        };
+        let map: Vec<(u32, u32, u32)> = String::from_utf8_lossy(data)
+            .lines()
+            .filter_map(|l| {
+                let v: Vec<u32> = l.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                (v.len() == 3).then(|| (v[0], v[1], v[2]))
+            })
+            .collect();
+        let p = process::find(pid).ok_or(ESRCH)?;
+        let mut c = p.cred.lock();
+        // A nested namespace's "outside" ids are the enclosing namespace's: translate them.
+        let map: Vec<(u32, u32, u32)> = match &c.parent_maps {
+            Some((pu, pg)) => {
+                let parent = if gid { pg } else { pu };
+                map.into_iter()
+                    .map(|(i, o, n)| (i, parent.iter().find(|&&(pi, _, pn)| o >= pi && o - pi < pn).map_or(o, |&(pi, po, _)| po + (o - pi)), n))
+                    .collect()
+            }
+            None => map,
+        };
+        let ns = c.userns.get_or_insert_with(|| (Vec::new(), Vec::new()));
+        if gid { ns.1 = map } else { ns.0 = map }
+        Ok(())
     }
     fn usage(&self) -> (u64, u64) {
         (0, 0)
@@ -1043,6 +1133,10 @@ fn stat_path(name: &str) -> Result<Vec<u8>, i64> {
 
 fn stat_file(f: &OpenFile) -> Vec<u8> {
     match &f.kind {
+        Kind::Path => match &f.at {
+            Some(at) => at.mount.fs.lstat(&at.rel).map(|m| stat_meta(&m)).unwrap_or_else(|_| stat_buf(0o120777, 0, 0, 8)),
+            None => stat_buf(0o120777, 0, 0, 8),
+        },
         Kind::Tty => stat_buf(0o20620, 0, 0, 1),
         Kind::Null | Kind::Random | Kind::Zero => stat_buf(0o20666, 0, 0, 1),
         Kind::File { path, data, at, .. } => match at.mount.fs.lstat(&at.rel) {
@@ -1122,7 +1216,9 @@ fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
                     }
                     Kind::Dir { at: vfs::At { mount: m.clone(), rel: rel.clone() } }
                 }
+                vfs::Type::Lnk if flags & O_PATH != 0 => Kind::Path,
                 vfs::Type::Lnk => return Err(ELOOP), // O_NOFOLLOW on a link
+                vfs::Type::Fifo => open_fifo(&m, &rel, acc),
                 vfs::Type::Chr => match m.fs.open(&rel)? {
                     vfs::Content::Device("null") => Kind::Null,
                     vfs::Content::Device("zero" | "full") => Kind::Zero,
@@ -1171,6 +1267,31 @@ fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
 
 /// Read from a pipe/socket/eventfd, blocking unless O_NONBLOCK. Returns data and
 /// any file descriptors that came with it.
+/// recv with MSG_WAITALL on a stream socket: keep reading until `len` bytes (or the end of
+/// the stream); other sockets and non-blocking reads return what is there.
+fn channel_read_flags(file: &FileRef, len: usize, flags: u64) -> Result<(Vec<u8>, Vec<FileRef>, bool), i64> {
+    let dontwait = flags & 0x40 != 0;
+    let stream = matches!(&file.lock().kind, Kind::Channel(e) if e.kind == ipc::SockType::Stream);
+    if flags & 0x100 == 0 || dontwait || !stream {
+        return channel_read(file, len, false, dontwait);
+    }
+    let (mut data, mut fds) = (Vec::new(), Vec::new());
+    while data.len() < len {
+        match channel_read(file, len - data.len(), false, false) {
+            Ok((d, f, _)) => {
+                if d.is_empty() {
+                    break; // end of stream
+                }
+                data.extend_from_slice(&d);
+                fds.extend(f);
+            }
+            Err(e) if data.is_empty() => return Err(e),
+            Err(_) => break, // e.g. EINTR after part of the data: return that part
+        }
+    }
+    Ok((data, fds, false))
+}
+
 fn channel_read(file: &FileRef, len: usize, peek_message: bool, dontwait: bool) -> Result<(Vec<u8>, Vec<FileRef>, bool), i64> {
     loop {
         {
@@ -1309,6 +1430,7 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     let pos = at.unwrap_or(f.pos);
     let out = match &f.kind {
         Kind::Null => Vec::new(),
+        Kind::Path => return Err(EBADF),
         Kind::Zero => vec![0; len],
         Kind::Random => {
             let mut v = vec![0; len];
@@ -1345,6 +1467,7 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
             return Ok(data.len());
         }
         Kind::Null | Kind::Random | Kind::Zero => data.len(),
+        Kind::Path => return Err(EBADF),
         Kind::Dir { .. } => return Err(EISDIR),
         Kind::Memfd(m, path) => {
             if path.is_some() && flags & 3 == 0 {
@@ -1462,7 +1585,11 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     let (nr, a0, a1, a2, a3, a4, a5) = (f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let trace = proc().trace.load(core::sync::atomic::Ordering::Relaxed);
     let tid = thread().tid;
+    thread().in_syscall = nr;
+    thread().syscall_arg = a0;
+    thread().syscall_arg2 = a1;
     let r = dispatch(f, nr, a0, a1, a2, a3, a4, a5);
+    thread().in_syscall = u64::MAX;
     if trace {
         let path = if matches!(nr, 2 | 4 | 6 | 21 | 59 | 80 | 83 | 87 | 89) {
             read_cstr(a0).map(|p| format!(" \"{p}\"")).unwrap_or_default()
@@ -1491,6 +1618,7 @@ fn kind_name(k: &Kind) -> String {
         Kind::Channel(e) => format!("{}{:?}", if e.rx.is_some() && e.tx.is_some() { "socket " } else { "pipe " }, e.kind),
         Kind::EventFd(_) => "eventfd".into(),
         Kind::SignalFd(_) => "signalfd".into(),
+        Kind::Path => "path".into(),
         Kind::Unix(_) => "unix socket".into(),
         Kind::Epoll(_) => "epoll".into(),
         Kind::Memfd(_, Some(at)) => format!("file {}", at.rel),
@@ -1504,7 +1632,7 @@ fn syscall_name(nr: u64) -> String {
         0 => "read", 1 => "write", 2 => "open", 3 => "close", 4 => "stat", 5 => "fstat", 6 => "lstat", 7 => "poll",
         8 => "lseek", 9 => "mmap", 10 => "mprotect", 11 => "munmap", 12 => "brk", 13 => "rt_sigaction",
         14 => "rt_sigprocmask", 16 => "ioctl", 17 => "pread64", 19 => "readv", 20 => "writev", 21 => "access",
-        22 => "pipe", 23 => "select", 24 => "sched_yield", 25 => "mremap", 28 => "madvise", 32 => "dup", 33 => "dup2",
+        22 => "pipe", 23 => "select", 270 => "pselect6", 436 => "close_range", 73 => "flock", 74 => "fsync", 24 => "sched_yield", 25 => "mremap", 28 => "madvise", 32 => "dup", 33 => "dup2",
  39 => "getpid", 40 => "sendfile", 57 => "fork", 58 => "vfork", 59 => "execve", 61 => "wait4", 62 => "kill", 77 => "ftruncate", 87 => "unlink", 84 => "rmdir", 88 => "symlink", 266 => "symlinkat", 86 => "link", 265 => "linkat", 280 => "utimensat", 76 => "truncate", 90 => "chmod", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
         42 => "connect", 49 => "bind", 53 => "socketpair", 307 => "sendmmsg", 56 => "clone", 60 => "exit", 63 => "uname", 72 => "fcntl", 79 => "getcwd",
         89 => "readlink", 96 => "gettimeofday", 97 => "getrlimit", 99 => "sysinfo", 137 => "statfs", 138 => "fstatfs",
@@ -1599,6 +1727,48 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 };
                 poll_fds(a0, a1 as usize, deadline)?
             }
+            23 | 270 => {
+                // select(n, readfds, writefds, exceptfds, timeval*),
+                // pselect6(n, readfds, writefds, exceptfds, timespec*, sigmask)
+                let d = if a4 == 0 {
+                    None
+                } else if nr == 23 {
+                    let t = read_user(a4, 16)?;
+                    let us = u64::from_le_bytes(t[0..8].try_into().unwrap()) * 1_000_000 + u64::from_le_bytes(t[8..16].try_into().unwrap());
+                    Some(pit::ticks() + us.div_ceil(1_000_000 / pit::HZ))
+                } else {
+                    deadline(a4, false, 1)?
+                };
+                select_fds(a0 as usize, a1, a2, a3, d)?
+            }
+            436 => {
+                // close_range(first, last, flags): CLOSE_RANGE_CLOEXEC (4) marks instead
+                let mut t = fds();
+                let last = (a1 as usize).min(t.fds.len().saturating_sub(1));
+                let mut closed = Vec::new();
+                for fd in (a0 as usize)..=last {
+                    if a2 & 4 != 0 {
+                        if t.fds.get(fd).is_some_and(|f| f.is_some()) {
+                            t.set_cloexec(fd as i64, true);
+                        }
+                    } else if let Some(slot) = t.fds.get_mut(fd) {
+                        if let Some(f) = slot.take() {
+                            closed.push(f);
+                        }
+                        t.cloexec.remove(&fd);
+                    }
+                }
+                drop(t);
+                drop(closed); // last references flush on drop
+                0
+            }
+            74 | 75 => {
+                // fsync, fdatasync: write a file's changes back now
+                let file = fds().get(a0 as i64)?;
+                flush(&mut file.lock());
+                0
+            }
+            73 | 306 => 0, // flock (advisory locks: one system, nothing to arbitrate), syncfs
             22 | 293 => {
                 // pipe, pipe2
                 let flags = if nr == 293 { a1 } else { 0 };
@@ -1733,7 +1903,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     }
                     data.len() as i64
                 } else {
-                    let (data, _, _) = channel_read(&file, a2 as usize, false, a3 & 0x40 != 0)?;
+                    let (data, _, _) = channel_read_flags(&file, a2 as usize, a3)?;
                     write_user(a1, &data)?;
                     if a4 != 0 && a5 != 0 {
                         write_user(a5, &0u32.to_le_bytes())?;
@@ -1895,9 +2065,12 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     (1, 17) => {
                         // SO_PEERCRED: struct ucred { pid, uid, gid }
                         let mut c = Vec::new();
+                        // The peer is not tracked; programs talking over local sockets
+                        // run as the same user, so the caller's own ids stand in.
+                        let (uid, gid) = { let cr = proc().cred.lock(); (cr.show(cr.euid, false), cr.show(cr.egid, true)) };
                         c.extend_from_slice(&(proc().pid as i32).to_le_bytes());
-                        c.extend_from_slice(&0u32.to_le_bytes());
-                        c.extend_from_slice(&0u32.to_le_bytes());
+                        c.extend_from_slice(&uid.to_le_bytes());
+                        c.extend_from_slice(&gid.to_le_bytes());
                         c
                     }
                     _ => 0i32.to_le_bytes().to_vec(),
@@ -2036,9 +2209,22 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     let file = fds().get(fd)?;
                     let fl = file.lock();
                     match &fl.kind {
-                        Kind::Memfd(m, _) => {
-                            // Shared memory: map its frames (every mapping sees the same pages).
+                        Kind::Memfd(m, _) if flags & 3 != 2 => {
+                            // MAP_SHARED: map its frames (every mapping sees the same pages).
                             mem().map_shared(addr, m.clone(), a5 as usize, len);
+                        }
+                        Kind::Memfd(m, _) => {
+                            // MAP_PRIVATE (the dynamic loader mapping a library from tmpfs):
+                            // a private copy, so writes (relocations) stay in this mapping.
+                            let m = m.clone();
+                            drop(fl);
+                            let bytes = {
+                                let mut m = m.lock();
+                                let size = m.size as usize;
+                                let off = (a5 as usize).min(size);
+                                m.read(off, (len as usize).min(size - off))
+                            };
+                            write_user(addr, &bytes)?;
                         }
                         Kind::File { data: FileData::Static(s), .. } if a5 % PAGE == 0 => {
                             mem().map_file(addr, s, a5 as usize, len);
@@ -2079,6 +2265,48 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 mem().unmap(a0, a1);
                 0
             }
+            25 => {
+                // mremap(old, old_size, new_size, flags, new_address): shrink in place, grow
+                // in place if the space after is free, else (MREMAP_MAYMOVE) move the pages
+                // to a new range without copying; MREMAP_FIXED puts them at new_address.
+                const MAYMOVE: u64 = 1;
+                const FIXED: u64 = 2;
+                let (old, old_len, new_len) = (a0, a1.next_multiple_of(PAGE), a2.next_multiple_of(PAGE));
+                if old % PAGE != 0 || new_len == 0 || a3 & !(MAYMOVE | FIXED | 4) != 0 {
+                    return Err(EINVAL);
+                }
+                let mut m = mem();
+                let area = m.area_at(old).ok_or(EFAULT)?;
+                if area.end < old + old_len.max(PAGE) {
+                    return Err(EFAULT);
+                }
+                if a3 & FIXED == 0 {
+                    if new_len <= old_len {
+                        m.unmap(old + new_len, old_len - new_len);
+                        return Ok(old as i64);
+                    }
+                    if m.is_free(old + old_len, new_len - old_len) {
+                        m.areas.push(process::Area { start: old + old_len, end: old + new_len, writable: area.writable });
+                        return Ok(old as i64);
+                    }
+                    if a3 & MAYMOVE == 0 {
+                        return Err(ENOMEM_ERR);
+                    }
+                }
+                let to = if a3 & FIXED != 0 {
+                    if a4 % PAGE != 0 {
+                        return Err(EINVAL);
+                    }
+                    m.unmap(a4, new_len);
+                    m.areas.push(process::Area { start: a4, end: a4 + new_len, writable: area.writable });
+                    a4
+                } else {
+                    m.reserve_with(new_len, area.writable)
+                };
+                m.move_pages(old, to, old_len.min(new_len));
+                m.unmap(old, old_len);
+                to as i64
+            }
             12 => {
                 // brk
                 let mut u = mem();
@@ -2089,6 +2317,10 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         u.unmap(new, old - new);
                     } else if new > u.brk {
                         let old = u.brk;
+                        // Never over a mapping: brk fails instead (glibc then uses mmap).
+                        if !u.is_free(old, new - old) {
+                            return Ok(u.brk as i64);
+                        }
                         u.areas.push(process::Area { start: old, end: new, writable: true });
                     }
                     u.brk = new;
@@ -2417,11 +2649,40 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 m.fs.symlink(&target, &rel)?;
                 0
             }
+            133 | 259 => {
+                // mknod(path, mode, dev), mknodat(dirfd, path, mode, dev): FIFOs and
+                // regular files (device nodes need a driver: EPERM).
+                let (p, mode) = if nr == 133 { (resolve_nofollow(&read_cstr(a0)?), a1) } else { (at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, false)?, a2) };
+                if stat_path(&p).is_ok() {
+                    return Err(EEXIST);
+                }
+                let (m, rel) = ns().writable(&p)?;
+                let perm = mode as u32 & 0o7777 & !0o022;
+                match mode & 0o170000 {
+                    0o010000 => m.fs.mkfifo(&rel, perm)?,
+                    0 | 0o100000 | 0o140000 => m.fs.create(&rel, perm)?,
+                    _ => return Err(EPERM),
+                }
+                0
+            }
             84 => {
                 // rmdir
                 let p = resolve_nofollow(&read_cstr(a0)?);
                 let (m, rel) = ns().writable(&p)?;
                 m.fs.rmdir(&rel)?;
+                0
+            }
+            221 => 0,                   // fadvise64: advice only
+            444..=446 => return Err(ENOSYS), // landlock: no sandboxing rules (programs fall back)
+            452 => {
+                // fchmodat2(dirfd, path, mode, flags): a symbolic link itself cannot have a
+                // mode (AT_SYMLINK_NOFOLLOW on one: EOPNOTSUPP, as on Linux)
+                let p = at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, a3 & 0x100 == 0)?;
+                let (m, rel) = ns().writable(&p)?;
+                if m.fs.lstat(&rel)?.ty == vfs::Type::Lnk {
+                    return Err(EOPNOTSUPP);
+                }
+                m.fs.chmod(&rel, a2 as u32)?;
                 0
             }
             90 | 268 => {
@@ -2550,20 +2811,35 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 fd
             }
             125 => {
-                // capget(header, data): every capability, as root has (Nova does not
-                // check them). Version 3 headers carry two 32-bit sets.
+                // capget(header, data): Nova does not check capabilities, but programs look
+                // at them. Version 3 headers carry two 32-bit sets.
                 let version = read_u32(a0)?;
                 if version != 0x2008_0522 && version != 0x2007_1026 {
                     write_user(a0, &0x2008_0522u32.to_le_bytes())?;
                     return if a1 == 0 { Ok(0) } else { Err(EINVAL) };
                 }
                 if a1 != 0 {
-                    let all = [u32::MAX, u32::MAX, 0, (1u32 << (CAP_LAST - 31)) - 1, (1u32 << (CAP_LAST - 31)) - 1, 0];
-                    write_user(a1, &all.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+                    // Root, and a process in a user namespace of its own, have every
+                    // capability; other users none (as on Linux).
+                    let full = { let c = proc().cred.lock(); c.euid == 0 || c.userns.is_some() };
+                    let caps = if full { [u32::MAX, u32::MAX, 0, (1u32 << (CAP_LAST - 31)) - 1, (1u32 << (CAP_LAST - 31)) - 1, 0] } else { [0; 6] };
+                    write_user(a1, &caps.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
                 }
                 0
             }
             126 => 0, // capset: accepted
+            64 => sysv::semget(a0 as i32, a1, a2)?,
+            65 => sysv::semop(a0 as i32, a1, a2, None)?,
+            220 => {
+                // semtimedop(id, sops, nsops, timeout)
+                let d = if a3 == 0 { None } else { deadline(a3, false, 1)? };
+                sysv::semop(a0 as i32, a1, a2, d)?
+            }
+            66 => sysv::semctl(a0 as i32, a1, a2, a3, false)?,
+            29 => sysv::shmget(a0 as i32, a1, a2)?,
+            30 => sysv::shmat(a0 as i32, a1, a2)? as i64,
+            31 => sysv::shmctl(a0 as i32, a1, a2, false)?,
+            67 => sysv::shmdt(a0)?,
             165 => {
                 // mount(source, target, fstype, flags, data)
                 const MS_RDONLY: u64 = 1;
@@ -2649,6 +2925,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     let copy = ns().copy();
                     *proc().ns.lock() = copy;
                 }
+                if a0 & CLONE_NEWUSER != 0 {
+                    process::unshare_user(proc().pid);
+                }
                 0
             }
             308 => return Err(EINVAL), // setns
@@ -2727,10 +3006,64 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 write_user(a0, &b)?;
                 0
             }
-            102 | 104 | 107 | 108 | 111 | 112 | 121 => 0, // uid/gid/pgrp/setsid queries: root
-            // setuid, setgid, setpgid, setreuid, setregid, setresuid, setresgid, setfsuid,
-            // setfsgid: accepted (Nova does not check permissions).
-            105 | 106 | 109 | 113 | 114 | 117 | 119 | 122 | 123 => 0,
+            111 | 112 | 121 => 0, // getpgrp, setsid, getpgid
+            109 => 0,             // setpgid
+            102 | 104 | 107 | 108 => {
+                // getuid, getgid, geteuid, getegid
+                let c = proc().cred.lock();
+                (match nr {
+                    102 => c.show(c.uid, false),
+                    107 => c.show(c.euid, false),
+                    104 => c.show(c.gid, true),
+                    _ => c.show(c.egid, true),
+                }) as i64
+            }
+            105 | 106 | 113 | 114 | 117 | 119 => {
+                // setuid, setgid, setreuid, setregid, setresuid, setresgid: allowed for any
+                // id (Nova does not check permissions); -1 keeps a value.
+                let gid = matches!(nr, 106 | 114 | 119);
+                let mut guard = proc().cred.lock();
+                let c = &mut *guard;
+                let ids = match nr {
+                    105 | 106 => [a0, a0, a0],
+                    113 | 114 => [a0, a1, if a1 as u32 != u32::MAX { a1 } else { u32::MAX as u64 }],
+                    _ => [a0, a1, a2],
+                };
+                let ids = ids.map(|v| (v as u32 != u32::MAX).then(|| c.take(v as u32, gid)));
+                let (r, e, sv) = if gid { (&mut c.gid, &mut c.egid, &mut c.sgid) } else { (&mut c.uid, &mut c.euid, &mut c.suid) };
+                for (slot, v) in [r, e, sv].into_iter().zip(ids) {
+                    if let Some(v) = v {
+                        *slot = v;
+                    }
+                }
+                0
+            }
+            122 | 123 => {
+                // setfsuid, setfsgid: the previous one (the effective id)
+                let c = proc().cred.lock();
+                (if nr == 122 { c.show(c.euid, false) } else { c.show(c.egid, true) }) as i64
+            }
+            115 => {
+                // getgroups(size, list)
+                let c = proc().cred.lock();
+                let groups: Vec<u32> = c.groups.iter().map(|&g| c.show(g, true)).collect();
+                drop(c);
+                if a0 != 0 {
+                    if (a0 as usize) < groups.len() {
+                        return Err(EINVAL);
+                    }
+                    write_user(a1, &groups.iter().flat_map(|g| g.to_le_bytes()).collect::<Vec<u8>>())?;
+                }
+                groups.len() as i64
+            }
+            116 => {
+                // setgroups(size, list)
+                let raw = read_user(a1, (a0 as usize).min(65536) * 4)?;
+                let mut c = proc().cred.lock();
+                let groups = raw.chunks_exact(4).map(|b| c.take(u32::from_le_bytes(b.try_into().unwrap()), true)).collect();
+                c.groups = groups;
+                0
+            }
             37 => {
                 // alarm(seconds): SIGALRM later; returns the seconds left of the previous one
                 let old = set_alarm(proc().pid, (a0 > 0).then(|| (a0 * 1_000_000, 0)));
@@ -2764,9 +3097,13 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 0
             }
             118 | 120 => {
-                // getresuid, getresgid: real, effective and saved ids, all 0
-                for p in [a0, a1, a2] {
-                    write_user(p, &0u32.to_le_bytes())?;
+                // getresuid, getresgid: real, effective and saved ids
+                let c = proc().cred.lock();
+                let gid = nr == 120;
+                let ids = if gid { [c.gid, c.egid, c.sgid] } else { [c.uid, c.euid, c.suid] }.map(|v| c.show(v, gid));
+                drop(c);
+                for (p, v) in [a0, a1, a2].into_iter().zip(ids) {
+                    write_user(p, &v.to_le_bytes())?;
                 }
                 0
             }
@@ -3027,6 +3364,7 @@ const CLONE_CHILD_SETTID: u64 = 0x1000000;
 
 const CLONE_VFORK: u64 = 0x4000;
 pub const CLONE_NEWNS: u64 = 0x20000;
+pub const CLONE_NEWUSER: u64 = 0x1000_0000;
 /// CAP_CHECKPOINT_RESTORE: the highest capability number Linux 7.x has.
 const CAP_LAST: u64 = 40;
 
@@ -3038,6 +3376,9 @@ fn clone(f: &SyscallFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u
         let pid = process::fork(f, flags & CLONE_VFORK != 0, stack, (flags & CLONE_SETTLS != 0).then_some(tls))?;
         if flags & CLONE_NEWNS != 0 {
             process::unshare_ns(pid);
+        }
+        if flags & CLONE_NEWUSER != 0 {
+            process::unshare_user(pid);
         }
         if flags & CLONE_PARENT_SETTID != 0 {
             write_user(parent_tid, &(pid as u32).to_le_bytes())?;
@@ -3330,7 +3671,7 @@ fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
         }
         (d, Vec::new(), false)
     } else {
-        channel_read(&file, total, false, flags & 0x40 != 0)?
+        channel_read_flags(&file, total, flags)?
     };
     let mut off = 0;
     for (base, len) in vecs {
@@ -3367,6 +3708,50 @@ fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
         write_user(msg + 8, &0u32.to_le_bytes())?; // msg_namelen: no address
     }
     Ok(data.len() as i64)
+}
+
+/// select: fd_set bitmaps of `n` descriptors (read as bytes, so the same code serves
+/// 32-bit programs); `deadline` in ticks.
+pub fn select_fds(n: usize, rp: u64, wp: u64, ep: u64, deadline: Option<u64>) -> Result<i64, i64> {
+    if n > 4096 {
+        return Err(EINVAL);
+    }
+    let bytes = n.div_ceil(8);
+    let get = |p: u64| -> Result<Vec<u8>, i64> { if p == 0 { Ok(vec![0; bytes]) } else { read_user(p, bytes) } };
+    let (rin, win) = (get(rp)?, get(wp)?);
+    loop {
+        let (mut rout, mut wout) = (vec![0u8; bytes], vec![0u8; bytes]);
+        let mut ready = 0;
+        for fd in 0..n {
+            let (r, w) = (rin[fd / 8] >> (fd % 8) & 1 != 0, win[fd / 8] >> (fd % 8) & 1 != 0);
+            if !r && !w {
+                continue;
+            }
+            let f = fds().get(fd as i64)?;
+            let ev = poll_file(&f).0;
+            if r && ev & (ipc::POLLIN | ipc::POLLHUP | ipc::POLLERR) != 0 {
+                rout[fd / 8] |= 1 << (fd % 8);
+                ready += 1;
+            }
+            if w && ev & (ipc::POLLOUT | ipc::POLLERR) != 0 {
+                wout[fd / 8] |= 1 << (fd % 8);
+                ready += 1;
+            }
+        }
+        if ready > 0 || deadline.is_some_and(|d| pit::ticks() >= d) {
+            for (p, v) in [(rp, &rout), (wp, &wout), (ep, &vec![0u8; bytes])] {
+                if p != 0 {
+                    write_user(p, v)?;
+                }
+            }
+            return Ok(ready);
+        }
+        ipc::wait(deadline);
+        process::check_exiting();
+        if signal::has_deliverable(thread()) {
+            return Err(EINTR);
+        }
+    }
 }
 
 fn poll_fds(ptr: u64, n: usize, deadline: Option<u64>) -> Result<i64, i64> {

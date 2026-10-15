@@ -157,6 +157,73 @@ if [[ -x /usr/bin/Xwayland && -x /usr/bin/xkbcomp ]]; then
     cp -rL /usr/share/X11/xkb "$SYSROOT/usr/share/X11/"
     [[ -f /usr/lib/xorg/protocol.txt ]] && cp /usr/lib/xorg/protocol.txt "$SYSROOT/usr/lib/xorg/"
 fi
+# GNU bash (Steam's launcher scripts need bash), /usr/bin/env, and the system's CA
+# certificates for TLS, from the host.
+if [[ -x /usr/bin/bash ]]; then
+    for f in /usr/bin/bash $(ldd /usr/bin/bash | awk '/=> \//{print $3}'); do
+        mkdir -p "$SYSROOT$(dirname "$f")"
+        cp -L "$f" "$SYSROOT$f"
+    done
+fi
+if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
+    mkdir -p "$SYSROOT/etc/ssl/certs"
+    cp -L /etc/ssl/certs/ca-certificates.crt "$SYSROOT/etc/ssl/certs/"
+fi
+# The rest of glibc (64- and 32-bit): libraries that older programs and Steam's runtime
+# link (libdl, librt, libpthread are stubs in today's glibc), and /bin/bash.
+for dir in /usr/lib /usr/lib32; do
+    for lib in libc.so.6 libdl.so.2 librt.so.1 libpthread.so.0 libutil.so.1 libresolv.so.2 libanl.so.1 libm.so.6 \
+               libnss_files.so.2 libnss_dns.so.2 libgcc_s.so.1 libstdc++.so.6 libz.so.1; do
+        [[ -f "$dir/$lib" ]] && { mkdir -p "$SYSROOT$dir"; cp -L "$dir/$lib" "$SYSROOT$dir/$lib"; }
+    done
+done
+[[ -f /usr/lib32/ld-linux.so.2 ]] && { mkdir -p "$SYSROOT/usr/lib32" "$SYSROOT/lib"; cp -L /usr/lib32/ld-linux.so.2 "$SYSROOT/usr/lib32/"; [[ -e "$SYSROOT/lib/ld-linux.so.2" ]] || cp -L /usr/lib32/ld-linux.so.2 "$SYSROOT/lib/"; }
+[[ -x "$SYSROOT/usr/bin/bash" ]] && { mkdir -p "$SYSROOT/bin"; ln -sf ../usr/bin/bash "$SYSROOT/bin/bash"; }
+# ldconfig (Steam's runtime lists the system libraries with it), its configuration, and the
+# compiled locales (the host's locale-archive).
+if [[ -x /usr/bin/ldconfig ]]; then
+    mkdir -p "$SYSROOT/sbin" "$SYSROOT/usr/bin" "$SYSROOT/etc"
+    cp -L /usr/bin/ldconfig "$SYSROOT/usr/bin/ldconfig"
+    ln -sf ../usr/bin/ldconfig "$SYSROOT/sbin/ldconfig"
+    [[ -f /etc/ld.so.conf ]] && cp /etc/ld.so.conf "$SYSROOT/etc/"
+    [[ -d /etc/ld.so.conf.d ]] && cp -rL /etc/ld.so.conf.d "$SYSROOT/etc/"
+fi
+[[ -f /usr/lib/locale/locale-archive ]] && { mkdir -p "$SYSROOT/usr/lib/locale"; cp /usr/lib/locale/locale-archive "$SYSROOT/usr/lib/locale/"; }
+# Copy files into the sysroot with every library ldd resolves for them; symbolic links
+# stay links (shared data in the image).
+copy_with_deps() {
+    local f lib
+    for f in "$@"; do
+        [[ -e "$f" ]] || continue
+        mkdir -p "$SYSROOT$(dirname "$f")"
+        if [[ -L "$f" ]]; then
+            cp -P "$f" "$SYSROOT$f"
+            copy_with_deps "$(readlink -f "$f")"
+            continue
+        fi
+        [[ -e "$SYSROOT$f" ]] || cp "$f" "$SYSROOT$f"
+        for lib in $(ldd "$f" 2>/dev/null | awk '/=> \//{print $3}'); do
+            [[ -e "$SYSROOT$lib" ]] || copy_with_deps "$lib"
+        done
+    done
+}
+# The host's 32-bit OpenGL stack (libglvnd + Mesa with its software rasterizer): 32-bit
+# programs (Steam's steamui.so) link libGL; the graphics driver always comes from the
+# system, not from Steam's runtime.
+if [[ -f /usr/lib32/libGL.so.1 ]]; then
+    copy_with_deps /usr/lib32/libGL.so.1 /usr/lib32/libGLX.so.0 /usr/lib32/libGLdispatch.so.0 /usr/lib32/libGLX_mesa.so.0 \
+        /usr/lib32/libEGL.so.1 /usr/lib32/libEGL_mesa.so.0 /usr/lib32/libva.so.2 /usr/lib32/libdrm.so.2 \
+        /usr/lib32/dri/swrast_dri.so /usr/lib32/dri/kms_swrast_dri.so
+    [[ -d /usr/share/glvnd ]] && { mkdir -p "$SYSROOT/usr/share"; cp -r /usr/share/glvnd "$SYSROOT/usr/share/"; }
+fi
+# Steam's launcher and bootstrap (Valve's proprietary redistributable), if the host has the
+# steam package: only into this local image, never into the repository.
+if [[ -f /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz && -f /usr/lib/steam/bin_steam.sh ]]; then
+    mkdir -p "$SYSROOT/usr/lib/steam" "$SYSROOT/usr/bin"
+    cp /usr/lib/steam/bin_steam.sh /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz "$SYSROOT/usr/lib/steam/"
+    ln -sf bin_steam.sh "$SYSROOT/usr/lib/steam/steam"
+    ln -sf ../lib/steam/bin_steam.sh "$SYSROOT/usr/bin/steam"
+fi
 # The Chromium engine (scripts/fetch-chromium.sh), if downloaded: its libraries too.
 CHROMIUM="$BUILD/chromium/chrome-headless-shell-linux64"
 if [[ -x "$CHROMIUM/chrome-headless-shell" ]]; then
@@ -183,6 +250,19 @@ if [[ -x "$CHROMIUM/chrome-headless-shell" ]]; then
         [[ -f "/usr/share/fonts/$f" ]] && { mkdir -p "$SYSROOT/usr/share/fonts/$(dirname "$f")"; cp -L "/usr/share/fonts/$f" "$SYSROOT/usr/share/fonts/$f"; }
     done
 fi
+# GNU readlink, realpath, tar, xz and gzip (scripts use options BusyBox lacks, e.g. readlink
+# -e or tar --checkpoint, as Steam's runtime setup does), from the
+# host; BusyBox provides the other tools.
+for tool in readlink realpath tar xz gzip; do
+    if [[ -x "/usr/bin/$tool" ]]; then
+        mkdir -p "$SYSROOT/bin"
+        cp -L "/usr/bin/$tool" "$SYSROOT/bin/$tool"
+        for lib in $(ldd "/usr/bin/$tool" | awk '/=> \//{print $3}'); do
+            mkdir -p "$SYSROOT$(dirname "$lib")"
+            cp -L "$lib" "$SYSROOT$lib"
+        done
+    fi
+done
 # BusyBox (scripts/fetch-busybox.sh), if built: bin/busybox plus one link per tool.
 if [[ -x "$BUILD/busybox/busybox" ]]; then
     log "Including BusyBox $(cat "$BUILD/busybox/VERSION") ($(wc -l < "$BUILD/busybox/applets") tools)"
@@ -191,6 +271,9 @@ if [[ -x "$BUILD/busybox/busybox" ]]; then
     while read -r tool; do
         [[ -n "$tool" && "$tool" != busybox && ! -e "$SYSROOT/bin/$tool" ]] && ln -s busybox "$SYSROOT/bin/$tool"
     done < "$BUILD/busybox/applets"
+    # Scripts start with #!/usr/bin/env.
+    mkdir -p "$SYSROOT/usr/bin"
+    [[ -e "$SYSROOT/usr/bin/env" ]] || ln -s ../../bin/busybox "$SYSROOT/usr/bin/env"
 fi
 # The dynamic loader looks in /usr/lib: make sure every library is there.
 if [[ -d "$SYSROOT/usr/lib64" ]]; then mkdir -p "$SYSROOT/usr/lib"; cp -n "$SYSROOT"/usr/lib64/* "$SYSROOT/usr/lib/" 2>/dev/null || true; fi

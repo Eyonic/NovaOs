@@ -184,6 +184,30 @@ pub struct Info {
     pub dns: Vec<Ipv4Address>,
 }
 
+/// One line per TCP socket: state, endpoints, bytes waiting to be read and to be sent,
+/// and the peer's advertised window (the `netstat` shell command).
+pub fn tcp_sockets() -> Vec<String> {
+    with_stack(|s| {
+        let mut v = Vec::new();
+        for (h, sock) in s.sockets.iter() {
+            if let smoltcp::socket::Socket::Tcp(t) = sock {
+                v.push(alloc::format!(
+                    "{h:?} {:?} local {:?} remote {:?} recv-q {} send-q {} can-recv {} can-send {}",
+                    t.state(),
+                    t.local_endpoint(),
+                    t.remote_endpoint(),
+                    t.recv_queue(),
+                    t.send_queue(),
+                    t.can_recv(),
+                    t.can_send()
+                ));
+            }
+        }
+        v
+    })
+    .unwrap_or_default()
+}
+
 pub fn info() -> Option<Info> {
     with_stack(|s| Info { mac: s.device.0.mac(), link: s.device.0.link_up(), ip: s.ip, gateway: s.gateway, dns: s.dns_servers.clone() })
         .ok()
