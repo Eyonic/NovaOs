@@ -278,7 +278,7 @@ impl Settings {
                     if targets.is_empty() {
                         col.text(&mut c, "No disk large enough to install onto was found.");
                     }
-                    let card = col.card(&mut c, targets.len());
+                    let card = if targets.is_empty() { Rect::new(col.x, col.y, col.w, 0) } else { col.card(&mut c, targets.len()) };
                     for (i, t) in targets.iter().enumerate() {
                         let y = card.y + i as i32 * ui::ROW_H;
                         if i > 0 {
