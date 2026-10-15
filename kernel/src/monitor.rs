@@ -76,11 +76,14 @@ struct Monitor {
     peak_rate: u64,
     /// End buttons on the Apps page: (window id, rect).
     end_buttons: Vec<(usize, Rect)>,
+    /// Pointer position inside the window (None when it is elsewhere), button held.
+    cursor: Option<(i32, i32)>,
+    held: bool,
 }
 
 impl Monitor {
     fn new(win: WindowRef) -> Self {
-        let mut m = Self { win, page: Page::Cpu, cpu: VecDeque::new(), mem: VecDeque::new(), disk: VecDeque::new(), net: VecDeque::new(), last_net: net::counters(), net_rate: (0, 0), peak_rate: 1, end_buttons: Vec::new() };
+        let mut m = Self { win, page: Page::Cpu, cpu: VecDeque::new(), mem: VecDeque::new(), disk: VecDeque::new(), net: VecDeque::new(), last_net: net::counters(), net_rate: (0, 0), peak_rate: 1, end_buttons: Vec::new(), cursor: None, held: false };
         m.sample();
         m
     }
@@ -133,7 +136,11 @@ impl Monitor {
     }
 
     fn nav_rect(i: usize) -> Rect {
-        if i < 4 { Rect::new(10, 52 + i as i32 * 78, SIDEBAR_W - 20, 70) } else { Rect::new(10, 52 + 4 * 78 + 40 + (i - 4) as i32 * 46, SIDEBAR_W - 20, 40) }
+        if i < 4 { Rect::new(ui::GAP, 48 + i as i32 * 76, SIDEBAR_W - 2 * ui::GAP, 70) } else { Rect::new(ui::GAP, 48 + 4 * 76 + 36 + (i - 4) as i32 * (ui::NAV_ROW_H + 2), SIDEBAR_W - 2 * ui::GAP, ui::NAV_ROW_H) }
+    }
+
+    fn state(&self, r: Rect) -> ui::State {
+        ui::state(self.cursor, self.held, r)
     }
 
     fn run(&mut self) {
@@ -142,7 +149,16 @@ impl Monitor {
         loop {
             match wm::wait_event(&self.win, Some(pit::HZ / 4)) {
                 Some(Event::Close) => return,
-                Some(Event::MouseDown { x, y, .. }) => self.click(x, y),
+                Some(Event::MouseDown { x, y, .. }) => {
+                    self.held = true;
+                    self.cursor = Some((x, y));
+                    self.click(x, y);
+                }
+                Some(Event::MouseUp { x, y }) => {
+                    self.held = false;
+                    self.cursor = Some((x, y));
+                }
+                Some(Event::MouseMove { x, y }) => self.cursor = (x >= 0 && y >= 0).then_some((x, y)),
                 Some(Event::Key(k)) => {
                     let i = PAGES.iter().position(|p| *p == self.page).unwrap_or(0);
                     match k {
@@ -218,9 +234,9 @@ impl Monitor {
     }
 
     fn card(c: &mut Canvas, r: Rect, label: &str, value: &str) {
-        c.fill_round_rect(r, 12, ui::PANEL);
-        font::draw(c, r.x + 16, r.y + 12, label, 12, Weight::Bold, ui::DIM);
-        font::draw_clipped(c, r.x + 16, r.y + 32, value, 18, Weight::Bold, ui::TEXT, r.w - 32);
+        ui::card(c, r);
+        ui::section_label(c, r.x + ui::PAD, r.y + 12, label);
+        font::draw_clipped(c, r.x + ui::PAD, r.y + 34, value, ui::TITLE_2, Weight::Bold, ui::TEXT, r.w - 2 * ui::PAD);
     }
 
     fn render(&mut self) {
@@ -231,44 +247,48 @@ impl Monitor {
 
         // Sidebar with sparklines.
         c.fill_rect(Rect::new(0, 0, SIDEBAR_W, h), ui::SIDEBAR);
-        c.fill_rect(Rect::new(SIDEBAR_W - 1, 0, 1, h), ui::BORDER);
-        font::draw(&mut c, 20, 18, "PERFORMANCE", 12, Weight::Bold, ui::DIM);
+        ui::divider(&mut c, Rect::new(SIDEBAR_W - 1, 0, 1, h));
+        ui::section_label(&mut c, ui::PAD + 4, 18, "Performance");
         for (i, p) in PAGES.iter().enumerate() {
             let r = Self::nav_rect(i);
             let active = *p == self.page;
-            if active {
-                c.fill_round_rect(r, 10, ui::SELECTION);
-            }
             let (label, value) = self.summary(*p);
             if i < 4 {
+                let state = self.state(r);
+                if active {
+                    c.fill_round_rect(r, ui::RADIUS, ui::SELECTION);
+                } else if state != ui::State::Normal {
+                    c.fill_round_rect(r, ui::RADIUS, ui::HOVER);
+                }
                 let spark = Rect::new(r.x + 12, r.y + 12, 64, r.h - 24);
                 c.fill_round_rect(Rect::new(spark.x - 2, spark.y - 2, spark.w + 4, spark.h + 4), 6, 0x15161F);
                 Self::chart(&mut c, spark, self.history(*p), page_color(*p), false);
-                font::draw(&mut c, r.x + 88, r.y + 14, &label, 15, Weight::Bold, ui::TEXT);
+                font::draw(&mut c, r.x + 88, r.y + 14, &label, ui::HEADING, Weight::Bold, ui::TEXT);
                 font::draw_clipped(&mut c, r.x + 88, r.y + 36, &value, 13, Weight::Regular, ui::DIM, r.w - 96);
             } else {
-                c.fill_circle(r.x + 20, r.y + 20, 5, page_color(*p));
-                font::draw(&mut c, r.x + 36, r.y + 10, &label, 15, if active { Weight::Bold } else { Weight::Regular }, ui::TEXT);
+                let glyph = if *p == Page::Apps { "grid" } else { "cpu" };
+                ui::nav_row(&mut c, r, Some((glyph, None)), &label, active, self.state(r));
             }
         }
         if 4 < PAGES.len() {
-            font::draw(&mut c, 20, Self::nav_rect(4).y - 26, "SYSTEM", 12, Weight::Bold, ui::DIM);
+            ui::section_label(&mut c, ui::PAD + 4, Self::nav_rect(4).y - 24, "System");
         }
 
         // Main pane.
         let mx = SIDEBAR_W + 28;
         let mw = w - mx - 28;
         let (title, value) = self.summary(self.page);
-        font::draw(&mut c, mx, 22, &title, 26, Weight::Bold, ui::TEXT);
+        font::draw(&mut c, mx, 24, &title, ui::TITLE, Weight::Bold, ui::TEXT);
         let vw = font::width(&value, 16, Weight::Bold);
         font::draw(&mut c, w - 28 - vw, 30, &value, 16, Weight::Bold, page_color(self.page));
         let color = page_color(self.page);
         match self.page {
             Page::Cpu | Page::Memory | Page::Storage | Page::Network => {
                 let graph = Rect::new(mx, 74, mw, h - 74 - 130);
-                c.fill_round_rect(Rect::new(graph.x - 1, graph.y - 1, graph.w + 2, graph.h + 2), 12, 0x1A1B26);
+                c.fill_round_rect(Rect::new(graph.x - 1, graph.y - 1, graph.w + 2, graph.h + 2), ui::RADIUS, 0x1A1B26);
+                c.stroke_round_rect_w(Rect::new(graph.x - 1, graph.y - 1, graph.w + 2, graph.h + 2), ui::RADIUS, 1, ui::BORDER);
                 Self::chart(&mut c, Rect::new(graph.x + 1, graph.y + 8, graph.w - 2, graph.h - 9), self.history(self.page), color, true);
-                font::draw(&mut c, graph.x + 12, graph.y + graph.h - 22, "60 seconds", 12, Weight::Regular, ui::FAINT);
+                font::draw(&mut c, graph.x + 12, graph.y + graph.h - 22, "60 seconds", ui::CAPTION, Weight::Regular, ui::DIM);
                 let cards: Vec<(String, String)> = match self.page {
                     Page::Cpu => {
                         let avg = self.cpu.iter().sum::<u32>() / self.cpu.len().max(1) as u32;
@@ -298,20 +318,28 @@ impl Monitor {
                 }
             }
             Page::Apps => {
-                font::draw(&mut c, mx, 74, "OPEN APPS", 12, Weight::Bold, ui::DIM);
-                let mut y = 98;
-                for wnd in wm::windows() {
-                    let r = Rect::new(mx, y, mw, 44);
-                    c.fill_round_rect(r, 10, ui::PANEL);
-                    crate::icons::draw(&mut c, wnd.icon, wnd.accent, Rect::new(r.x + 10, r.y + 8, 28, 28));
-                    font::draw_clipped(&mut c, r.x + 50, r.y + 12, &wnd.title, 15, Weight::Bold, ui::TEXT, r.w - 160);
-                    let b = Rect::new(r.x + r.w - 92, r.y + 8, 80, 28);
-                    ui::button(&mut c, b, "End", false);
-                    self.end_buttons.push((wnd.id, b));
-                    y += 52;
+                let mut y = ui::section_label(&mut c, mx, 74, "Open apps");
+                let windows = wm::windows();
+                if windows.is_empty() {
+                    font::draw(&mut c, mx, y + 4, "No apps are open. Home lists what you can start.", ui::BODY, Weight::Regular, ui::DIM);
+                    y += 30;
+                } else {
+                    let card = Rect::new(mx, y, mw, windows.len() as i32 * ui::ROW_H);
+                    ui::card(&mut c, card);
+                    for (i, wnd) in windows.iter().enumerate() {
+                        let r = Rect::new(card.x, card.y + i as i32 * ui::ROW_H, card.w, ui::ROW_H);
+                        if i > 0 {
+                            ui::divider(&mut c, Rect::new(r.x + ui::PAD, r.y, r.w - 2 * ui::PAD, 1));
+                        }
+                        crate::icons::draw(&mut c, wnd.icon, wnd.accent, Rect::new(r.x + ui::PAD, r.y + (ui::ROW_H - 24) / 2, 24, 24));
+                        font::draw_clipped(&mut c, r.x + ui::PAD + 36, r.y + (ui::ROW_H - font::line_height(ui::BODY)) / 2, &wnd.title, ui::BODY, Weight::Regular, ui::TEXT, r.w - 160);
+                        let b = Rect::new(r.x + r.w - ui::PAD - 72, r.y + (ui::ROW_H - 28) / 2, 72, 28);
+                        ui::button_kind(&mut c, b, "End", ui::Kind::Secondary, self.state(b));
+                        self.end_buttons.push((wnd.id, b));
+                    }
+                    y = card.y + card.h + 24;
                 }
-                font::draw(&mut c, mx, y + 14, "BACKGROUND TASKS", 12, Weight::Bold, ui::DIM);
-                y += 40;
+                y = ui::section_label(&mut c, mx, y, "Background tasks") + 4;
                 let tasks = task::list();
                 let col_w = mw / 2;
                 for (i, (id, name, state)) in tasks.iter().enumerate() {
@@ -331,36 +359,31 @@ impl Monitor {
             Page::Hardware => {
                 let (u, f) = memory::heap_usage();
                 let cw = (mw - 16) / 2;
-                Self::card(&mut c, Rect::new(mx, 74, cw, 84), "PROCESSOR", &crate::cpu::brand());
-                Self::card(&mut c, Rect::new(mx + cw + 16, 74, cw, 84), "MEMORY", &fmt_bytes((u + f) as u64));
-                let mut y = 176;
-                font::draw(&mut c, mx, y, "DISKS", 12, Weight::Bold, ui::DIM);
-                y += 22;
+                Self::card(&mut c, Rect::new(mx, 74, cw, 84), "Processor", &crate::cpu::brand());
+                Self::card(&mut c, Rect::new(mx + cw + 16, 74, cw, 84), "Memory", &fmt_bytes((u + f) as u64));
+                let mut y = ui::section_label(&mut c, mx, 178, "Disks");
                 for d in storage::list() {
-                    font::draw_clipped(&mut c, mx, y, &format!("{}  \u{00b7}  {}{}", d.name, fmt_bytes(d.sectors * 512), if d.is_boot { "  \u{00b7}  boot disk" } else { "" }), 14, Weight::Regular, ui::TEXT, mw);
-                    y += 22;
+                    ui::symbol(&mut c, "drive", ui::DIM, Rect::new(mx, y + 1, 16, 16));
+                    font::draw_clipped(&mut c, mx + 24, y, &format!("{}  \u{00b7}  {}{}", d.name, fmt_bytes(d.sectors * 512), if d.is_boot { "  \u{00b7}  boot disk" } else { "" }), ui::BODY, Weight::Regular, ui::TEXT, mw);
+                    y += 24;
                 }
-                y += 10;
-                font::draw(&mut c, mx, y, "DEVICES AND DRIVERS", 12, Weight::Bold, ui::DIM);
-                y += 24;
+                y = ui::section_label(&mut c, mx, y + 12, "Devices and drivers");
                 for r in drivers::records() {
                     if y > h - 30 {
                         break;
                     }
                     let (chip, chip_color) = match &r.status {
-                        drivers::Status::Bound { driver, .. } => (driver.to_string(), 0x8FD694),
+                        drivers::Status::Bound { driver, .. } => (driver.to_string(), ui::SUCCESS),
                         drivers::Status::Failed { driver, .. } => (format!("{driver} failed"), ui::DANGER),
-                        drivers::Status::NotNeeded => ("built in".into(), ui::FAINT),
-                        drivers::Status::Missing => ("no driver".into(), 0xF2C46D),
-                        drivers::Status::Ported { .. } => ("port drafted".into(), 0x7AA8FF),
+                        drivers::Status::NotNeeded => ("built in".into(), ui::DIM),
+                        drivers::Status::Missing => ("no driver".into(), ui::WARNING),
+                        drivers::Status::Ported { .. } => ("port drafted".into(), ui::INFO),
                     };
                     let name = format!("{} {}", pci::vendor_name(r.device.vendor), r.device.class_name());
-                    font::draw_clipped(&mut c, mx, y, &name, 14, Weight::Regular, ui::TEXT, mw - 160);
-                    let tw = font::width(&chip, 12, Weight::Bold) + 18;
-                    let cr = Rect::new(mx + mw - tw, y - 2, tw, 22);
-                    c.fill_round_rect(cr, 11, blend(ui::PANEL, chip_color, 60));
-                    font::draw(&mut c, cr.x + 9, cr.y + 3, &chip, 12, Weight::Bold, chip_color);
-                    y += 30;
+                    font::draw_clipped(&mut c, mx, y, &name, ui::BODY, Weight::Regular, ui::TEXT, mw - 160);
+                    let tw = font::width(&chip, ui::LABEL, Weight::Bold) + 16;
+                    ui::badge(&mut c, mx + mw - tw, y - 1, &chip, chip_color);
+                    y += 28;
                 }
             }
         }

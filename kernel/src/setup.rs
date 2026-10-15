@@ -30,10 +30,17 @@ pub fn cmdline_flag(name: &str) -> Option<&'static str> {
     limine::EXECUTABLE_CMDLINE.get()?.split_whitespace().find_map(|a| a.strip_prefix(name)?.strip_prefix('='))
 }
 
+/// First-boot setup has three steps; each announces itself so the user knows how far
+/// along it is (one task per screen, progress visible).
+fn step(n: u8, title: &str) {
+    println!();
+    println!("  {DIM}Step {n} of 3{RESET}");
+    println!("{BOLD}{title}{RESET}");
+}
+
 /// Step 1: drivers, storage and network. Prints one line per device.
 pub fn hardware() {
-    println!();
-    println!("{BOLD}Setting up this computer{RESET}");
+    step(1, "Setting up this computer");
     println!("  {DIM}Detecting hardware and installing Nova's Rust drivers...{RESET}");
     let probed = drivers::probe_all(|r| {
         let (mark, text) = match &r.status {
@@ -147,8 +154,7 @@ fn port_drivers(cfg: &Config) {
         println!("  {GREEN}\u{2713}{RESET} every device has a driver; nothing to port.");
         return;
     }
-    println!();
-    println!("{BOLD}Porting drivers with {}{RESET}", cfg.provider.name());
+    step(2, &format!("Porting drivers with {}", cfg.provider.name()));
     for r in &missing {
         println!("  {ORANGE}?{RESET} {}", r.describe());
     }
@@ -177,12 +183,11 @@ fn offer_install() -> bool {
     }
     let targets = install::targets();
     let Some(target) = targets.first() else { return false };
-    println!();
-    println!("{BOLD}Install Nova{RESET}");
+    step(3, "Install Nova");
     println!("  You are running Nova from the installation image.");
     println!("  Disk {}: {} ({} MiB) can hold an installed system. {ORANGE}Installing erases it.{RESET}", target.index, target.name, target.sectors / 2048);
     if cmdline_flag("nova.install") == Some("no") || !ask_yes_no(&format!("  Install Nova on disk {}?", target.index), true) {
-        println!("  {DIM}Continuing live. You can install later from Settings.{RESET}");
+        println!("  {DIM}Continuing live. You can install later from Settings (Storage & install).{RESET}");
         return false;
     }
     let _ = fs::write("system/setup-done", b"1\n");
@@ -226,6 +231,7 @@ pub fn run() -> ! {
     if first_boot {
         claude::welcome(&cfg);
         println!("  Welcome to Nova. {} will help set up this computer and build apps for you.", cfg.provider.app_name());
+        println!("  {DIM}Three steps: sign in, port drivers, install. Each one can be skipped and done later.{RESET}");
         if claude::sign_in(&mut cfg) {
             port_drivers(&cfg);
         } else if !missing_devices().is_empty() {
@@ -234,6 +240,7 @@ pub fn run() -> ! {
         offer_install();
         let _ = fs::write("system/setup-done", b"1\n");
         println!();
+        println!("  {GREEN}\u{2713}{RESET} Setup is done. Press the Windows key for Home, F1 for the assistant.");
         println!("  {DIM}Starting the desktop...{RESET}");
         task::sleep_ticks(pit::HZ);
     }

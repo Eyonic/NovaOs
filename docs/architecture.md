@@ -327,7 +327,35 @@ are generated images from `assets/` (see assets/README.md). Glyphs are white-on-
 tinted when drawn (`Canvas::draw_mask`).
 
 Window content is a `gfx::Canvas` handed over by the app (`wm::present`) or a terminal grid.
-Apps receive `wm::Event`s (keys, mouse down/up/move, wheel, resize, close).
+Apps receive `wm::Event`s (keys, mouse down/up/move, wheel, resize, close). The window under
+the pointer gets `MouseMove` even when no button is held (and `(-1, -1)` when the pointer
+leaves), so apps can draw hover and pressed states.
+
+### Design system (0.9)
+
+The look follows what the macOS, Windows 11 and GNOME guidelines agree on, kept in `ui.rs` as
+tokens so every app draws the same way:
+
+- Surfaces lighten with elevation (base, sidebar, card, popover) instead of leaning on shadows;
+  windows still get one soft shadow that surrounds the frame (ambient plus a key light from
+  above, `Canvas::shadow_round`), the same size focused or not and lighter when inactive.
+- Secondary text keeps at least 4.5:1 contrast on the cards it sits on (WCAG AA); the faint
+  colour is for hints and decoration only; filled buttons use a darker accent so white labels
+  pass too. The accent is reserved for the one primary action, selection and focus rings.
+- A 4/8 px grid: 32 px controls, 44 px boxed-list rows, 36 px sidebar rows, 16 px surface
+  padding; corners 8 px on controls, 10 on cards, 12 on popovers and window frames (the client
+  area follows the frame at the bottom through per-corner clipping).
+- Every rounded shape, disc and ring is anti-aliased (`gfx.rs` computes coverage from the
+  pixel centre to the arc). Images and glyph masks shrink through a box filter (up to 4x4
+  samples per pixel), so icons stay crisp at 16-24 px.
+- States: hover and pressed fills, disabled at reduced contrast, 2 px focus rings; empty
+  views show a glyph, a heading and one line; feedback is a toast, not a status line.
+- Icons: the app icons are one generated set (same tile, gradient and light); UI icons are
+  the symbolic glyph set in `assets/glyphs/` (one stroke weight, one keyline box), tinted in
+  the text colours or drawn white on a coloured tile for sidebar sections.
+
+Home follows the same grid and adds type-to-search: letters typed on Home filter every tab
+into one Results row (fuzzy on titles, phrase match on descriptions), Escape clears.
 
 ## Core apps (0.7)
 

@@ -605,21 +605,35 @@ impl Browser {
         let mut c = Canvas::new(w as usize, h as usize);
         c.clear(0xFFFFFF);
         // Page.
+        use crate::font::{self, Weight};
+        use crate::ui;
         match (&self.page, &self.error) {
             (_, Some(err)) => {
-                c.fill_rect(Rect::new(0, TOOLBAR, w, h - TOOLBAR), 0x1E1F24);
-                c.text(24, TOOLBAR + 30, "Nova Browser", 0xFFFFFF);
-                let mut y = TOOLBAR + 60;
-                for chunk in err.as_bytes().chunks(((w - 48) / 8).max(10) as usize) {
-                    c.text(24, y, core::str::from_utf8(chunk).unwrap_or(""), 0xFF9C8A);
-                    y += 18;
+                // An error page: glyph, heading, the message, in the UI font.
+                let area = Rect::new(0, TOOLBAR, w, h - TOOLBAR - STATUS);
+                c.fill_rect(area, ui::BG);
+                let (cx, cy) = (w / 2, area.y + area.h / 2 - 60);
+                c.fill_circle(cx, cy, 36, ui::PANEL);
+                ui::symbol(&mut c, "warning", ui::WARNING, Rect::new(cx - 20, cy - 20, 40, 40));
+                let title = "Nova Browser could not start";
+                let tw = font::width(title, ui::TITLE_2, Weight::Bold);
+                font::draw(&mut c, cx - tw / 2, cy + 52, title, ui::TITLE_2, Weight::Bold, ui::TEXT);
+                let mut y = cy + 52 + font::line_height(ui::TITLE_2) + 6;
+                for line in font::wrap(err, ui::BODY, Weight::Regular, (w - 96).min(560), 4) {
+                    let lw = font::width(&line, ui::BODY, Weight::Regular);
+                    font::draw(&mut c, cx - lw / 2, y, &line, ui::BODY, Weight::Regular, ui::DIM);
+                    y += font::line_height(ui::BODY);
                 }
             }
             (Some(p), None) => c.blit(p, p.bounds(), 0, TOOLBAR),
             (None, None) => {
-                c.fill_rect(Rect::new(0, TOOLBAR, w, h - TOOLBAR), 0x1E1F24);
-                c.text_scaled(w / 2 - 96, h / 2 - 40, "Nova", 0xFB542B, 4);
-                c.text(w / 2 - (self.status.len() as i32 * 4), h / 2 + 40, &self.status, 0xC8C8D0);
+                // Starting: the wordmark and what is happening.
+                let area = Rect::new(0, TOOLBAR, w, h - TOOLBAR - STATUS);
+                c.fill_rect(area, ui::BG);
+                let tw = font::width("nova", 44, Weight::Bold);
+                font::draw(&mut c, (w - tw) / 2, area.y + area.h / 2 - 50, "nova", 44, Weight::Bold, 0xFB542B);
+                let sw = font::width(&self.status, ui::BODY, Weight::Regular);
+                font::draw(&mut c, (w - sw) / 2, area.y + area.h / 2 + 14, &self.status, ui::BODY, Weight::Regular, ui::DIM);
             }
         }
         // Toolbar: round glyph buttons, a light pill address bar, the Shields button.
@@ -676,25 +690,27 @@ impl Browser {
         c.fill_rect(Rect::new(0, h - STATUS, w, STATUS), 0x252634);
         let status = if self.loading { format!("{} ...", self.status) } else { self.status.clone() };
         crate::font::draw_clipped(&mut c, 14, h - STATUS + 5, &status, 13, crate::font::Weight::Regular, 0xB4B5C4, w - 28);
-        // Shields panel.
+        // Shields panel: a popover under the shield button.
         if self.panel {
             let p = self.panel_rect(w);
-            c.shadow(p, 10);
-            c.fill_round_rect(p, 10, 0x2B2C31);
-            c.text(p.x + 16, p.y + 14, &format!("Shields {} for {}", if up { "UP" } else { "DOWN" }, host), 0xFFFFFF);
-            c.text(p.x + 16, p.y + 40, &format!("{} trackers and ads blocked", self.blocked.len()), 0xFB542B);
-            c.text(p.x + 16, p.y + 60, &format!("{} connection(s) upgraded to HTTPS", self.upgraded), 0xC8C8D0);
+            c.shadow_round(p, ui::RADIUS_L, 20, 140);
+            c.fill_round_rect(p, ui::RADIUS_L, ui::RAISED);
+            c.stroke_round_rect_w(p, ui::RADIUS_L, 1, crate::gfx::blend(ui::RAISED, 0xFFFFFF, 22));
+            ui::symbol(&mut c, "shield", if up { 0xFB542B } else { ui::FAINT }, Rect::new(p.x + ui::PAD, p.y + ui::PAD, 22, 22));
+            font::draw_clipped(&mut c, p.x + ui::PAD + 32, p.y + ui::PAD + 1, &format!("Shields {} for {host}", if up { "up" } else { "down" }), ui::HEADING, Weight::Bold, ui::TEXT, p.w - 2 * ui::PAD - 32);
+            let n = self.blocked.len();
+            font::draw(&mut c, p.x + ui::PAD, p.y + 50, &format!("{n} tracker{} and ad{} blocked", if n == 1 { "" } else { "s" }, if n == 1 { "" } else { "s" }), ui::BODY, Weight::Bold, 0xFB542B);
+            font::draw(&mut c, p.x + ui::PAD, p.y + 72, &format!("{} connection{} upgraded to HTTPS", self.upgraded, if self.upgraded == 1 { "" } else { "s" }), ui::BODY, Weight::Regular, ui::DIM);
             let mut hosts: Vec<&String> = self.blocked.iter().collect();
             hosts.sort();
             hosts.dedup();
-            for (i, hst) in hosts.iter().take(6).enumerate() {
-                c.text_clipped(p.x + 24, p.y + 86 + i as i32 * 18, hst, 0x9A9AA5, p.w - 40);
+            for (i, hst) in hosts.iter().take(5).enumerate() {
+                font::draw_clipped(&mut c, p.x + ui::PAD + 8, p.y + 100 + i as i32 * 18, hst, ui::CAPTION + 1, Weight::Regular, ui::DIM, p.w - 2 * ui::PAD - 8);
             }
-            c.text(p.x + 16, p.y + p.h - 70, &format!("{} filter list rules + built-in list", self.shields.list_rules), 0x7A7A85);
-            let btn = Rect::new(p.x + 16, p.y + p.h - 46, p.w - 32, 30);
-            c.fill_round_rect(btn, 8, if up { 0x4A4B53 } else { 0xFB542B });
+            font::draw(&mut c, p.x + ui::PAD, p.y + p.h - 76, &format!("{} filter list rules + built-in list", self.shields.list_rules), ui::CAPTION, Weight::Regular, ui::DIM);
+            let btn = Rect::new(p.x + ui::PAD, p.y + p.h - ui::PAD - ui::CONTROL_H, p.w - 2 * ui::PAD, ui::CONTROL_H);
             let label = if up { "Turn Shields down for this site" } else { "Turn Shields up for this site" };
-            c.text(btn.x + (btn.w - label.len() as i32 * 8) / 2, btn.y + 7, label, 0xFFFFFF);
+            ui::button_kind(&mut c, btn, label, if up { ui::Kind::Secondary } else { ui::Kind::Primary }, ui::State::Normal);
         }
         wm::present(&self.win, &c);
     }

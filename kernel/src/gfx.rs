@@ -115,41 +115,93 @@ impl Canvas {
         self.fill_rect(Rect::new(r.x + r.w - 1, r.y, 1, r.h), color);
     }
 
-    /// Rectangle with corners rounded by `radius`.
+    /// Blend one pixel: `color` at `alpha` over what is there.
+    #[inline]
+    pub fn blend_px(&mut self, x: i32, y: i32, color: u32, alpha: u32) {
+        if x >= 0 && y >= 0 && (x as usize) < self.width && (y as usize) < self.height {
+            let i = y as usize * self.width + x as usize;
+            self.pixels[i] = if alpha >= 255 { color } else { blend(self.pixels[i], color, alpha) };
+        }
+    }
+
+    /// Rectangle with all four corners rounded by `radius` (anti-aliased).
     pub fn fill_round_rect(&mut self, r: Rect, radius: i32, color: u32) {
+        self.fill_round_rect_corners(r, radius, color, ALL_CORNERS, 255);
+    }
+
+    /// Rectangle with the `corners` in `which` rounded (see [`TOP_CORNERS`]), filled with
+    /// `color` at `alpha`. The corners are anti-aliased, so edges look smooth at any size.
+    pub fn fill_round_rect_corners(&mut self, r: Rect, radius: i32, color: u32, which: u8, alpha: u32) {
         let radius = radius.min(r.w / 2).min(r.h / 2).max(0);
-        for dy in 0..r.h {
-            let inset = if dy < radius {
-                let y = radius - dy;
-                radius - isqrt(radius * radius - y * y)
-            } else if dy >= r.h - radius {
-                let y = dy - (r.h - radius) + 1;
-                radius - isqrt((radius * radius - y * y).max(0))
-            } else {
-                0
-            };
-            self.fill_rect(Rect::new(r.x + inset, r.y + dy, r.w - 2 * inset, 1), color);
+        if radius == 0 || which == 0 {
+            if alpha >= 255 { self.fill_rect(r, color) } else { self.blend_rect(r, color, alpha) }
+            return;
+        }
+        let fill = |c: &mut Canvas, rr: Rect| if alpha >= 255 { c.fill_rect(rr, color) } else { c.blend_rect(rr, color, alpha) };
+        // The middle band, then the top and bottom bands minus whatever corners are round.
+        fill(self, Rect::new(r.x, r.y + radius, r.w, r.h - 2 * radius));
+        for (band_y, left, right) in [(r.y, which & TOP_LEFT != 0, which & TOP_RIGHT != 0), (r.y + r.h - radius, which & BOTTOM_LEFT != 0, which & BOTTOM_RIGHT != 0)] {
+            let x0 = if left { r.x + radius } else { r.x };
+            let x1 = if right { r.x + r.w - radius } else { r.x + r.w };
+            fill(self, Rect::new(x0, band_y, x1 - x0, radius));
+        }
+        for dy in 0..radius {
+            for dx in 0..radius {
+                let a = corner_coverage(dx, dy, radius) * alpha / 255;
+                if a == 0 {
+                    continue;
+                }
+                if which & TOP_LEFT != 0 {
+                    self.blend_px(r.x + dx, r.y + dy, color, a);
+                }
+                if which & TOP_RIGHT != 0 {
+                    self.blend_px(r.x + r.w - 1 - dx, r.y + dy, color, a);
+                }
+                if which & BOTTOM_LEFT != 0 {
+                    self.blend_px(r.x + dx, r.y + r.h - 1 - dy, color, a);
+                }
+                if which & BOTTOM_RIGHT != 0 {
+                    self.blend_px(r.x + r.w - 1 - dx, r.y + r.h - 1 - dy, color, a);
+                }
+            }
+        }
+    }
+
+    /// Rounded rectangle filled with `color` at `alpha` over what is there.
+    pub fn blend_round_rect(&mut self, r: Rect, radius: i32, color: u32, alpha: u32) {
+        self.fill_round_rect_corners(r, radius, color, ALL_CORNERS, alpha);
+    }
+
+    /// Outline of a rounded rectangle, `width` px wide, anti-aliased (focus rings, borders).
+    pub fn stroke_round_rect_w(&mut self, r: Rect, radius: i32, width: i32, color: u32) {
+        let radius = radius.min(r.w / 2).min(r.h / 2).max(0);
+        let w = width.max(1);
+        let ir = (radius - w).max(0); // the inner rectangle's corner radius
+        // Straight edges.
+        self.fill_rect(Rect::new(r.x + radius, r.y, r.w - 2 * radius, w), color);
+        self.fill_rect(Rect::new(r.x + radius, r.y + r.h - w, r.w - 2 * radius, w), color);
+        self.fill_rect(Rect::new(r.x, r.y + radius, w, r.h - 2 * radius), color);
+        self.fill_rect(Rect::new(r.x + r.w - w, r.y + radius, w, r.h - 2 * radius), color);
+        // Corners: outer coverage minus inner coverage.
+        for dy in 0..radius {
+            for dx in 0..radius {
+                let outer = corner_coverage(dx, dy, radius);
+                let inner = if dx >= w && dy >= w { corner_coverage(dx - w, dy - w, ir) } else { 0 };
+                let a = outer.saturating_sub(inner);
+                if a == 0 {
+                    continue;
+                }
+                self.blend_px(r.x + dx, r.y + dy, color, a);
+                self.blend_px(r.x + r.w - 1 - dx, r.y + dy, color, a);
+                self.blend_px(r.x + dx, r.y + r.h - 1 - dy, color, a);
+                self.blend_px(r.x + r.w - 1 - dx, r.y + r.h - 1 - dy, color, a);
+            }
         }
     }
 
     /// Outline of a rounded rectangle, 2 px wide.
     pub fn stroke_round_rect(&mut self, r: Rect, radius: i32, color: u32) {
-        for (dx, dy) in [(0, 0), (1, 1)] {
-            let o = Rect::new(r.x + dx, r.y + dy, r.w - 2 * dx, r.h - 2 * dy);
-            let rad = (radius - dx).max(0);
-            self.fill_rect(Rect::new(o.x + rad, o.y, o.w - 2 * rad, 1), color);
-            self.fill_rect(Rect::new(o.x + rad, o.y + o.h - 1, o.w - 2 * rad, 1), color);
-            self.fill_rect(Rect::new(o.x, o.y + rad, 1, o.h - 2 * rad), color);
-            self.fill_rect(Rect::new(o.x + o.w - 1, o.y + rad, 1, o.h - 2 * rad), color);
-            // Corner arcs.
-            for i in 0..=rad {
-                let j = isqrt(rad * rad - i * i);
-                for (cx, cy, sx, sy) in [(o.x + rad, o.y + rad, -1, -1), (o.x + o.w - 1 - rad, o.y + rad, 1, -1), (o.x + rad, o.y + o.h - 1 - rad, -1, 1), (o.x + o.w - 1 - rad, o.y + o.h - 1 - rad, 1, 1)] {
-                    self.set(cx + sx * i, cy + sy * j, color);
-                    self.set(cx + sx * j, cy + sy * i, color);
-                }
-            }
-        }
+        self.stroke_round_rect_w(r, radius, 2, color);
     }
 
     pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: u32) {
@@ -173,10 +225,28 @@ impl Canvas {
         }
     }
 
+    /// Disc of radius `r` around the pixel (cx, cy), anti-aliased.
     pub fn fill_circle(&mut self, cx: i32, cy: i32, r: i32, color: u32) {
-        for dy in -r..=r {
-            let w = isqrt(r * r - dy * dy);
-            self.fill_rect(Rect::new(cx - w, cy + dy, 2 * w + 1, 1), color);
+        if r <= 0 {
+            return self.set(cx, cy, color);
+        }
+        for dy in -r - 1..=r + 1 {
+            // Solid span, then the edge pixels on each side by coverage.
+            let solid = (r - 1) * (r - 1) >= dy * dy;
+            let inner = isqrt(((r - 1) * (r - 1) - dy * dy).max(0));
+            let outer = isqrt(((r + 1) * (r + 1) - dy * dy).max(0)) + 1;
+            if solid {
+                self.fill_rect(Rect::new(cx - inner, cy + dy, 2 * inner + 1, 1), color);
+            }
+            for dx in if solid { inner + 1 } else { 0 }..=outer {
+                let a = disc_coverage(dx, dy, r);
+                if a > 0 {
+                    self.blend_px(cx + dx, cy + dy, color, a);
+                    if dx > 0 {
+                        self.blend_px(cx - dx, cy + dy, color, a);
+                    }
+                }
+            }
         }
     }
 
@@ -257,63 +327,71 @@ impl Canvas {
         }
     }
 
-    /// Draw `src` scaled into `dst`: averaged 2x2 samples when shrinking, nearest pixel
-    /// when enlarging. `radius` > 0 rounds the corners; `alpha` (0..=255) fades it in.
+    /// Draw `src` scaled into `dst`: a box filter (up to 4x4 samples per pixel) when
+    /// shrinking, nearest pixel when enlarging. `radius` > 0 rounds the corners
+    /// (anti-aliased); `alpha` (0..=255) fades it in.
     pub fn blit_scaled(&mut self, src: &Canvas, dst: Rect, radius: i32, alpha: u32) {
-        if dst.w <= 0 || dst.h <= 0 || src.width == 0 || src.height == 0 {
+        self.blit_scaled_corners(src, dst, radius, ALL_CORNERS, alpha);
+    }
+
+    /// [`blit_scaled`] with only the corners in `which` rounded (see [`TOP_CORNERS`]).
+    pub fn blit_scaled_corners(&mut self, src: &Canvas, dst: Rect, radius: i32, which: u8, alpha: u32) {
+        if dst.w <= 0 || dst.h <= 0 || src.width == 0 || src.height == 0 || alpha == 0 {
             return;
         }
         let Some(vis) = dst.intersect(&self.bounds()) else { return };
-        let (sw, sh) = (src.width as i64, src.height as i64);
-        let shrink = src.width as i32 > dst.w;
-        for y in vis.y..vis.y + vis.h {
+        let radius = radius.min(dst.w / 2).min(dst.h / 2).max(0);
+        let cols = Samples::table(src.width, dst.w, vis.x - dst.x, vis.w);
+        let rows = Samples::table(src.height, dst.h, vis.y - dst.y, vis.h);
+        for (row, y) in rows.iter().zip(vis.y..) {
             let ry = y - dst.y;
-            // Horizontal inset of the rounded corner on this row.
-            let inset = if radius > 0 {
-                let dy = if ry < radius { radius - ry } else if ry >= dst.h - radius { ry - (dst.h - radius - 1) } else { 0 };
-                if dy > 0 { radius - isqrt(radius * radius - dy * dy) } else { 0 }
-            } else {
-                0
-            };
-            let sy0 = (ry as i64 * sh / dst.h as i64) as usize;
-            let sy1 = (((ry as i64 * 2 + 1) * sh / (dst.h as i64 * 2)) as usize).min(src.height - 1);
-            for x in vis.x.max(dst.x + inset)..(vis.x + vis.w).min(dst.x + dst.w - inset) {
-                let rx = (x - dst.x) as i64;
-                let sx0 = (rx * sw / dst.w as i64) as usize;
-                let p = if shrink {
-                    let sx1 = (((rx * 2 + 1) * sw / (dst.w as i64 * 2)) as usize).min(src.width - 1);
-                    let px = [src.pixels[sy0 * src.width + sx0], src.pixels[sy0 * src.width + sx1], src.pixels[sy1 * src.width + sx0], src.pixels[sy1 * src.width + sx1]];
-                    let ch = |s: u32| px.iter().map(|p| (p >> s) & 0xFF).sum::<u32>() / 4;
-                    (ch(16) << 16) | (ch(8) << 8) | ch(0)
+            for (col, x) in cols.iter().zip(vis.x..) {
+                let a = alpha * corner_alpha(ry, x - dst.x, dst, radius, which) / 255;
+                if a == 0 {
+                    continue;
+                }
+                let p = if row.n == 1 && col.n == 1 {
+                    src.pixels[row.at[0] * src.width + col.at[0]]
                 } else {
-                    src.pixels[sy0 * src.width + sx0]
+                    let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
+                    for sy in &row.at[..row.n] {
+                        for sx in &col.at[..col.n] {
+                            let p = src.pixels[sy * src.width + sx];
+                            r += (p >> 16) & 0xFF;
+                            g += (p >> 8) & 0xFF;
+                            b += p & 0xFF;
+                        }
+                    }
+                    let n = (row.n * col.n) as u32;
+                    ((r / n) << 16) | ((g / n) << 8) | (b / n)
                 };
                 let i = y as usize * self.width + x as usize;
-                self.pixels[i] = if alpha >= 255 { p } else { blend(self.pixels[i], p, alpha) };
+                self.pixels[i] = if a >= 255 { p } else { blend(self.pixels[i], p, a) };
             }
         }
     }
 
     /// Draw a mask image (white = opaque, black = transparent, e.g. a toolbar glyph)
-    /// scaled into `dst`, tinted `color`. Shrinking averages 2x2 samples for smooth edges.
+    /// scaled into `dst`, tinted `color`. Shrinking box-filters up to 4x4 samples per pixel,
+    /// so glyph edges stay smooth at 16-24 px.
     pub fn draw_mask(&mut self, mask: &Canvas, dst: Rect, color: u32) {
         let Some(vis) = dst.intersect(&self.bounds()) else { return };
-        if mask.width == 0 || mask.height == 0 {
+        if mask.width == 0 || mask.height == 0 || dst.w <= 0 || dst.h <= 0 {
             return;
         }
-        let (mw, mh) = (mask.width as i64, mask.height as i64);
-        for y in vis.y..vis.y + vis.h {
-            let ry = (y - dst.y) as i64;
-            let sy0 = (ry * mh / dst.h as i64) as usize;
-            let sy1 = (((ry * 2 + 1) * mh / (dst.h as i64 * 2)) as usize).min(mask.height - 1);
-            for x in vis.x..vis.x + vis.w {
-                let rx = (x - dst.x) as i64;
-                let sx0 = (rx * mw / dst.w as i64) as usize;
-                let sx1 = (((rx * 2 + 1) * mw / (dst.w as i64 * 2)) as usize).min(mask.width - 1);
-                let a = [(sy0, sx0), (sy0, sx1), (sy1, sx0), (sy1, sx1)].iter().map(|&(yy, xx)| (mask.pixels[yy * mask.width + xx] >> 8) & 0xFF).sum::<u32>() / 4;
-                if a > 8 {
-                    let i = y as usize * self.width + x as usize;
-                    self.pixels[i] = blend(self.pixels[i], color, a);
+        let cols = Samples::table(mask.width, dst.w, vis.x - dst.x, vis.w);
+        let rows = Samples::table(mask.height, dst.h, vis.y - dst.y, vis.h);
+        for (row, y) in rows.iter().zip(vis.y..) {
+            for (col, x) in cols.iter().zip(vis.x..) {
+                let mut a = 0;
+                for sy in &row.at[..row.n] {
+                    for sx in &col.at[..col.n] {
+                        a += (mask.pixels[sy * mask.width + sx] >> 8) & 0xFF;
+                    }
+                }
+                let a = a / (row.n * col.n) as u32;
+                if a > 4 {
+                    self.blend_px(x, y, color, a);
                 }
             }
         }
@@ -327,13 +405,76 @@ impl Canvas {
         }
     }
 
-    /// Soft drop shadow around `r` (drawn before the window itself).
+    /// Soft drop shadow around `r` (drawn before the window itself): `size` px wide.
     pub fn shadow(&mut self, r: Rect, size: i32) {
+        self.shadow_round(r, 0, size, 90);
+    }
+
+    /// A shadow for a rounded shape: ambient all around plus a key light from above
+    /// (the shadow sits a little lower than the shape), fading quadratically from
+    /// `strength` (0..=255) at the edge to nothing `size` px out, like the two-layer
+    /// shadows of desktop toolkits.
+    pub fn shadow_round(&mut self, r: Rect, radius: i32, size: i32, strength: u32) {
+        if size <= 0 {
+            return;
+        }
+        let drop = (size / 3).max(1);
         for i in 1..=size {
-            let alpha = (60 * (size - i + 1) / size) as u32;
-            self.blend_rect(Rect::new(r.x - i + 2, r.y + r.h + i - 1, r.w + 2 * i - 2, 1), 0, alpha);
-            self.blend_rect(Rect::new(r.x + r.w + i - 1, r.y - i + 4, 1, r.h + 2 * i - 4), 0, alpha);
-            self.blend_rect(Rect::new(r.x - i, r.y - i + 4, 1, r.h + 2 * i - 4), 0, alpha / 2);
+            let t = (size - i + 1) as u32;
+            let alpha = strength * t * t / (size as u32 * size as u32);
+            if alpha == 0 {
+                continue;
+            }
+            self.ring(Rect::new(r.x - i, r.y - i + drop, r.w + 2 * i, r.h + 2 * i), radius + i, alpha);
+        }
+    }
+
+    /// One pixel wide black ring along the edge of a rounded rectangle, at `alpha`.
+    fn ring(&mut self, r: Rect, radius: i32, alpha: u32) {
+        let radius = radius.min(r.w / 2).min(r.h / 2).max(0);
+        let inset = |dy: i32| -> i32 {
+            let d = if dy < radius { radius - dy } else if dy >= r.h - radius { dy - (r.h - radius) + 1 } else { 0 };
+            if d > 0 { radius - isqrt((radius * radius - d * d).max(0)) } else { 0 }
+        };
+        for dy in 0..r.h {
+            let y = r.y + dy;
+            let a = inset(dy);
+            if dy == 0 || dy == r.h - 1 {
+                self.blend_rect(Rect::new(r.x + a, y, r.w - 2 * a, 1), 0, alpha);
+                continue;
+            }
+            // The edge pixel, plus the step out to the next row's inset in the corners.
+            let outer = if dy < r.h / 2 { inset(dy - 1) } else { inset(dy + 1) };
+            let run = (outer - a).max(1);
+            self.blend_rect(Rect::new(r.x + a, y, run, 1), 0, alpha);
+            self.blend_rect(Rect::new(r.x + r.w - a - run, y, run, 1), 0, alpha);
+        }
+    }
+
+    /// Copy `src` to (dx, dy) with the corners in `which` rounded by `radius`: what was
+    /// underneath shows through outside the arcs (window contents in a rounded frame).
+    pub fn blit_corners(&mut self, src: &Canvas, src_rect: Rect, dx: i32, dy: i32, radius: i32, which: u8) {
+        let Some(sr) = src_rect.intersect(&src.bounds()) else { return };
+        let dst = Rect::new(dx, dy, sr.w, sr.h);
+        let radius = radius.min(dst.w / 2).min(dst.h / 2).max(0);
+        // Keep the corner squares, copy everything, then re-blend the corners by coverage.
+        let mut kept: Vec<(i32, i32, u32)> = Vec::new();
+        if radius > 0 {
+            for cy in 0..radius {
+                for cx in 0..radius {
+                    for (x, y) in [(dst.x + cx, dst.y + cy), (dst.x + dst.w - 1 - cx, dst.y + cy), (dst.x + cx, dst.y + dst.h - 1 - cy), (dst.x + dst.w - 1 - cx, dst.y + dst.h - 1 - cy)] {
+                        kept.push((x, y, self.get(x, y)));
+                    }
+                }
+            }
+        }
+        self.blit(src, sr, dx, dy);
+        for (x, y, under) in kept {
+            let a = corner_alpha(y - dst.y, x - dst.x, dst, radius, which);
+            if a < 255 {
+                let over = self.get(x, y);
+                self.set(x, y, blend(under, over, a));
+            }
         }
     }
 
@@ -380,6 +521,84 @@ impl Canvas {
         chunk(&mut out, b"IDAT", &z);
         chunk(&mut out, b"IEND", &[]);
         out
+    }
+}
+
+/// Corner flags for [`Canvas::fill_round_rect_corners`] and [`Canvas::blit_scaled_corners`].
+pub const TOP_LEFT: u8 = 1;
+pub const TOP_RIGHT: u8 = 2;
+pub const BOTTOM_LEFT: u8 = 4;
+pub const BOTTOM_RIGHT: u8 = 8;
+pub const TOP_CORNERS: u8 = TOP_LEFT | TOP_RIGHT;
+pub const BOTTOM_CORNERS: u8 = BOTTOM_LEFT | BOTTOM_RIGHT;
+pub const ALL_CORNERS: u8 = TOP_CORNERS | BOTTOM_CORNERS;
+
+/// Coverage (0..=255) of the pixel `dx`, `dy` from the corner of a rounded rectangle
+/// with corner `radius`: 255 inside the arc, 0 outside, in between on the edge.
+pub fn corner_coverage(dx: i32, dy: i32, radius: i32) -> u32 {
+    if radius <= 0 || dx >= radius || dy >= radius {
+        return 255;
+    }
+    // Distance from the pixel centre to the arc centre, in half pixels.
+    let (hx, hy) = (2 * (radius - dx) - 1, 2 * (radius - dy) - 1);
+    let d16 = isqrt(64 * (hx * hx + hy * hy)); // 16 * distance in pixels
+    (16 * radius + 8 - d16).clamp(0, 16) as u32 * 255 / 16
+}
+
+/// Coverage of the pixel at offset (dx, dy) from the centre of a disc of radius `r`.
+fn disc_coverage(dx: i32, dy: i32, r: i32) -> u32 {
+    let d16 = isqrt(256 * (dx * dx + dy * dy));
+    (16 * r + 8 - d16).clamp(0, 16) as u32 * 255 / 16
+}
+
+/// Corner alpha for the pixel (`rx`, `ry`) inside `dst` with the given corners rounded.
+fn corner_alpha(ry: i32, rx: i32, dst: Rect, radius: i32, which: u8) -> u32 {
+    if radius <= 0 {
+        return 255;
+    }
+    let (left, right) = (rx < radius, rx >= dst.w - radius);
+    let (top, bottom) = (ry < radius, ry >= dst.h - radius);
+    let corner = match (left, right, top, bottom) {
+        (true, _, true, _) => TOP_LEFT,
+        (_, true, true, _) => TOP_RIGHT,
+        (true, _, _, true) => BOTTOM_LEFT,
+        (_, true, _, true) => BOTTOM_RIGHT,
+        _ => return 255,
+    };
+    if which & corner == 0 {
+        return 255;
+    }
+    let dx = if left { rx } else { dst.w - 1 - rx };
+    let dy = if top { ry } else { dst.h - 1 - ry };
+    corner_coverage(dx, dy, radius)
+}
+
+/// Source sample positions for one destination pixel when scaling (at most 4 per axis).
+struct Samples {
+    at: [usize; 4],
+    n: usize,
+}
+
+impl Samples {
+    /// The table for destination pixels `from..from + count` of a `dst_len` wide (or tall)
+    /// target drawn from `src_len` source pixels.
+    fn table(src_len: usize, dst_len: i32, from: i32, count: i32) -> Vec<Samples> {
+        let (s, d) = (src_len as i64, dst_len as i64);
+        (from..from + count)
+            .map(|p| {
+                let p = p as i64;
+                let s0 = (p * s / d).min(s - 1);
+                let s1 = ((p + 1) * s / d).clamp(s0 + 1, s);
+                let span = s1 - s0;
+                let n = span.min(4) as usize;
+                let mut at = [0usize; 4];
+                for (i, slot) in at.iter_mut().take(n).enumerate() {
+                    // Spread the samples evenly over the footprint.
+                    *slot = (s0 + (2 * i as i64 + 1) * span / (2 * n as i64)).min(s - 1) as usize;
+                }
+                Samples { at, n }
+            })
+            .collect()
     }
 }
 

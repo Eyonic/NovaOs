@@ -1095,7 +1095,7 @@ impl Editor {
             if d.dirty {
                 c.fill_circle(r.x + r.w - 16, r.y + 16, 4, ui::ACCENT);
             } else {
-                font::draw(&mut c, r.x + r.w - 21, r.y + 6, "\u{00d7}", 16, Weight::Regular, ui::FAINT);
+                ui::symbol(&mut c, "close", if active { ui::DIM } else { ui::FAINT }, Rect::new(r.x + r.w - 21, r.y + 11, 10, 10));
             }
             tx += tw + 4;
         }
@@ -1166,12 +1166,7 @@ impl Editor {
             }
         }
         // Scrollbar.
-        if d.lines.len() > rows {
-            let track = area.h - 8;
-            let thumb = (track * rows as i32 / d.lines.len() as i32).max(24);
-            let ty = area.y + 4 + (track - thumb) * d.scroll as i32 / (d.lines.len() - rows).max(1) as i32;
-            c.fill_round_rect(Rect::new(area.x + area.w - 8, ty, 5, thumb), 3, ui::BORDER);
-        }
+        ui::scrollbar(&mut c, Rect::new(area.x + area.w - 10, area.y + 4, 6, area.h - 8), d.lines.len() as i32, rows as i32, d.scroll as i32);
 
         // Status bar.
         let sb = Rect::new(0, h - STATUS_H, w, STATUS_H);
@@ -1189,8 +1184,9 @@ impl Editor {
             c.blend_rect(c.bounds(), 0x000000, 110);
             let list = self.quick_open_list();
             let r = self.palette_rect(w, list.len());
-            c.shadow(r, 16);
-            c.fill_round_rect(r, 12, ui::PANEL);
+            c.shadow_round(r, ui::RADIUS_L, 24, 140);
+            c.fill_round_rect(r, ui::RADIUS_L, ui::RAISED);
+            c.stroke_round_rect_w(r, ui::RADIUS_L, 1, crate::gfx::blend(ui::RAISED, 0xFFFFFF, 22));
             ui::field(&mut c, Rect::new(r.x + 12, r.y + 12, r.w - 24, 34), &self.query, "Open a file by name...", true);
             for (i, f) in list.iter().enumerate() {
                 let y = r.y + 56 + i as i32 * 32;

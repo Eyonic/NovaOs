@@ -11,6 +11,9 @@
 //!
 //! Artwork: `usr/share/nova/home/<name>.png` system files (generated images, see
 //! assets/home/README.md); items without artwork get a procedural poster.
+//!
+//! Typing on Home searches: the query shows in the header and the shelves are
+//! replaced by one row of matches across every tab (Escape clears it).
 
 use alloc::format;
 use alloc::string::String;
@@ -22,19 +25,20 @@ use crate::input::Key;
 use crate::sync::SpinLock;
 use crate::wm::{self, Action};
 use crate::font::{self, Weight};
-use crate::{apps, fs, pit, rtc, task};
+use crate::{apps, fs, pit, rtc, task, ui};
 
-// Portrait covers (2:3-ish), like game capsules.
-const CARD_W: i32 = 150;
-const CARD_H: i32 = 214;
-const ZOOM_W: i32 = 172;
-const ZOOM_H: i32 = 246;
+// Portrait covers (2:3-ish), like game capsules. Everything sits on an 8 px grid.
+const CARD_W: i32 = 152;
+const CARD_H: i32 = 216;
+const ZOOM_W: i32 = 176;
+const ZOOM_H: i32 = 250;
 const GAP: i32 = 20;
-const MARGIN: i32 = 44;
-const TOP_BAR: i32 = 68;
+const MARGIN: i32 = 48;
+const TOP_BAR: i32 = 64;
 const HERO_H: i32 = 232;
-const ROW_H: i32 = 292;
-const ROW_TITLE: i32 = 42;
+const ROW_H: i32 = 304;
+/// Space above a row's cards for its title (the zoomed card grows 21 px upwards).
+const ROW_TITLE: i32 = 48;
 /// Hover time before a card's preview starts (ticks).
 const PREVIEW_DELAY: u64 = pit::HZ * 6 / 10;
 
@@ -42,6 +46,16 @@ const BG: u32 = 0x0B0C12;
 const TEXT: u32 = 0xF2F2F7;
 const DIM: u32 = 0xA2A4B8;
 const ACCENT: u32 = 0x8B7CF6;
+
+/// What the pointer is over besides cards (for hover states).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hot {
+    None,
+    Open,
+    Tab(usize),
+    Left(usize),
+    Right(usize),
+}
 
 #[derive(Clone, PartialEq)]
 enum Kind {
@@ -106,10 +120,13 @@ pub struct Home {
     backdrop: Option<(String, Canvas)>,
     background: Canvas,
     /// Network, CPU, memory and clock, shown in the header.
-    status: String,
+    status: wm::Status,
     cursor: (i32, i32),
+    hot: Hot,
     /// Open context menu: its card, position and entries.
     menu: Option<Menu>,
+    /// Type-to-search: the query (empty = browsing the tabs).
+    query: String,
 }
 
 struct Menu {
@@ -303,14 +320,16 @@ impl Home {
             posters: Vec::new(),
             backdrop: None,
             background,
-            status: String::new(),
+            status: wm::Status::default(),
             cursor: (-1, -1),
+            hot: Hot::None,
             menu: None,
+            query: String::new(),
         }
     }
 
-    pub fn set_status(&mut self, status: &str) {
-        self.status = status.into();
+    pub fn set_status(&mut self, status: wm::Status) {
+        self.status = status;
     }
 
     /// Rebuild the rows from the installed apps and open windows.
@@ -456,7 +475,7 @@ impl Home {
             self.tab_rows.push(grid("Sites", take("Web")));
         }
         self.tab = self.tab.min(self.tab_rows.len() - 1);
-        let mut rows = self.tab_rows[self.tab].clone();
+        let mut rows = if self.query.is_empty() { self.tab_rows[self.tab].clone() } else { self.search_rows() };
 
         // Keep the scroll positions and the selection where possible.
         for row in rows.iter_mut() {
@@ -476,13 +495,43 @@ impl Home {
     }
 
     fn switch_tab(&mut self, tab: usize) {
-        if tab >= self.tab_rows.len() || tab == self.tab {
+        if tab >= self.tab_rows.len() || (tab == self.tab && self.query.is_empty()) {
             return;
         }
         self.tab = tab;
+        self.query.clear();
         self.rows = self.tab_rows[tab].clone();
         self.top_row = 0;
         self.select((0, 0));
+        self.menu = None;
+    }
+
+    /// One row of everything that matches the query, best match first.
+    fn search_rows(&self) -> Vec<Row> {
+        let mut found: Vec<(i32, Item)> = Vec::new();
+        for item in self.tab_rows.iter().flatten().flat_map(|r| r.items.iter()) {
+            if found.iter().any(|(_, i)| i.key() == item.key()) {
+                continue;
+            }
+            // Fuzzy on the title; descriptions only match as a whole word or phrase.
+            let q = self.query.to_lowercase();
+            let score = ui::fuzzy(&q, &item.title).map(|s| s + 20).or_else(|| item.about.to_lowercase().contains(&q).then_some(0));
+            if let Some(s) = score {
+                found.push((s, item.clone()));
+            }
+        }
+        found.sort_by_key(|(s, _)| -s);
+        let items: Vec<Item> = found.into_iter().map(|(_, i)| i).collect();
+        alloc::vec![Row { title: "Results", items, scroll: 0 }]
+    }
+
+    /// The query changed: show matches (or the tab again when it is empty).
+    fn apply_query(&mut self) {
+        self.rows = if self.query.is_empty() { self.tab_rows[self.tab].clone() } else { self.search_rows() };
+        self.top_row = 0;
+        self.sel = (0, 0);
+        self.sel_since = pit::ticks();
+        self.preview_on = false;
         self.menu = None;
     }
 
@@ -492,11 +541,40 @@ impl Home {
         widths
             .iter()
             .map(|tw| {
-                let r = Rect::new(x, 16, *tw, 36);
+                let r = Rect::new(x, 14, *tw, 36);
                 x += tw + 8;
                 r
             })
             .collect()
+    }
+
+    /// The search pill in the header, right of the tabs.
+    fn search_rect(&self) -> Rect {
+        let tabs = self.tab_rects();
+        let x = tabs.last().map_or(MARGIN, |r| r.x + r.w) + 24;
+        let w = if self.query.is_empty() { 120 } else { (font::width(&self.query, 15, Weight::Regular) + 56).max(120) };
+        Rect::new(x, 14, w, 36)
+    }
+
+    /// What is under the pointer besides cards.
+    fn hot_at(&self, x: i32, y: i32) -> Hot {
+        if self.open_button().contains(x, y) {
+            return Hot::Open;
+        }
+        if let Some(t) = self.tab_rects().iter().position(|r| r.contains(x, y)) {
+            return Hot::Tab(t);
+        }
+        for r in 0..self.rows.len() {
+            if let Some((left, right)) = self.chevrons(r) {
+                if left.contains(x, y) {
+                    return Hot::Left(r);
+                }
+                if right.contains(x, y) {
+                    return Hot::Right(r);
+                }
+            }
+        }
+        Hot::None
     }
 
     fn selected(&self) -> Option<&Item> {
@@ -520,7 +598,7 @@ impl Home {
     // ----- layout -----
 
     fn rows_y(&self) -> i32 {
-        TOP_BAR + HERO_H + 10
+        TOP_BAR + HERO_H + 8
     }
 
     fn visible_cards(&self) -> usize {
@@ -541,12 +619,13 @@ impl Home {
     }
 
     fn open_button(&self) -> Rect {
-        Rect::new(MARGIN, TOP_BAR + HERO_H - 54, 140, 44)
+        Rect::new(MARGIN, TOP_BAR + HERO_H - 56, 140, 44)
     }
 
+    /// Round scroll buttons at both ends of a row (only drawn when there is more).
     fn chevrons(&self, r: usize) -> Option<(Rect, Rect)> {
-        let y = self.row_y(r)? + ROW_TITLE;
-        Some((Rect::new(4, y, MARGIN - 10, CARD_H), Rect::new(self.width - MARGIN + 6, y, MARGIN - 10, CARD_H)))
+        let y = self.row_y(r)? + ROW_TITLE + CARD_H / 2 - 18;
+        Some((Rect::new(6, y, 36, 36), Rect::new(self.width - 42, y, 36, 36)))
     }
 
     fn ensure_visible(&mut self) {
@@ -577,18 +656,21 @@ impl Home {
             // While a menu is open, only its highlight follows the pointer.
             return m.entry_at(old.0, old.1) != m.entry_at(x, y);
         }
+        let hot = self.hot_at(x, y);
+        let hot_changed = hot != self.hot;
+        self.hot = hot;
         for r in 0..self.rows.len() {
             for c in 0..self.rows[r].items.len() {
                 if self.card_rect(r, c).is_some_and(|rect| rect.contains(x, y)) {
                     let changed = self.select((r, c)) | !self.hovering;
                     self.hovering = true;
-                    return changed;
+                    return changed | hot_changed;
                 }
             }
         }
         let was = self.hovering;
         self.hovering = false;
-        was
+        was | hot_changed
     }
 
     /// A right click on Home: open the card's menu (running windows can be stopped).
@@ -624,6 +706,11 @@ impl Home {
         }
         if let Some(t) = self.tab_rects().iter().position(|r| r.contains(x, y)) {
             self.switch_tab(t);
+            return None;
+        }
+        if self.search_rect().contains(x, y) && !self.query.is_empty() {
+            self.query.clear();
+            self.apply_query();
             return None;
         }
         if self.open_button().contains(x, y) {
@@ -664,11 +751,40 @@ impl Home {
             return None;
         }
         let (r, c) = self.sel;
+        if self.rows.is_empty() || self.rows[r].items.is_empty() {
+            // Only the search can be empty: keep editing it.
+            match key {
+                Key::Char(0x1B) | Key::Char(b'\n' | b'\r') => self.query.clear(),
+                Key::Char(0x08 | 0x7F) => {
+                    self.query.pop();
+                }
+                Key::Char(ch) if (0x20..0x7F).contains(&ch) => self.query.push(ch as char),
+                _ => {}
+            }
+            self.apply_query();
+            return None;
+        }
         match key {
             Key::Char(b'\t') => {
                 // Tab: next section.
-                let next = (self.tab + 1) % self.tab_rows.len().max(1);
+                let next = if self.query.is_empty() { (self.tab + 1) % self.tab_rows.len().max(1) } else { self.tab };
                 self.switch_tab(next);
+                return None;
+            }
+            // Type to search; Backspace edits, Escape clears.
+            Key::Char(ch) if (0x20..0x7F).contains(&ch) => {
+                self.query.push(ch as char);
+                self.apply_query();
+                return None;
+            }
+            Key::Char(0x08 | 0x7F) => {
+                self.query.pop();
+                self.apply_query();
+                return None;
+            }
+            Key::Char(0x1B) if !self.query.is_empty() => {
+                self.query.clear();
+                self.apply_query();
                 return None;
             }
             Key::Left => {
@@ -682,7 +798,7 @@ impl Home {
                 let nr = if key == Key::Up { r.saturating_sub(1) } else { (r + 1).min(self.rows.len() - 1) };
                 // Keep the same screen column.
                 let col = c.saturating_sub(self.rows[r].scroll) + self.rows[nr].scroll;
-                self.select((nr, col.min(self.rows[nr].items.len() - 1)));
+                self.select((nr, col.min(self.rows[nr].items.len().saturating_sub(1))));
             }
             Key::Char(b'\n' | b'\r') => return self.selected().map(|i| i.action.clone()),
             _ => return None,
@@ -741,20 +857,83 @@ impl Home {
         }
     }
 
+    /// The header: wordmark, tabs, the search pill, machine status, date and time.
+    fn draw_header(&self, scene: &mut Canvas) {
+        let w = self.width;
+        scene.gradient(Rect::new(0, 0, w, TOP_BAR), 0x08090E, 0x0B0C12);
+        scene.blend_rect(Rect::new(0, 0, w, TOP_BAR), BG, 60);
+        scene.fill_rect(Rect::new(0, TOP_BAR - 1, w, 1), blend(BG, 0xFFFFFF, 14));
+        font::draw(scene, MARGIN, 12, "nova", 28, Weight::Bold, ACCENT);
+
+        // Tabs: the active one is a light pill; the others brighten under the pointer.
+        let searching = !self.query.is_empty();
+        for (i, (r, name)) in self.tab_rects().iter().zip(self.tab_names.iter()).enumerate() {
+            let active = i == self.tab && !searching;
+            let hot = self.hot == Hot::Tab(i);
+            if active {
+                scene.fill_round_rect(*r, r.h / 2, 0xF2F2F7);
+            } else if hot {
+                scene.fill_round_rect(*r, r.h / 2, blend(BG, 0xFFFFFF, 24));
+            }
+            let tw = font::width(name, 16, Weight::Bold);
+            let color = if active { 0x12131A } else if hot { TEXT } else { DIM };
+            font::draw(scene, r.x + (r.w - tw) / 2, r.y + (r.h - font::line_height(16)) / 2, name, 16, Weight::Bold, color);
+        }
+
+        // Search: a pill that shows the query as it is typed.
+        let sr = self.search_rect();
+        scene.fill_round_rect(sr, sr.h / 2, if searching { blend(BG, 0xFFFFFF, 30) } else { blend(BG, 0xFFFFFF, 12) });
+        if searching {
+            scene.stroke_round_rect_w(sr, sr.h / 2, 2, ACCENT);
+        }
+        ui::symbol(scene, "search", if searching { TEXT } else { DIM }, Rect::new(sr.x + 13, sr.y + 10, 16, 16));
+        let ty = sr.y + (sr.h - font::line_height(15)) / 2;
+        if searching {
+            let end = font::draw(scene, sr.x + 38, ty, &self.query, 15, Weight::Regular, TEXT);
+            scene.fill_rect(Rect::new(end + 2, ty + 3, 2, 16), ACCENT);
+        } else {
+            font::draw(scene, sr.x + 38, ty, "Search", 15, Weight::Regular, DIM);
+        }
+
+        // Right side: date and time, then the machine status with small glyphs.
+        let (_, mo, d, ..) = rtc::now();
+        let when = format!("{} {} {}", weekday(rtc::unix_time()), d, MONTHS[(mo as usize).clamp(1, 12) - 1]);
+        let clock_w = font::width(&self.status.clock, 15, Weight::Bold);
+        let mut x = w - MARGIN - clock_w;
+        let y = (TOP_BAR - font::line_height(15)) / 2;
+        font::draw(scene, x, y, &self.status.clock, 15, Weight::Bold, TEXT);
+        x -= font::width(&when, 15, Weight::Regular) + 14;
+        font::draw(scene, x, y, &when, 15, Weight::Regular, DIM);
+        x -= 28;
+        let s = &self.status;
+        let mem = s.mem.clone();
+        let cpu = format!("{}%", s.cpu);
+        for (glyph, text, color) in [("memory", mem.as_str(), DIM), ("cpu", cpu.as_str(), DIM), ("network", s.net.as_str(), if s.online { DIM } else { ui::WARNING })] {
+            let tw = font::width(text, 13, Weight::Regular);
+            x -= tw;
+            font::draw(scene, x, y + 1, text, 13, Weight::Regular, color);
+            x -= 20;
+            ui::symbol(scene, glyph, color, Rect::new(x, y + 2, 15, 15));
+            x -= 18;
+        }
+    }
+
     pub fn draw(&mut self, scene: &mut Canvas) {
         let (w, h) = (self.width, self.height);
-        let Some(item) = self.selected().cloned() else { return };
+        let item = self.selected().cloned();
 
         // Backdrop: the focused item's artwork across the whole screen, darkened, with a
         // fade to the shelves and a darker left side under the hero text.
-        let key = item.key();
+        let key = item.as_ref().map_or(String::new(), |i| i.key());
         if self.backdrop.as_ref().is_none_or(|(k, _)| *k != key) {
-            let mut c = match item.art.and_then(art) {
+            let mut c = match item.as_ref().and_then(|i| i.art).and_then(art) {
                 Some(a) => cover(&a, w, h),
                 // No artwork: the wallpaper, tinted towards the item's colour.
                 None => {
                     let mut c = self.background.clone();
-                    c.blend_rect(c.bounds(), darken(item.color, 100), 60);
+                    if let Some(i) = &item {
+                        c.blend_rect(c.bounds(), darken(i.color, 100), 60);
+                    }
                     c
                 }
             };
@@ -769,36 +948,27 @@ impl Home {
         if let Some((_, c)) = &self.backdrop {
             scene.blit(c, c.bounds(), 0, 0);
         }
-        scene.gradient(Rect::new(0, 0, w, TOP_BAR), 0x08090E, 0x0B0C12);
-        scene.blend_rect(Rect::new(0, 0, w, TOP_BAR), BG, 60);
+        self.draw_header(scene);
 
-        // Tabs.
-        for (i, (r, name)) in self.tab_rects().iter().zip(self.tab_names.iter()).enumerate() {
-            let active = i == self.tab;
-            if active {
-                scene.fill_round_rect(*r, r.h / 2, 0xF2F2F7);
-            }
-            let tw = font::width(name, 16, Weight::Bold);
-            font::draw(scene, r.x + (r.w - tw) / 2, r.y + 7, name, 16, Weight::Bold, if active { 0x12131A } else { DIM });
-        }
-
-        // Top bar: wordmark, date and time.
-        font::draw(scene, MARGIN, 14, "nova", 28, Weight::Bold, ACCENT);
-        let (_, mo, d, ..) = rtc::now();
-        let when = format!("{} {} {}", weekday(rtc::unix_time()), d, MONTHS[(mo as usize).clamp(1, 12) - 1]);
-        let when_w = font::width(&when, 15, Weight::Bold);
-        font::draw(scene, w - MARGIN - when_w, 18, &when, 15, Weight::Bold, TEXT);
-        let status_w = font::width(&self.status, 14, Weight::Regular);
-        font::draw(scene, w - MARGIN - when_w - 28 - status_w, 19, &self.status, 14, Weight::Regular, DIM);
+        let Some(item) = item else {
+            // Nothing matches the search.
+            let msg = format!("Nothing matches \u{201c}{}\u{201d}", self.query);
+            let tw = font::width(&msg, 20, Weight::Bold);
+            font::draw(scene, (w - tw) / 2, h / 2 - 40, &msg, 20, Weight::Bold, TEXT);
+            let hint = "Keep typing, or press Escape to go back.";
+            let hw = font::width(hint, 15, Weight::Regular);
+            font::draw(scene, (w - hw) / 2, h / 2 - 6, hint, 15, Weight::Regular, DIM);
+            return;
+        };
 
         // Hero text.
         let tx = MARGIN;
         let chip = item.category.to_uppercase();
-        let chip_w = font::width(&chip, 12, Weight::Bold) + 22;
-        scene.fill_round_rect(Rect::new(tx, TOP_BAR + 14, chip_w, 24), 12, ACCENT);
-        font::draw(scene, tx + 11, TOP_BAR + 18, &chip, 12, Weight::Bold, 0xFFFFFF);
+        let chip_w = font::width(&chip, 11, Weight::Bold) + 20;
+        scene.fill_round_rect(Rect::new(tx, TOP_BAR + 16, chip_w, 22), 11, ACCENT);
+        font::draw(scene, tx + 10, TOP_BAR + 16 + (22 - font::line_height(11)) / 2, &chip, 11, Weight::Bold, 0xFFFFFF);
         let tmax = w * 11 / 20;
-        let tsize: u16 = if font::width(&item.title, 46, Weight::Bold) <= tmax { 46 } else { 34 };
+        let tsize: u16 = if font::width(&item.title, 44, Weight::Bold) <= tmax { 44 } else { 32 };
         font::draw_clipped(scene, tx + 2, TOP_BAR + 44 + 2, &item.title, tsize, Weight::Bold, 0x000000, tmax);
         font::draw_clipped(scene, tx, TOP_BAR + 44, &item.title, tsize, Weight::Bold, TEXT, tmax);
         let mut ty = TOP_BAR + 50 + font::line_height(tsize);
@@ -810,29 +980,29 @@ impl Home {
             font::draw_clipped(scene, tx, ty + 2, &item.meta, 13, Weight::Regular, DIM, w * 9 / 20);
         }
         let open = self.open_button();
-        scene.fill_round_rect(open, open.h / 2, 0xFFFFFF);
-        // Play triangle.
-        for i in 0..16 {
-            let half = if i < 8 { i } else { 15 - i };
-            scene.fill_rect(Rect::new(open.x + 26, open.y + 12 + i, half + 1, 1), 0x111111);
-        }
-        font::draw(scene, open.x + 46, open.y + 10, "Open", 17, Weight::Bold, 0x111111);
-
+        let open_hot = self.hot == Hot::Open;
+        scene.shadow_round(open, open.h / 2, 10, if open_hot { 90 } else { 60 });
+        scene.fill_round_rect(open, open.h / 2, if open_hot { 0xFFFFFF } else { 0xF2F2F7 });
+        ui::symbol(scene, "play", 0x111111, Rect::new(open.x + 24, open.y + 13, 18, 18));
+        font::draw(scene, open.x + 50, open.y + (open.h - font::line_height(17)) / 2, "Open", 17, Weight::Bold, 0x111111);
 
         // Live preview panel on the right of the hero.
         let pw = (w * 3 / 10).min(384);
-        let panel = Rect::new(w - MARGIN - pw, TOP_BAR + 14, pw, pw * 9 / 16);
+        let panel = Rect::new(w - MARGIN - pw, TOP_BAR + 16, pw, pw * 9 / 16);
         if matches!(item.kind, Kind::Window(_) | Kind::App(_)) {
-            scene.shadow(panel, 14);
+            scene.shadow_round(panel, 12, 20, 110);
             scene.fill_round_rect(Rect::new(panel.x - 2, panel.y - 2, panel.w + 4, panel.h + 4), 12, 0x2A2C3E);
             if !Self::draw_live(scene, &item, panel, 10) {
                 let i = self.poster(&item, true);
                 scene.blit_scaled(&self.posters[i].2, panel, 10, 255);
             }
-            let badge = if matches!(item.kind, Kind::Window(_)) { "LIVE WINDOW" } else { "LIVE PREVIEW" };
-            let bw = font::width(badge, 11, Weight::Bold) + 16;
-            scene.fill_round_rect(Rect::new(panel.x + 10, panel.y + 10, bw, 20), 10, 0xE5394B);
-            font::draw(scene, panel.x + 18, panel.y + 12, badge, 11, Weight::Bold, 0xFFFFFF);
+            // A quiet "live" pill: a green dot, not a red banner.
+            let badge = if matches!(item.kind, Kind::Window(_)) { "Live" } else { "Preview" };
+            let bw = font::width(badge, 12, Weight::Bold) + 30;
+            let br = Rect::new(panel.x + 10, panel.y + 10, bw, 22);
+            scene.blend_round_rect(br, 11, 0x000000, 150);
+            scene.fill_circle(br.x + 11, br.y + 11, 4, ui::SUCCESS);
+            font::draw(scene, br.x + 20, br.y + (22 - font::line_height(12)) / 2, badge, 12, Weight::Bold, 0xFFFFFF);
         }
 
         // Rows.
@@ -845,9 +1015,10 @@ impl Home {
             }
             let title = self.rows[r].title;
             if !title.is_empty() {
-                let end = font::draw(scene, MARGIN, ry - 2, title, 20, Weight::Bold, TEXT);
+                let end = font::draw(scene, MARGIN, ry, title, 20, Weight::Bold, TEXT);
                 let count: usize = if self.tab == 1 && title == "All apps" { self.rows.iter().filter(|r| r.title != "System").map(|r| r.items.len()).sum() } else { self.rows[r].items.len() };
-                font::draw(scene, end + 10, ry + 1, &format!("{count}"), 15, Weight::Regular, DIM);
+                // The count sits on the title's baseline.
+                font::draw(scene, end + 10, ry + 5, &format!("{count}"), 15, Weight::Regular, DIM);
             }
             for c in 0..self.rows[r].items.len() {
                 let Some(rect) = self.card_rect(r, c) else { continue };
@@ -867,18 +1038,20 @@ impl Home {
                     blit_round(scene, &self.posters[i].2, rect.x, rect.y, 12);
                 }
                 if (r, c) == self.sel {
-                    // Keyboard selection without zoom: an outline.
-                    scene.stroke_round_rect(Rect::new(rect.x - 4, rect.y - 4, rect.w + 8, rect.h + 8), 15, 0xFFFFFF);
+                    // Keyboard selection without zoom: a 3 px focus ring.
+                    scene.stroke_round_rect_w(Rect::new(rect.x - 5, rect.y - 5, rect.w + 10, rect.h + 10), 16, 3, 0xFFFFFF);
                 }
             }
             let vis = self.visible_cards();
             let row = &self.rows[r];
             if let Some((left, right)) = self.chevrons(r) {
-                if row.scroll > 0 {
-                    font::draw(scene, left.x + 6, left.y + CARD_H / 2 - 22, "\u{2039}", 40, Weight::Bold, TEXT);
-                }
-                if row.scroll + vis < row.items.len() {
-                    font::draw(scene, right.x + 8, right.y + CARD_H / 2 - 22, "\u{203a}", 40, Weight::Bold, TEXT);
+                for (b, glyph, show, hot) in [(left, "chevron-left", row.scroll > 0, self.hot == Hot::Left(r)), (right, "chevron-right", row.scroll + vis < row.items.len(), self.hot == Hot::Right(r))] {
+                    if !show {
+                        continue;
+                    }
+                    let (cx, cy) = (b.x + b.w / 2, b.y + b.h / 2);
+                    scene.fill_circle(cx, cy, b.w / 2, if hot { blend(BG, 0xFFFFFF, 70) } else { blend(BG, 0xFFFFFF, 36) });
+                    ui::symbol(scene, glyph, TEXT, Rect::new(cx - 9, cy - 9, 18, 18));
                 }
             }
         }
@@ -889,12 +1062,8 @@ impl Home {
             let it = self.rows[r].items[c].clone();
             let z = Rect::new(rect.x - (ZOOM_W - CARD_W) / 2, rect.y - (ZOOM_H - CARD_H) / 2, ZOOM_W, ZOOM_H);
             let z = Rect::new(z.x.max(4), z.y, z.w, z.h);
-            // Soft white glow around the focused card.
-            for i in (4..=14).rev() {
-                let a = (14 - i) as u32 * 5;
-                scene.blend_rect(Rect::new(z.x - i, z.y - i + 6, z.w + 2 * i, z.h + 2 * i - 12), 0xFFFFFF, a / 3);
-            }
-            scene.shadow(z, 18);
+            // The focused card lifts: a deeper shadow and a white border.
+            scene.shadow_round(z, 16, 24, 140);
             scene.fill_round_rect(Rect::new(z.x - 4, z.y - 4, z.w + 8, z.h + 8), 16, 0xFFFFFF);
             let live = self.preview_on && Self::draw_live(scene, &it, z, 13);
             if !live {
@@ -910,27 +1079,30 @@ impl Home {
         let mut hx = MARGIN;
         let hy = h - 40;
         scene.blend_rect(Rect::new(0, h - 60, w, 60), BG, 120);
-        for (key, label) in [("Enter", "Open"), ("Tab", "Section"), ("Arrows", "Move"), ("Windows key", "Home"), ("F1", "Assistant"), ("Right-click", "Options")] {
-            let kw = font::width(key, 12, Weight::Bold) + 16;
-            scene.fill_round_rect(Rect::new(hx, hy, kw, 24), 7, 0x2C2E40);
-            font::draw(scene, hx + 8, hy + 4, key, 12, Weight::Bold, TEXT);
-            hx += kw + 8;
+        let hints: &[(&str, &str)] = if self.query.is_empty() {
+            &[("Enter", "Open"), ("Tab", "Section"), ("Arrows", "Move"), ("A-Z", "Search"), ("Windows key", "Home"), ("F1", "Assistant"), ("Right-click", "Options")]
+        } else {
+            &[("Enter", "Open"), ("Arrows", "Move"), ("Esc", "Clear search")]
+        };
+        for (key, label) in hints {
+            hx = ui::kbd(scene, hx, hy, key) + 8;
             hx = font::draw(scene, hx, hy + 3, label, 13, Weight::Regular, DIM) + 22;
         }
 
-        // Context menu.
+        // Context menu: a raised popover with the card's name and its actions.
         if let Some(menu) = &self.menu {
             let r = menu.rect();
-            scene.shadow(r, 12);
-            scene.fill_round_rect(r, 12, 0x1C1D2A);
-            font::draw_clipped(scene, r.x + 14, r.y + 10, &menu.title, 14, Weight::Regular, DIM, r.w - 28);
+            scene.shadow_round(r, 12, 16, 130);
+            scene.fill_round_rect(r, 12, ui::RAISED);
+            scene.stroke_round_rect_w(r, 12, 1, blend(ui::RAISED, 0xFFFFFF, 22));
+            font::draw_clipped(scene, r.x + 14, r.y + 10, &menu.title, 13, Weight::Bold, DIM, r.w - 28);
             for (i, (label, _)) in menu.entries.iter().enumerate() {
                 let e = Rect::new(r.x + 6, r.y + 36 + i as i32 * MENU_ROW, r.w - 12, MENU_ROW - 2);
                 if menu.entry_at(self.cursor.0, self.cursor.1) == Some(i) {
-                    scene.fill_round_rect(e, 6, 0x34364C);
+                    scene.fill_round_rect(e, 6, blend(ui::RAISED, 0xFFFFFF, 30));
                 }
-                let color = if *label == "Stop running" { 0xFF7A85 } else { TEXT };
-                font::draw(scene, e.x + 10, e.y + 4, label, 15, Weight::Bold, color);
+                let color = if *label == "Stop running" { ui::DANGER } else { TEXT };
+                font::draw(scene, e.x + 10, e.y + (MENU_ROW - 2 - font::line_height(15)) / 2, label, 15, Weight::Regular, color);
             }
         }
     }

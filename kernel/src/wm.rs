@@ -31,6 +31,8 @@ use crate::{apps, fs, net, pit, rtc, task};
 pub const TITLE_H: i32 = 40;
 /// No taskbar: Home and full-screen windows use the whole screen.
 pub const TASKBAR_H: i32 = 0;
+/// Corner radius of window frames (the client area follows it at the bottom).
+pub const FRAME_RADIUS: i32 = 12;
 const TERM_PAD: i32 = 14;
 /// Terminal text size (px) in the monospace font.
 const TERM_FONT: u16 = 15;
@@ -41,9 +43,22 @@ pub mod theme {
     pub const TEXT: u32 = 0xE8E8F2;
     pub const TEXT_DIM: u32 = 0x9A9CB0;
     pub const HOVER: u32 = 0x3A3D58;
-    pub const CLOSE: u32 = 0xEF5B6B;
+    pub const CLOSE: u32 = 0xE5596A;
     pub const MINIMIZE: u32 = 0xF2C14E;
     pub const WINDOW_BG: u32 = 0x1E1E2E;
+}
+
+/// What Home's header shows about the machine (refreshed once a second).
+#[derive(Clone, PartialEq, Default)]
+pub struct Status {
+    /// "10.0.2.15", "connecting" or "offline".
+    pub net: String,
+    pub online: bool,
+    pub cpu: u32,
+    /// "0.1 / 3.6 GB".
+    pub mem: String,
+    /// "14:37".
+    pub clock: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -104,11 +119,12 @@ impl Window {
     fn title_bar(&self) -> Rect {
         Rect::new(self.x, self.y, self.w + 2, TITLE_H)
     }
+    /// Caption buttons: 20 px discs on an 8 px rhythm from the right edge.
     fn close_button(&self) -> Rect {
-        Rect::new(self.x + self.w + 2 - 32, self.y + (TITLE_H - 18) / 2, 18, 18)
+        Rect::new(self.x + self.w + 2 - 34, self.y + (TITLE_H - 20) / 2, 20, 20)
     }
     fn minimize_button(&self) -> Rect {
-        Rect::new(self.x + self.w + 2 - 60, self.y + (TITLE_H - 18) / 2, 18, 18)
+        Rect::new(self.x + self.w + 2 - 62, self.y + (TITLE_H - 20) / 2, 20, 20)
     }
     fn resize_grip(&self) -> Rect {
         let f = self.frame();
@@ -394,9 +410,11 @@ struct Desktop {
     cursor: (i32, i32),
     buttons: (bool, bool),
     drag: Option<Drag>,
+    /// The window the pointer hovers (gets MouseMove events so it can show states).
+    hover_win: usize,
     /// Filesystem generation Home was built from (apps appear when written).
     launchers_gen: u64,
-    status: String,
+    status: Status,
     last_status_tick: u64,
     last_compose_tick: u64,
     /// Cursor position drawn on the framebuffer (to restore the scene under it).
@@ -454,8 +472,9 @@ pub fn start() -> bool {
             cursor: (screen.width as i32 / 2, screen.height as i32 / 2),
             buttons: (false, false),
             drag: None,
+            hover_win: 0,
             launchers_gen: fs::generation(),
-            status: String::new(),
+            status: Status::default(),
             last_status_tick: 0,
             last_compose_tick: 0,
             drawn_cursor: None,
@@ -510,9 +529,9 @@ impl Desktop {
             let now = pit::ticks();
             if now - self.last_status_tick >= pit::HZ {
                 self.last_status_tick = now;
-                let status = status_line();
+                let status = status_now();
                 if status != self.status {
-                    self.home.set_status(&status);
+                    self.home.set_status(status.clone());
                     self.status = status;
                     changed = true;
                 }
@@ -597,6 +616,7 @@ impl Desktop {
     /// Handle one pointer report; returns true if the scene must be redrawn.
     fn mouse(&mut self, r: mouse::Report) -> bool {
         let (sw, sh) = (self.screen.width as i32, self.screen.height as i32);
+        let before = self.cursor;
         match r.motion {
             Motion::Relative(dx, dy) => {
                 self.cursor = ((self.cursor.0 + dx).clamp(0, sw - 1), (self.cursor.1 + dy).clamp(0, sh - 1));
@@ -605,6 +625,7 @@ impl Desktop {
                 self.cursor = ((x as i64 * sw as i64 / 0x10000) as i32, (y as i64 * sh as i64 / 0x10000) as i32);
             }
         }
+        let moved = self.cursor != before;
         let (x, y) = self.cursor;
         let mut changed = false;
         let pressed = r.left && !self.buttons.0;
@@ -712,6 +733,28 @@ impl Desktop {
             } else {
                 changed |= self.home.hover(-1, -1);
             }
+            // Hover: the window under the pointer hears where it is (apps show hover
+            // states); the one it just left hears that it is gone.
+            let over_id = over_window.as_ref().map_or(0, |w| w.lock().id);
+            if over_id != self.hover_win
+                && let Some(old) = window_by_id(self.hover_win)
+            {
+                let mut old = old.lock();
+                if matches!(old.content, Content::Canvas(_)) {
+                    old.push(Event::MouseMove { x: -1, y: -1 });
+                }
+            }
+            self.hover_win = over_id;
+            if moved && let Some(w) = &over_window {
+                let mut w = w.lock();
+                let (ox, oy) = w.client_origin();
+                let (cx, cy) = (x - ox, y - oy);
+                if matches!(w.content, Content::Canvas(_)) && cy >= 0 {
+                    w.push(Event::MouseMove { x: cx, y: cy });
+                } else if cy < 0 {
+                    changed = true; // the caption buttons highlight
+                }
+            }
         }
         changed
     }
@@ -769,10 +812,11 @@ impl Desktop {
 
         let focus = FOCUS.load(Ordering::Relaxed);
         let list: Vec<WindowRef> = WINDOWS.lock().clone();
+        let hover = (self.drag.is_none()).then_some(self.cursor);
         for win in &list {
             let w = win.lock();
             if !w.minimized {
-                draw_window(&mut self.scene, &w, w.id == focus);
+                draw_window(&mut self.scene, &w, w.id == focus, if w.id == self.hover_win { hover } else { None });
             }
         }
         self.draw_bubble();
@@ -789,21 +833,25 @@ impl Desktop {
             let w = w.lock();
             w.minimized && matches!(&w.content, Content::Terminal(t) if t.try_lock().is_some_and(|t| t.grid.dirty))
         });
-        for i in (1..=10).rev() {
-            self.scene.blend_rect(Rect::new(cx - BUBBLE_R - i + 2, cy - BUBBLE_R - i + 6, 2 * (BUBBLE_R + i) - 4, 2 * (BUBBLE_R + i) - 4), 0, 6);
-        }
-        self.scene.fill_circle(cx, cy, BUBBLE_R + 3, if open { theme::ACCENT } else { 0x2A2C3E });
+        let hovered = self.drag.is_none() && {
+            let (x, y) = self.cursor;
+            (x - cx) * (x - cx) + (y - cy) * (y - cy) <= (BUBBLE_R + 4) * (BUBBLE_R + 4)
+        };
+        let ring = BUBBLE_R + 3;
+        self.scene.shadow_round(Rect::new(cx - ring, cy - ring, 2 * ring, 2 * ring), ring, 14, 110);
+        let base = if open { theme::ACCENT } else { 0x2A2C3E };
+        self.scene.fill_circle(cx, cy, ring, if hovered { crate::gfx::blend(base, 0xFFFFFF, 30) } else { base });
         let r = BUBBLE_R - 1;
         crate::icons::draw(&mut self.scene, '*', 0xD97757, Rect::new(cx - r, cy - r, 2 * r, 2 * r));
         if open {
             // A small down chevron: click to tuck the chat away.
-            self.scene.fill_circle(cx + BUBBLE_R - 4, cy - BUBBLE_R + 4, 10, theme::ACCENT);
-            for i in 0..4 {
-                self.scene.fill_rect(Rect::new(cx + BUBBLE_R - 9 + i, cy - BUBBLE_R + 2 + i, 2, 2), 0xFFFFFF);
-                self.scene.fill_rect(Rect::new(cx + BUBBLE_R + 1 - i, cy - BUBBLE_R + 2 + i, 2, 2), 0xFFFFFF);
-            }
+            let (bx, by) = (cx + BUBBLE_R - 4, cy - BUBBLE_R + 4);
+            self.scene.fill_circle(bx, by, 10, theme::ACCENT);
+            crate::icons::glyph(&mut self.scene, "chevron-down", 0xFFFFFF, Rect::new(bx - 6, by - 6, 12, 12));
         } else if unread {
-            self.scene.fill_circle(cx + BUBBLE_R - 6, cy - BUBBLE_R + 6, 8, 0xE5394B);
+            let (bx, by) = (cx + BUBBLE_R - 6, cy - BUBBLE_R + 6);
+            self.scene.fill_circle(bx, by, 9, 0x16171F);
+            self.scene.fill_circle(bx, by, 7, 0xE5394B);
         }
     }
 
@@ -964,44 +1012,49 @@ pub fn draw_window_thumb(scene: &mut Canvas, id: usize, r: Rect, radius: i32) ->
     true
 }
 
-fn draw_window(scene: &mut Canvas, w: &Window, focused: bool) {
+/// Draw a window: a rounded frame with a translucent header, the caption buttons
+/// (highlighted under `hover`), and the client area with rounded bottom corners. The
+/// focused window has a deeper shadow and full-contrast chrome; others sit back.
+fn draw_window(scene: &mut Canvas, w: &Window, focused: bool, hover: Option<(i32, i32)>) {
+    use crate::gfx::{blend, BOTTOM_CORNERS, TOP_CORNERS};
     let f = w.frame();
-    scene.shadow(f, if focused { 22 } else { 12 });
-    // Translucent header over whatever is behind the window, rounded on top.
+    let radius = FRAME_RADIUS;
+    // Shadow: same extent whether focused or not (nothing jumps), lighter when inactive.
+    scene.shadow_round(f, radius, 28, if focused { 120 } else { 55 });
+    scene.fill_round_rect(f, radius, theme::FRAME);
+    // Translucent header over whatever is behind the window, rounded on top, with a
+    // 1 px highlight along the top edge so the window separates from the backdrop.
     let header = if focused { 0x2C2E42 } else { 0x23242F };
-    let radius = 14;
-    scene.fill_round_rect(Rect::new(f.x, f.y + TITLE_H / 2, f.w, f.h - TITLE_H / 2), radius, theme::FRAME);
-    for y in 0..TITLE_H {
-        // Rows of the rounded top: inset like fill_round_rect does.
-        let dy = radius - y;
-        let inset = if dy > 0 { radius - crate::gfx::isqrt(radius * radius - dy * dy) } else { 0 };
-        scene.blend_rect(Rect::new(f.x + inset, f.y + y, f.w - 2 * inset, 1), header, if focused { 236 } else { 220 });
-    }
+    scene.fill_round_rect_corners(Rect::new(f.x, f.y, f.w, TITLE_H), radius, header, TOP_CORNERS, if focused { 236 } else { 220 });
+    scene.blend_rect(Rect::new(f.x + radius, f.y, f.w - 2 * radius, 1), 0xFFFFFF, if focused { 26 } else { 14 });
     scene.fill_rect(Rect::new(f.x, f.y + TITLE_H - 1, f.w, 1), if focused { 0x3A3D58 } else { 0x2C2E3C });
-    crate::icons::draw(scene, w.icon, w.accent, Rect::new(f.x + 12, f.y + (TITLE_H - 24) / 2, 24, 24));
+    crate::icons::draw(scene, w.icon, w.accent, Rect::new(f.x + 12, f.y + (TITLE_H - 22) / 2, 22, 22));
     let title_color = if focused { theme::TEXT } else { theme::TEXT_DIM };
-    crate::font::draw_clipped(scene, f.x + 46, f.y + (TITLE_H - 20) / 2, &w.title, 15, crate::font::Weight::Bold, title_color, f.w - 130);
+    crate::font::draw_clipped(scene, f.x + 44, f.y + (TITLE_H - crate::font::line_height(14)) / 2, &w.title, 14, crate::font::Weight::Bold, title_color, f.w - 118);
+    // Caption buttons: a red close and a neutral minimize; both lift on hover, the
+    // glyphs show on the focused window and on hover.
     let close = w.close_button();
-    scene.fill_circle(close.x + 9, close.y + 9, 9, if focused { 0xE5596A } else { 0x45475A });
     let min = w.minimize_button();
-    scene.fill_circle(min.x + 9, min.y + 9, 9, if focused { 0x5A5D78 } else { 0x45475A });
-    // A minus on minimize, a cross on close (focused windows only).
-    if focused {
-        scene.fill_rect(Rect::new(min.x + 5, min.y + 8, 8, 2), 0xE8E8F2);
-        for i in 0..7 {
-            scene.fill_rect(Rect::new(close.x + 5 + i, close.y + 5 + i, 2, 2), 0xFFFFFF);
-            scene.fill_rect(Rect::new(close.x + 11 - i, close.y + 5 + i, 2, 2), 0xFFFFFF);
+    let over = |r: Rect| hover.is_some_and(|(x, y)| r.contains(x, y));
+    let (close_fill, min_fill) = if focused { (theme::CLOSE, 0x5A5D78) } else { (0x45475A, 0x45475A) };
+    for (r, fill, glyph) in [(close, close_fill, "close"), (min, min_fill, "minus")] {
+        let fill = if over(r) { blend(fill, 0xFFFFFF, 40) } else { fill };
+        scene.fill_circle(r.x + r.w / 2, r.y + r.h / 2, r.w / 2, fill);
+        if focused || over(r) {
+            crate::icons::glyph(scene, glyph, 0xFFFFFF, Rect::new(r.x + 5, r.y + 5, r.w - 10, r.h - 10));
         }
     }
 
     let (ox, oy) = w.client_origin();
+    let client = Rect::new(ox, oy, w.w, w.h);
+    let inner = radius - 1;
     match &w.content {
         Content::Canvas(c) => {
-            scene.fill_rect(Rect::new(ox, oy, w.w, w.h), theme::WINDOW_BG);
-            scene.blit(c, Rect::new(0, 0, w.w.min(c.width as i32), w.h.min(c.height as i32)), ox, oy);
+            scene.fill_round_rect_corners(client, inner, theme::WINDOW_BG, BOTTOM_CORNERS, 255);
+            scene.blit_corners(c, Rect::new(0, 0, w.w.min(c.width as i32), w.h.min(c.height as i32)), ox, oy, inner, BOTTOM_CORNERS);
         }
         Content::Terminal(t) => {
-            scene.fill_rect(Rect::new(ox, oy, w.w, w.h), PALETTE[0]);
+            scene.fill_round_rect_corners(client, inner, PALETTE[0], BOTTOM_CORNERS, 255);
             let mut t = t.lock();
             let g = &mut t.grid;
             let (cw, ch) = term_cell();
@@ -1073,23 +1126,23 @@ fn draw_window(scene: &mut Canvas, w: &Window, focused: bool) {
             g.dirty = false;
         }
     }
-    // Resize grip.
+    // Resize grip: two short diagonal lines tucked inside the rounded corner.
     let grip = w.resize_grip();
-    for i in 0..3 {
-        scene.line(grip.x + 4 + i * 3, grip.y + 12, grip.x + 12, grip.y + 4 + i * 3, 0x55586E);
+    for i in 0..2 {
+        scene.line(grip.x + 6 + i * 4, grip.y + 11, grip.x + 11, grip.y + 6 + i * 4, if focused { 0x6A6E8A } else { 0x4A4D62 });
     }
 }
 
 /// Status for Home's header: network, CPU, memory, clock.
-fn status_line() -> String {
-    let net = match net::info() {
+fn status_now() -> Status {
+    let (net, online) = match net::info() {
         Some(i) => match i.ip {
-            Some(ip) => format!("{}", ip.address()),
-            None => "connecting".to_string(),
+            Some(ip) => (format!("{}", ip.address()), true),
+            None => ("connecting".to_string(), false),
         },
-        None => "offline".to_string(),
+        None => ("offline".to_string(), false),
     };
-    let cpu = task::cpu_usage();
+    let cpu = task::cpu_usage() as u32;
     let (used, free) = crate::memory::heap_usage();
     let tenths = |b: usize| {
         let t = (b as u64 * 10 + (1 << 29)) >> 30; // GiB in tenths, rounded
@@ -1097,5 +1150,5 @@ fn status_line() -> String {
     };
     let mem = format!("{} / {} GB", tenths(used), tenths(used + free));
     let (_, _, _, h, m, _) = rtc::now();
-    format!("net {net}   cpu {cpu:>2}%   mem {mem}   {h:02}:{m:02} UTC")
+    Status { net, online, cpu, mem, clock: format!("{h:02}:{m:02}") }
 }
