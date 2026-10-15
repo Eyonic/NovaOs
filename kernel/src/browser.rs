@@ -113,7 +113,7 @@ impl Cdp {
             if pit::ticks() > end {
                 return Err(format!("{method}: no answer from the engine"));
             }
-            ipc::wait(Some(pit::ticks() + 2));
+            ipc::wait(Some(pit::ticks() + pit::HZ / 50));
         }
     }
 }
@@ -547,7 +547,7 @@ impl Browser {
 
     fn run(&mut self) {
         loop {
-            if let Some(e) = wm::wait_event(&self.win, Some(1)) {
+            if let Some(e) = wm::wait_event(&self.win, Some(pit::HZ / 100)) {
                 if !self.input(e) {
                     return;
                 }

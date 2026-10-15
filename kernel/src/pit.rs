@@ -4,8 +4,10 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::port::outb;
 
-/// Tick rate.
-pub const HZ: u64 = 100;
+/// Tick rate: 1 ms, the resolution of sleeps, timeouts and timers.
+pub const HZ: u64 = 1000;
+/// User programs are preempted every this many ticks (4 ms time slices).
+pub const PREEMPT_TICKS: u64 = 4;
 const BASE_FREQUENCY: u64 = 1_193_182;
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -45,14 +47,14 @@ fn rdtsc() -> u64 {
     (hi as u64) << 32 | lo as u64
 }
 
-/// Measure the TSC frequency over 10 ticks (100 ms). Interrupts must be enabled.
+/// Measure the TSC frequency over 100 ms. Interrupts must be enabled.
 pub fn calibrate() -> u64 {
     let start_tick = ticks();
     while ticks() == start_tick {
         core::hint::spin_loop();
     }
     let (t0, k0) = (rdtsc(), ticks());
-    while ticks() < k0 + 10 {
+    while ticks() < k0 + HZ / 10 {
         core::hint::spin_loop();
     }
     let (t1, k1) = (rdtsc(), ticks());

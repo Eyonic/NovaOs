@@ -161,7 +161,7 @@ APIC (clears `IA32_APIC_BASE` bit 11, and bit 10 for x2APIC). With the LAPIC off
 line goes straight to the CPU, as on a pre-APIC PC. That is fine for one CPU. SMP would need the
 LAPIC and I/O APIC instead.
 
-The PIT's channel 0 runs at 100 Hz (divisor 11931, mode 3). Its handler only increments a tick
+The PIT's channel 0 runs at 1000 Hz (divisor 1193, mode 3; user programs are preempted every 4 ticks). Its handler only increments a tick
 counter, which `uptime` and `sleep` read.
 
 Spurious IRQ 7/15 are detected by reading the PIC's in-service register. They get no EOI (IRQ 7) or
@@ -434,6 +434,31 @@ multi-threaded, including the Chromium engine (`process.rs`, `linux.rs`, `ipc.rs
   packed into one Limine module (`scripts/mkpak.py`, 4 KiB-aligned files) and registered as
   read-only files over NovaFS. Mapping them shares the module's physical pages
   (copy-on-write), so a 205 MB binary is not copied.
+* **File system** (`vfs.rs`). Linux programs see a mount tree over backends: NovaFS (with
+  the system files) at `/`, tmpfs at `/run` and `/home`, and the Linux layer's `/proc`,
+  `/dev` (null, zero, full, random, urandom, tty, ptmx, shm, pts, fd links) and `/sys`. Paths are walked one component at
+  a time, following symbolic links (up to 40, then `ELOOP`) except in the last component
+  for `lstat`, `readlink`, `unlink`, `rename` and `O_NOFOLLOW`. NovaFS stores flat names,
+  so its symbolic links, permissions and empty directories are kept in one metadata file
+  (`.nova-vfs`). tmpfs is a tree of inodes: directories, files, symbolic links, hard links
+  (shared inode, `st_nlink`), permissions, owners and times, without NovaFS's 1024-file and
+  88-byte-name limits; file contents are shared-memory objects, so every open file and
+  every `MAP_SHARED` mapping uses the same pages, and an unlinked file lives on while it is
+  open. `getdents64` resumes across calls (directories of any size); `/proc/mounts` lists
+  the mounts. Test: `vfstest` (43 checks on NovaFS and tmpfs) plus BusyBox `tar`/`cp -a`
+  keeping links (case `vfs`).
+* **Mount namespaces and containers.** Each process has a mount namespace (shared until
+  `unshare`/`clone` with `CLONE_NEWNS` copies it). Mounts form a tree with parents, as on
+  Linux: a mount stacked on another hides it, `umount2` removes a mount with everything
+  below it. `mount` does bind mounts (recursive too), remounts, `MS_MOVE`, and new tmpfs,
+  proc, sysfs, devtmpfs, devpts and mqueue file systems; `mount_setattr` sets read-only
+  (recursively), and read-only mounts refuse changes with `EROFS`. `pivot_root` (including
+  the `pivot_root(".", ".")` form) and `chroot` re-root the namespace; open directories and
+  files remember their mount, so they keep working when paths move. `/proc/self/mountinfo`,
+  `openat2` with `RESOLVE_IN_ROOT`, `/proc/self/fd/N` links that walks follow, `signalfd`,
+  `capget`/`capset` and the capability `prctl`s complete what bubblewrap needs: the host's
+  unmodified `bwrap` builds containers on Nova (case `containers`). User, PID, IPC, UTS and
+  network namespaces are accepted but not separate yet.
 * **Threads.** `clone`/`clone3` with `CLONE_VM | CLONE_THREAD` start a kernel task that
   enters user mode with the parent's registers on a new stack and TLS; `set_tid_address`,
   `CLONE_CHILD_CLEARTID` and futexes (wait, wake, requeue, wake-op, bitsets, timeouts) work.
@@ -469,7 +494,7 @@ checks: exceptions, RTTI, static constructors/destructors, STL, iostreams, fstre
 `threads` (7 checks: mutexes, condition variables, TLS, async, exceptions in threads),
 `hello-dyn`, `nettest` (DNS + HTTP over sockets), `guess` (interactive stdin).
 
-Not yet: `AF_INET6`, listening sockets, inotify, namespaces (containers), `vm86`.
+Not yet: `AF_INET6`, listening sockets, inotify, separate PID and user namespaces, `vm86`.
 
 ## Nova Browser and Shields (0.4)
 
@@ -570,6 +595,8 @@ All cases run the same kernel binary. `scripts/mkimage.sh` adds `cmdline: nova.t
 | `crash` | `crash pf` typed at the shell, with interrupts on | full #PF report with RIP check, controlled halt |
 | `native` | `hello`, `ctest`, `cxxtest`, `threads`, `hello-dyn`, `cxxtest-dyn`, `guess` | C and C++ runtime checks pass (static and dynamic), threads, stdin, exit status, no unimplemented syscall |
 | `compat32` | `hello32`, `hello32-dyn`, `proctest32`, `threads32` | 32-bit programs: static and dynamic, processes and signals, threads with TLS, no fault or unimplemented syscall |
+| `vfs` | `vfstest`, BusyBox `tar`, `cp -a`, `readlink` | symbolic and hard links, directories, rename, chmod, tmpfs with 3000 files and long names, links kept by tar and cp |
+| `containers` | host `bwrap`, BusyBox | read-only root with its own /dev, /proc, /tmp; a container rooted in a separate tree; exit status passed through |
 | `net` | `nettest 10.0.2.2:<mock port>` | glibc DNS and a TCP HTTP exchange through the Linux socket layer |
 | `chromium` | `chrome-headless-shell --screenshot` of a `data:` URL | the Chromium engine starts, renders and writes the PNG (skipped if Chromium was not downloaded) |
 | `browser` | desktop; "open the test page" typed to Claude Code (mock API) | Claude calls `open_url`, Nova Browser starts Chromium, Chromium fetches the page from the host, Shields blocks its Google Analytics script (skipped without Chromium) |

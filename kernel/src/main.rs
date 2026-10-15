@@ -62,6 +62,7 @@ mod textgrid;
 mod tls;
 mod tty;
 mod ui;
+mod vfs;
 mod wm;
 
 use core::arch::asm;

@@ -329,6 +329,8 @@ pub struct Process {
     pub term_signal: AtomicI32,
     /// vfork: set when the child has called execve or exited (the parent then resumes).
     pub vfork_done: AtomicBool,
+    /// Mount namespace (shared with the parent unless unshared).
+    pub ns: SpinLock<Arc<crate::vfs::Namespace>>,
 }
 
 /// Per-thread user state, owned by the kernel task that runs the thread.
@@ -776,6 +778,7 @@ impl Process {
             signals: SpinLock::new(crate::signal::Signals::new()),
             term_signal: AtomicI32::new(0),
             vfork_done: AtomicBool::new(false),
+            ns: SpinLock::new(crate::vfs::root()),
         });
         TABLE.lock().insert(p.pid, Entry { parent, process: Arc::downgrade(&p), status: None });
         p
@@ -783,6 +786,20 @@ impl Process {
 }
 
 // ---------------------------------------------------------------- process table
+
+/// Give process `pid` its own copy of its mount namespace (clone with CLONE_NEWNS).
+pub fn unshare_ns(pid: u64) {
+    let p = TABLE.lock().get(&pid).and_then(|e| e.process.upgrade());
+    if let Some(p) = p {
+        let copy = p.ns.lock().copy();
+        *p.ns.lock() = copy;
+    }
+}
+
+/// Whether process `pid` exists (or is a zombie).
+pub fn exists(pid: u64) -> bool {
+    TABLE.lock().contains_key(&pid)
+}
 
 /// Every process that exists or has exited and not been waited for (a zombie).
 struct Entry {
@@ -1452,10 +1469,11 @@ pub fn kill(p: &Process) {
 
 /// The bytes of program `path` (a system file is used in place), and whether it is one.
 fn program_bytes(path: &str) -> Result<(alloc::borrow::Cow<'static, [u8]>, bool), String> {
-    match crate::fs::system_file(path) {
-        Some(s) => Ok((alloc::borrow::Cow::Borrowed(s), true)),
-        None => crate::fs::read(path).map(|v| (alloc::borrow::Cow::Owned(v), false)).map_err(|e| format!("{path}: {e}")),
-    }
+    // `path` is canonical (relative to the root, as resolved by the caller).
+    let ns = task::current_user().map_or_else(crate::vfs::root, |u| u.process.ns.lock().clone());
+    let bytes = ns.read_program("", path).map_err(|e| format!("{path}: error {e}"))?;
+    let in_place = matches!(bytes, alloc::borrow::Cow::Borrowed(_));
+    Ok((bytes, in_place))
 }
 
 /// Load program `path` (and its dynamic loader) into `mem` and build its initial stack.
@@ -1471,13 +1489,8 @@ fn load_program(mem: &mut Memory, path: &str, elf: &[u8], is_static: bool, args:
     let (start, interp_base) = match &loaded.interp {
         Some(ip) => {
             let ip = ip.trim_start_matches('/');
-            let l = match crate::fs::system_file(ip) {
-                Some(ld) => load_elf(mem, ld, interp_load, true)?,
-                None => {
-                    let ld = crate::fs::read(ip).map_err(|_| format!("{path} needs the dynamic loader /{ip}, which is not installed"))?;
-                    load_elf(mem, &ld, interp_load, false)?
-                }
-            };
+            let (ld, in_place) = program_bytes(ip).map_err(|_| format!("{path} needs the dynamic loader /{ip}, which is not installed"))?;
+            let l = load_elf(mem, &ld, interp_load, in_place)?;
             (l.entry, interp_load)
         }
         None => (loaded.entry, 0),
@@ -1564,6 +1577,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     let parent = me.process.clone();
     let child = Process::new(&parent.name, &parent.exe.lock(), parent.pid);
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
+    *child.ns.lock() = parent.ns.lock().clone();
     {
         let src = parent.mem.lock();
         let mut dst = child.mem.lock();

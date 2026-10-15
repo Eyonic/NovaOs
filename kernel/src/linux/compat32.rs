@@ -354,6 +354,9 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
             } else {
                 let sf = as_syscall_frame(f);
                 let pid = process::fork(&sf, flags & CLONE_VFORK != 0, stack, None)?;
+                if flags & super::CLONE_NEWNS != 0 {
+                    process::unshare_ns(pid);
+                }
                 if flags & CLONE_PARENT_SETTID != 0 {
                     wr32(ptid, pid as u32)?;
                 }

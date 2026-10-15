@@ -61,11 +61,13 @@ pub struct Signals {
     pub pending: u64,
     /// Who sent each pending signal (pid), for siginfo.
     pub sender: [u32; NSIG as usize + 1],
+    /// Signals a signalfd reads: kept pending even when their action is to ignore them.
+    pub watched: u64,
 }
 
 impl Signals {
     pub const fn new() -> Self {
-        Self { actions: [Action { handler: 0, flags: 0, restorer: 0, mask: 0 }; NSIG as usize + 1], pending: 0, sender: [0; NSIG as usize + 1] }
+        Self { actions: [Action { handler: 0, flags: 0, restorer: 0, mask: 0 }; NSIG as usize + 1], pending: 0, sender: [0; NSIG as usize + 1], watched: 0 }
     }
 
     /// For execve: handled signals revert to their default, ignored ones stay ignored.
@@ -108,9 +110,11 @@ pub fn send_process(p: &process::Process, sig: u32, sender: u64) {
     }
     {
         let mut s = p.signals.lock();
-        // A signal that is ignored at the time it is sent is discarded.
+        // A signal explicitly ignored (SIG_IGN) when it is sent is discarded. One whose
+        // default action is to ignore it (SIGCHLD) stays pending: the program may have it
+        // blocked for sigwaitinfo or a signalfd; delivery drops it otherwise.
         let a = s.actions[sig as usize];
-        if a.handler == SIG_IGN || (a.handler == SIG_DFL && matches!(default_action(sig), Default::Ignore)) {
+        if s.watched & bit(sig) == 0 && a.handler == SIG_IGN {
             return;
         }
         s.pending |= bit(sig);
@@ -133,8 +137,18 @@ pub fn send_self(u: &mut UserState, sig: u32) {
 
 /// A deliverable (pending and not blocked) signal for `u`, if any, without taking it.
 pub fn has_deliverable(u: &UserState) -> bool {
-    let process = u.process.signals.lock().pending;
-    (process | u.pending) & !u.sigmask != 0
+    let s = u.process.signals.lock();
+    let mut ready = (s.pending | u.pending) & !u.sigmask;
+    // Signals that delivery would just drop do not interrupt anything.
+    while ready != 0 {
+        let sig = ready.trailing_zeros() + 1;
+        let a = s.actions[sig as usize];
+        if !(a.handler == SIG_IGN || (a.handler == SIG_DFL && matches!(default_action(sig), Default::Ignore))) {
+            return true;
+        }
+        ready &= !bit(sig);
+    }
+    false
 }
 
 /// Take the lowest deliverable signal: (signal, sender pid, sent to the thread itself).
@@ -153,6 +167,29 @@ pub(crate) fn take(u: &mut UserState) -> Option<(u32, u32, bool)> {
     let sig = shared.trailing_zeros() + 1;
     s.pending &= !bit(sig);
     Some((sig, s.sender[sig as usize], false))
+}
+
+/// Take the lowest pending signal in `mask`, blocked or not (signalfd): (signal, sender).
+pub(crate) fn take_masked(u: &mut UserState, mask: u64) -> Option<(u32, u32)> {
+    let own = u.pending & mask;
+    if own != 0 {
+        let sig = own.trailing_zeros() + 1;
+        u.pending &= !bit(sig);
+        return Some((sig, u.process.pid as u32));
+    }
+    let mut s = u.process.signals.lock();
+    let shared = s.pending & mask;
+    if shared == 0 {
+        return None;
+    }
+    let sig = shared.trailing_zeros() + 1;
+    s.pending &= !bit(sig);
+    Some((sig, s.sender[sig as usize]))
+}
+
+/// Whether a signal in `mask` is pending for `u`.
+pub(crate) fn pending_masked(u: &UserState, mask: u64) -> bool {
+    (u.pending | u.process.signals.lock().pending) & mask != 0
 }
 
 // rt_sigframe layout (x86-64): pretcode, ucontext, siginfo; the FPU state follows.

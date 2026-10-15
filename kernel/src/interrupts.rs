@@ -331,7 +331,7 @@ extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
         pic::end_of_interrupt(irq);
     }
     // Preempt user programs on the timer, so they cannot monopolise the CPU.
-    if irq == pic::IRQ_TIMER && frame.cs & 3 == 3 {
+    if irq == pic::IRQ_TIMER && frame.cs & 3 == 3 && pit::ticks() % pit::PREEMPT_TICKS == 0 {
         crate::task::yield_now();
         // A thread spinning in user code learns here that its program is exiting.
         crate::process::check_exiting();

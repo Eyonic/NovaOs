@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -151,6 +151,35 @@ define_case() {
                         "proctest: 15 passed, 0 failed" "  ok   each thread has its own __thread variable"
                         "threads32: 7 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
+        vfs)    # The file system Linux programs see (vfs.rs): symbolic and hard links, directories,
+                # rename, permissions, tmpfs at /run (userland/vfstest.c), and BusyBox tar and cp
+                # keeping symbolic links.
+                CMDLINE="nova.mode=shell"
+                [[ -x "$BUILD/busybox/busybox" ]] || SKIP="BusyBox not built (scripts/fetch-busybox.sh)"
+                INPUT=("wait:$PROMPT" "ser:vfstest" "wait:vfstest: " "wait:$PROMPT" "ser:sh" "sleep:1"
+                       "ser:mkdir /run/t && cd /run/t && echo hi > target && ln -s target l && ln -s ../t/target up"
+                       "ser:tar cf /run/a.tar . && mkdir /run/x && cd /run/x && tar xf /run/a.tar && readlink l && cat up"
+                       "wait:hi" "ser:cp -a /run/x /run/y && echo copied-\$(readlink /run/y/up)" "wait:copied-")
+                EXPECT=("${shell[@]}" "  ok   a link loop gives ELOOP" "  ok   tmpfs hard link: same inode, nlink 2"
+                        "  ok   3000 files in one directory" "vfstest: 43 passed, 0 failed" "target" "hi" "copied-../t/target")
+                FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault" "can't") ;;
+        containers) # Mount namespaces (vfs.rs): the host's unmodified bubblewrap, the container
+                # tool Steam's runtime uses, builds a read-only view of / with its own /dev,
+                # /proc and /tmp (mount, bind mounts, mount_setattr, two pivot_roots), then a
+                # container whose root is a separate tree.
+                CMDLINE="nova.mode=shell"
+                [[ -x "$BUILD/busybox/busybox" ]] || SKIP="BusyBox not built (scripts/fetch-busybox.sh)"
+                [[ -x /usr/bin/bwrap ]] || SKIP="bubblewrap is not installed on this machine"
+                INPUT=("wait:$PROMPT" "ser:sh" "sleep:1"
+                       "ser:/usr/bin/bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp /bin/busybox sh -c 'echo in-container; ls /dev | wc -l; grep -c tmpfs /proc/self/mountinfo; echo x > /etc/y'"
+                       "wait:Read-only file system"
+                       "ser:mkdir -p /run/rootfs/bin /run/rootfs/etc && cp /bin/busybox /run/rootfs/bin/ && ln -s busybox /run/rootfs/bin/sh && echo own-root > /run/rootfs/etc/name && echo made-root" "wait:made-root"
+                       "ser:/usr/bin/bwrap --bind /run/rootfs / --proc /proc --dev /dev /bin/sh -c 'busybox cat /etc/name; busybox ls / > /listing'"
+                       "wait:own-root" "sleep:1" "ser:echo root-has-\$(cat /run/rootfs/listing | tr '\\n' ' ')" "wait:root-has-"
+                       "sleep:1" "ser:/usr/bin/bwrap --bind / / /bin/busybox sh -c 'exit 3'; echo exit-status-\$?" "wait:exit-status-")
+                EXPECT=("${shell[@]}" "in-container" "sh: line 0: can't create /etc/y: Read-only file system" "own-root"
+                        "root-has-bin dev etc listing proc" "exit-status-3")
+                FORBID=("$PANIC" "$EXC" "NESTED" "unimplemented Linux syscall" "segmentation fault" "bwrap:") ;;
         busybox) # A Unix userland on Nova: BusyBox's shell runs pipelines, loops, subshells and
                 # command substitution, which fork, execve, wait and pipes underneath.
                 CMDLINE="nova.mode=shell"

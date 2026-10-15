@@ -15,7 +15,7 @@
 //! Not yet: threads (clone), fork/exec, signals, sockets, pipes. Unknown calls
 //! return -ENOSYS and are logged once to the serial console.
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -26,10 +26,11 @@ use crate::input::Key;
 use crate::process::{self, Process, SyscallFrame, UserState, PAGE};
 use crate::signal;
 use crate::gdt;
+use crate::vfs;
 
 pub mod compat32;
 use crate::sync::SpinLock;
-use crate::{fs, ipc, pit, rand, rtc, task};
+use crate::{ipc, pit, rand, rtc, task};
 
 const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
@@ -47,6 +48,10 @@ const EAFNOSUPPORT: i64 = 97;
 const ENOTSOCK: i64 = 88;
 const ENOMEM_ERR: i64 = 12;
 const EROFS: i64 = 30;
+const EACCES: i64 = 13;
+const ENODEV: i64 = 19;
+const ELOOP: i64 = 40;
+const O_NOFOLLOW: u64 = 0o400000;
 
 const AT_FDCWD: i64 = -100;
 
@@ -91,18 +96,28 @@ pub enum Kind {
     /// Pipe end or Unix socket.
     Channel(ipc::End),
     EventFd(Arc<SpinLock<ipc::EventFd>>),
+    /// signalfd: reads the pending signals in its mask as signalfd_siginfo records.
+    SignalFd(u64),
     Epoll(ipc::Epoll),
-    Memfd(ipc::SharedRef),
+    /// Shared-memory object: memfd, POSIX shm, or (with its path) a tmpfs file.
+    Memfd(ipc::SharedRef, Option<vfs::At>),
     /// AF_INET TCP or UDP socket (smoltcp, net.rs).
     Inet(InetSocket),
-    File { path: String, data: FileData, writable: bool, append: bool, dirty: bool },
-    Dir { path: String, listed: bool },
+    /// /dev/zero (and /dev/full): reads zeros, writes are discarded.
+    Zero,
+    /// A regular file read into memory (NovaFS) or used in place (system files); `at`
+    /// is where it is written back.
+    File { path: String, at: vfs::At, data: FileData, writable: bool, append: bool, dirty: bool },
+    Dir { at: vfs::At },
 }
 
 pub struct OpenFile {
     kind: Kind,
     pos: usize,
     flags: u64,
+    /// Where it was opened, for any file opened by path (devices too): fchdir, *at
+    /// calls, /proc/self/fd links.
+    at: Option<vfs::At>,
 }
 
 pub type FileRef = Arc<SpinLock<OpenFile>>;
@@ -233,7 +248,7 @@ const O_CLOEXEC: u64 = 0o2000000;
 const EPIPE: i64 = 32;
 
 fn new_file(kind: Kind, flags: u64) -> FileRef {
-    Arc::new(SpinLock::new(OpenFile { kind, pos: 0, flags }))
+    Arc::new(SpinLock::new(OpenFile { kind, pos: 0, flags, at: None }))
 }
 
 /// Readiness of a file for poll/epoll: (events, generation).
@@ -242,6 +257,7 @@ fn poll_file(f: &FileRef) -> (u32, u64) {
     match &f.kind {
         Kind::Channel(end) => end.poll(),
         Kind::EventFd(e) => e.lock().poll(),
+        Kind::SignalFd(mask) => (if signal::pending_masked(thread(), *mask) { ipc::POLLIN } else { 0 }, 0),
         Kind::Inet(s) => {
             let (r, w, hup, err) = crate::net::sock_poll(s.handle, s.udp);
             let mut ev = 0;
@@ -275,14 +291,14 @@ pub struct FdTable {
     fds: Vec<Option<FileRef>>,
     /// Descriptors closed by execve (O_CLOEXEC / FD_CLOEXEC).
     cloexec: alloc::collections::BTreeSet<usize>,
-    cwd: String,
+    pub cwd: String,
     /// Typed-ahead terminal input not yet consumed by read().
     stdin: Vec<u8>,
 }
 
 impl FdTable {
     pub fn new() -> Self {
-        let tty = || Some(Arc::new(SpinLock::new(OpenFile { kind: Kind::Tty, pos: 0, flags: 2 })));
+        let tty = || Some(Arc::new(SpinLock::new(OpenFile { kind: Kind::Tty, pos: 0, flags: 2, at: None })));
         Self { fds: vec![tty(), tty(), tty()], cloexec: Default::default(), cwd: String::new(), stdin: Vec::new() }
     }
 
@@ -343,11 +359,11 @@ impl FdTable {
 }
 
 fn flush(f: &mut OpenFile) {
-    if let Kind::File { path, data, dirty, .. } = &mut f.kind
+    if let Kind::File { path, at, data, dirty, .. } = &mut f.kind
         && *dirty
     {
-        if let Err(e) = fs::write(path, &data[..]) {
-            crate::log::warn(&format!("could not write back {path}: {e}"));
+        if let Err(e) = at.mount.fs.write_back(&at.rel, &data[..]) {
+            crate::log::warn(&format!("could not write back {path}: error {e}"));
         }
         *dirty = false;
     }
@@ -434,8 +450,22 @@ fn read_cstr(addr: u64) -> Result<String, i64> {
 }
 
 /// Resolve a path to a NovaFS name ("" = the root directory).
+/// Canonical path of `path` for this process, symbolic links followed (vfs::walk).
 fn resolve(path: &str) -> String {
-    let joined = if path.starts_with('/') { String::from(path) } else { format!("/{}/{}", fds().cwd, path) };
+    let cwd = fds().cwd.clone();
+    ns().walk(&cwd, path, true).unwrap_or_else(|_| lexical(&cwd, path))
+}
+
+/// Like [`resolve`], but a symbolic link in the last component is not followed (lstat,
+/// readlink, unlink, rename, O_NOFOLLOW).
+fn resolve_nofollow(path: &str) -> String {
+    let cwd = fds().cwd.clone();
+    ns().walk(&cwd, path, false).unwrap_or_else(|_| lexical(&cwd, path))
+}
+
+/// `.` and `..` applied, no links followed (a path whose walk failed, e.g. ELOOP).
+fn lexical(cwd: &str, path: &str) -> String {
+    let joined = if path.starts_with('/') { String::from(path) } else { format!("/{cwd}/{path}") };
     let mut parts: Vec<&str> = Vec::new();
     for p in joined.split('/') {
         match p {
@@ -449,8 +479,27 @@ fn resolve(path: &str) -> String {
     parts.join("/")
 }
 
+/// The calling process's mount namespace.
+fn ns() -> Arc<vfs::Namespace> {
+    proc().ns.lock().clone()
+}
+
+/// Where an open directory is now, in this process's namespace ("" if unreachable).
+fn dir_path(at: &vfs::At) -> String {
+    ns().vpath(at).unwrap_or_default()
+}
+
 fn is_dir(name: &str) -> bool {
-    name.is_empty() || !fs::list(&format!("{name}/")).is_empty()
+    ns().lstat(name).is_ok_and(|m| m.ty == vfs::Type::Dir)
+}
+
+/// struct stat for VFS metadata.
+fn stat_meta(m: &vfs::Meta) -> Vec<u8> {
+    let mut b = stat_buf(m.ty.mode() | m.perm, m.size, m.mtime, m.ino);
+    b[16..24].copy_from_slice(&(m.nlink as u64).to_le_bytes());
+    b[28..32].copy_from_slice(&m.uid.to_le_bytes());
+    b[32..36].copy_from_slice(&m.gid.to_le_bytes());
+    b
 }
 
 fn tty_write(data: &[u8]) {
@@ -513,6 +562,25 @@ fn ino_of(name: &str) -> u64 {
     crate::storage::crc32(name.as_bytes()) as u64 + 2
 }
 
+/// Files Nova provides under /etc when NovaFS has none of its own.
+pub const ETC_FILES: &[&str] = &["hostname", "hosts", "resolv.conf", "nsswitch.conf", "passwd", "group", "machine-id"];
+
+pub fn etc_file(name: &str) -> Option<String> {
+    Some(match name {
+        "etc/hostname" => "nova\n".into(),
+        "etc/hosts" => "127.0.0.1 localhost\n::1 localhost\n".into(),
+        "etc/resolv.conf" => {
+            let dns = crate::net::info().and_then(|i| i.dns.first().copied()).map(|d| format!("{d}")).unwrap_or_else(|| "10.0.2.3".into());
+            format!("nameserver {dns}\n")
+        }
+        "etc/nsswitch.conf" => "hosts: files dns\npasswd: files\ngroup: files\n".into(),
+        "etc/passwd" => "root:x:0:0:root:/:/bin/sh\nnova:x:1000:1000:Nova:/:/bin/sh\n".into(),
+        "etc/group" => "root:x:0:\nnova:x:1000:\n".into(),
+        "etc/machine-id" => "4e6f7661000000000000000000000001\n".into(),
+        _ => return None,
+    })
+}
+
 /// Synthetic /proc and /sys files.
 fn proc_file(name: &str) -> Option<String> {
     let name = name.replace("proc/thread-self/", "proc/self/").replace(&format!("proc/{}/", proc().pid), "proc/self/");
@@ -533,6 +601,16 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/self/comm" => format!("{}\n", proc().name),
         "proc/self/oom_score_adj" => "0\n".into(),
         "proc/self/limits" => "Limit                     Soft Limit           Hard Limit           Units\nMax open files            1024                 4096                 files\n".into(),
+        "proc/mounts" | "proc/self/mounts" => ns().mounts(),
+        "proc/self/mountinfo" => ns().mountinfo(),
+        "proc/self/uid_map" | "proc/self/gid_map" => "         0          0 4294967295\n".into(),
+        "proc/self/setgroups" => "allow\n".into(),
+        "proc/self/cgroup" => "0::/\n".into(),
+        "proc/filesystems" => "nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tdevpts\nnodev\tmqueue\n\tnovafs\n".into(),
+        "proc/sys/kernel/unprivileged_userns_clone" => "1\n".into(),
+        "proc/sys/user/max_user_namespaces" => "15000\n".into(),
+        "proc/sys/kernel/overflowuid" | "proc/sys/kernel/overflowgid" => "65534\n".into(),
+        "proc/sys/fs/nr_open" => "1048576\n".into(),
         "proc/meminfo" => format!("MemTotal:       {total_kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n", free / 1024, free / 1024),
         "proc/cpuinfo" => format!("processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: {}\ncpu MHz\t\t: 3000.000\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n\n", crate::cpu::brand()),
         "proc/stat" => format!("cpu  {0} 0 0 {0} 0 0 0 0 0 0\ncpu0 {0} 0 0 {0} 0 0 0 0 0 0\nbtime {1}\nprocesses 1\n", pit::ticks(), rtc::unix_time() - pit::ticks() / pit::HZ),
@@ -546,29 +624,331 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/sys/fs/inotify/max_user_watches" => "8192\n".into(),
         "sys/devices/system/cpu/online" | "sys/devices/system/cpu/possible" | "sys/devices/system/cpu/present" => "0\n".into(),
         "sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq" => "3000000\n".into(),
-        "etc/hostname" => "nova\n".into(),
-        "etc/hosts" => "127.0.0.1 localhost\n::1 localhost\n".into(),
-        "etc/resolv.conf" => {
-            let dns = crate::net::info().and_then(|i| i.dns.first().copied()).map(|d| format!("{d}")).unwrap_or_else(|| "10.0.2.3".into());
-            format!("nameserver {dns}\n")
-        }
-        "etc/nsswitch.conf" => "hosts: files dns\npasswd: files\ngroup: files\n".into(),
-        "etc/passwd" => "root:x:0:0:root:/:/bin/sh\nnova:x:1000:1000:Nova:/:/bin/sh\n".into(),
-        "etc/group" => "root:x:0:\nnova:x:1000:\n".into(),
-        "etc/machine-id" => "4e6f7661000000000000000000000001\n".into(),
         _ => return None,
     })
+}
+
+
+// ---------------------------------------------------------------- /proc, /dev, /sys
+
+/// The file systems the Linux layer provides: mounted at /proc, /dev and /sys in the
+/// initial namespace (and wherever a program mounts proc, sysfs or devtmpfs).
+pub fn special_mounts() -> Vec<(&'static str, Arc<dyn vfs::Backend>)> {
+    alloc::vec![("proc", Arc::new(ProcFs) as Arc<dyn vfs::Backend>), ("dev", Arc::new(DevFs)), ("sys", Arc::new(SysFs))]
+}
+
+fn meta(ty: vfs::Type, perm: u32, size: u64, name: &str) -> vfs::Meta {
+    vfs::Meta { ty, perm, size, mtime: 0, ino: ino_of(name), nlink: if ty == vfs::Type::Dir { 2 } else { 1 }, uid: 0, gid: 0 }
+}
+
+/// /proc paths of any process ("<pid>/...", "thread-self/...") as "self/...": every
+/// process sees its own data (enough for programs that look up their own pid).
+fn proc_norm(rel: &str) -> String {
+    let (first, rest) = rel.split_once('/').unwrap_or((rel, ""));
+    if first == "thread-self" || (!first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) && process::exists(first.parse().unwrap_or(0))) {
+        return vfs::join("self", rest);
+    }
+    rel.into()
+}
+
+/// What /proc/self/fd/N points at.
+fn fd_link(n: i64) -> Option<String> {
+    let file = fds().get(n).ok()?;
+    let f = file.lock();
+    if let Some(at) = &f.at {
+        return Some(format!("/{}", ns().vpath(at).unwrap_or_default()));
+    }
+    Some(match &f.kind {
+        Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at)) => format!("/{}", ns().vpath(at).unwrap_or_default()),
+        Kind::Tty => "/dev/tty".into(),
+        Kind::Null => "/dev/null".into(),
+        Kind::Zero => "/dev/zero".into(),
+        Kind::Random => "/dev/urandom".into(),
+        Kind::Channel(_) => "socket:[1]".into(),
+        Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
+        Kind::SignalFd(_) => "anon_inode:[signalfd]".into(),
+        Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
+        Kind::Memfd(_, None) => "/memfd: (deleted)".into(),
+        Kind::Inet(_) => "socket:[2]".into(),
+    })
+}
+
+const PROC_DIRS: &[&str] = &["", "self", "self/fd", "self/ns", "self/task", "sys", "sys/kernel", "sys/kernel/yama", "sys/vm", "sys/fs", "sys/fs/inotify", "sys/user"];
+const PROC_ROOT: &[&str] = &["self", "thread-self", "cpuinfo", "meminfo", "mounts", "stat", "uptime", "loadavg", "filesystems", "sys"];
+const PROC_SELF: &[&str] = &["exe", "fd", "ns", "maps", "status", "stat", "statm", "cmdline", "comm", "mountinfo", "mounts", "limits", "oom_score_adj", "uid_map", "gid_map", "setgroups", "cgroup"];
+const NAMESPACES: &[&str] = &["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"];
+
+struct ProcFs;
+
+impl vfs::Backend for ProcFs {
+    fn kind(&self) -> &'static str {
+        "proc"
+    }
+    fn lstat(&self, p: &str) -> Result<vfs::Meta, i64> {
+        let n = proc_norm(p);
+        if PROC_DIRS.contains(&n.as_str()) || (p.split('/').next().is_some_and(|f| f.bytes().all(|b| b.is_ascii_digit())) && n == "self") {
+            return Ok(meta(vfs::Type::Dir, 0o555, 0, p));
+        }
+        if let Some(t) = self.readlink(p) {
+            return Ok(meta(vfs::Type::Lnk, 0o777, t.len() as u64, p));
+        }
+        let text = proc_file(&format!("proc/{n}")).ok_or(ENOENT)?;
+        let perm = if n.ends_with("_map") || n == "self/setgroups" || n == "self/oom_score_adj" { 0o644 } else { 0o444 };
+        Ok(meta(vfs::Type::Reg, perm, text.len() as u64, p))
+    }
+    fn link_target(&self, p: &str) -> Option<String> {
+        // Path walks follow exe, and fd/N when it is a file or directory (mount and
+        // openat on /proc/self/fd/N reach it, as on Linux). Other fd/N (pipes, sockets,
+        // memfd) and ns/* are magic links that only readlink describes; opening fd/N
+        // reopens the object.
+        let n = proc_norm(p);
+        if n == "self/exe" {
+            return Some(format!("/{}", *proc().exe.lock()));
+        }
+        let fd: i64 = n.strip_prefix("self/fd/")?.parse().ok()?;
+        let file = fds().get(fd).ok()?;
+        let f = file.lock();
+        let at = match (&f.at, &f.kind) {
+            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
+            (Some(at), _) => at.clone(),
+            (None, Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at))) => at.clone(),
+            _ => return None,
+        };
+        drop(f);
+        ns().vpath(&at).map(|p| format!("/{p}"))
+    }
+    fn readlink(&self, p: &str) -> Option<String> {
+        let n = proc_norm(p);
+        if let Some(fd) = n.strip_prefix("self/fd/") {
+            return fd_link(fd.parse().ok()?);
+        }
+        if let Some(name) = n.strip_prefix("self/ns/") {
+            return NAMESPACES.contains(&name).then(|| format!("{name}:[4026531840]"));
+        }
+        self.link_target(p)
+    }
+    fn list(&self, p: &str) -> Result<Vec<(String, vfs::Type, u64)>, i64> {
+        let n = proc_norm(p);
+        let ty = |name: &str| self.lstat(&vfs::join(p, name)).map(|m| m.ty).unwrap_or(vfs::Type::Reg);
+        let names: Vec<String> = match n.as_str() {
+            "" => PROC_ROOT.iter().map(|s| s.to_string()).chain([proc().pid.to_string()]).collect(),
+            "self" => PROC_SELF.iter().map(|s| s.to_string()).collect(),
+            "self/fd" => fds().fds.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| i.to_string()).collect(),
+            "self/ns" => NAMESPACES.iter().map(|s| s.to_string()).collect(),
+            "self/task" => alloc::vec![thread().tid.to_string()],
+            _ if PROC_DIRS.contains(&n.as_str()) => Vec::new(),
+            _ => return Err(ENOTDIR),
+        };
+        Ok(names.into_iter().map(|name| (name.clone(), ty(&name), ino_of(&vfs::join(p, &name)))).collect())
+    }
+    fn open(&self, p: &str) -> Result<vfs::Content, i64> {
+        proc_file(&format!("proc/{}", proc_norm(p))).map(|t| vfs::Content::Copy(t.into_bytes())).ok_or(ENOENT)
+    }
+    fn create(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn mkdir(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn rmdir(&self, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn unlink(&self, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn rename(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn symlink(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn link(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn chmod(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn truncate(&self, _: &str, _: u64) -> Result<(), i64> {
+        Ok(()) // writing uid_map and friends opens them with O_TRUNC
+    }
+    fn usage(&self) -> (u64, u64) {
+        (0, 0)
+    }
+}
+
+const DEV_NODES: &[&str] = &["null", "zero", "full", "random", "urandom", "tty", "console", "ptmx"];
+const DEV_LINKS: &[(&str, &str)] = &[("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")];
+
+struct DevFs;
+
+impl vfs::Backend for DevFs {
+    fn kind(&self) -> &'static str {
+        "devtmpfs"
+    }
+    fn lstat(&self, p: &str) -> Result<vfs::Meta, i64> {
+        if matches!(p, "" | "shm" | "pts") {
+            return Ok(meta(vfs::Type::Dir, if p == "shm" { 0o1777 } else { 0o755 }, 0, p));
+        }
+        if DEV_NODES.contains(&p) {
+            return Ok(meta(vfs::Type::Chr, 0o666, 0, p));
+        }
+        if let Some(t) = self.link_target(p) {
+            return Ok(meta(vfs::Type::Lnk, 0o777, t.len() as u64, p));
+        }
+        Err(ENOENT)
+    }
+    fn link_target(&self, p: &str) -> Option<String> {
+        DEV_LINKS.iter().find(|(n, _)| *n == p).map(|(_, t)| t.to_string())
+    }
+    fn list(&self, p: &str) -> Result<Vec<(String, vfs::Type, u64)>, i64> {
+        Ok(match p {
+            "" => DEV_NODES
+                .iter()
+                .map(|n| (n.to_string(), vfs::Type::Chr, ino_of(n)))
+                .chain(DEV_LINKS.iter().map(|(n, _)| (n.to_string(), vfs::Type::Lnk, ino_of(n))))
+                .chain(["shm", "pts"].iter().map(|n| (n.to_string(), vfs::Type::Dir, ino_of(n))))
+                .collect(),
+            "shm" => SHM.lock().keys().map(|n| (n.clone(), vfs::Type::Reg, ino_of(n))).collect(),
+            "pts" => Vec::new(),
+            _ => return Err(ENOTDIR),
+        })
+    }
+    fn open(&self, p: &str) -> Result<vfs::Content, i64> {
+        DEV_NODES.iter().find(|n| **n == p).map(|n| vfs::Content::Device(n)).ok_or(ENOENT)
+    }
+    fn create(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn mkdir(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn rmdir(&self, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn unlink(&self, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn rename(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn symlink(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn link(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn chmod(&self, _: &str, _: u32) -> Result<(), i64> {
+        Ok(())
+    }
+    fn truncate(&self, _: &str, _: u64) -> Result<(), i64> {
+        Ok(())
+    }
+    fn usage(&self) -> (u64, u64) {
+        (0, 0)
+    }
+}
+
+const SYS_FILES: &[&str] = &["devices/system/cpu/online", "devices/system/cpu/possible", "devices/system/cpu/present", "devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"];
+
+struct SysFs;
+
+impl vfs::Backend for SysFs {
+    fn kind(&self) -> &'static str {
+        "sysfs"
+    }
+    fn lstat(&self, p: &str) -> Result<vfs::Meta, i64> {
+        if let Some(t) = proc_file(&format!("sys/{p}")) {
+            return Ok(meta(vfs::Type::Reg, 0o444, t.len() as u64, p));
+        }
+        if p.is_empty() || SYS_FILES.iter().any(|f| f.starts_with(p) && f.as_bytes().get(p.len()) == Some(&b'/')) {
+            return Ok(meta(vfs::Type::Dir, 0o555, 0, p));
+        }
+        Err(ENOENT)
+    }
+    fn link_target(&self, _: &str) -> Option<String> {
+        None
+    }
+    fn list(&self, p: &str) -> Result<Vec<(String, vfs::Type, u64)>, i64> {
+        let prefix = if p.is_empty() { String::new() } else { format!("{p}/") };
+        let mut names = BTreeMap::new();
+        for f in SYS_FILES.iter().filter_map(|f| f.strip_prefix(prefix.as_str())) {
+            match f.split_once('/') {
+                Some((d, _)) => names.insert(d.to_string(), vfs::Type::Dir),
+                None => names.insert(f.to_string(), vfs::Type::Reg),
+            };
+        }
+        Ok(names.into_iter().map(|(n, t)| (n.clone(), t, ino_of(&n))).collect())
+    }
+    fn open(&self, p: &str) -> Result<vfs::Content, i64> {
+        proc_file(&format!("sys/{p}")).map(|t| vfs::Content::Copy(t.into_bytes())).ok_or(ENOENT)
+    }
+    fn create(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn mkdir(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn rmdir(&self, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn unlink(&self, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn rename(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn symlink(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn link(&self, _: &str, _: &str) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn chmod(&self, _: &str, _: u32) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn truncate(&self, _: &str, _: u64) -> Result<(), i64> {
+        Err(EACCES)
+    }
+    fn usage(&self) -> (u64, u64) {
+        (0, 0)
+    }
 }
 
 /// A path relative to directory descriptor `dirfd` (AT_FDCWD, or a descriptor that is not
 /// a directory Nova tracks by path: the working directory, as openat does).
 fn at_path(dirfd: i64, p: &str) -> Result<String, i64> {
     if dirfd != AT_FDCWD && !p.starts_with('/') {
-        if let Kind::Dir { path: d, .. } = &fds().get(dirfd)?.lock().kind {
-            return Ok(resolve(&format!("/{d}/{p}")));
+        if let Kind::Dir { at } = &fds().get(dirfd)?.lock().kind {
+            return Ok(resolve(&format!("/{}/{p}", dir_path(at))));
         }
     }
     Ok(resolve(p))
+}
+
+/// [`at_path`], following a symbolic link in the last component only if `follow`.
+fn at_path_nf(dirfd: i64, p: &str, follow: bool) -> Result<String, i64> {
+    let p = if dirfd != AT_FDCWD && !p.starts_with('/') {
+        match &fds().get(dirfd)?.lock().kind {
+            Kind::Dir { at } => format!("/{}/{p}", dir_path(at)),
+            _ => String::from(p),
+        }
+    } else {
+        String::from(p)
+    };
+    Ok(if follow { resolve(&p) } else { resolve_nofollow(&p) })
+}
+
+/// The file-system path an open descriptor refers to (None: not a file).
+fn fd_path(fd: i64) -> Result<Option<String>, i64> {
+    let file = fds().get(fd)?;
+    let f = file.lock();
+    if let Some(at) = &f.at {
+        return Ok(ns().vpath(at));
+    }
+    Ok(match &f.kind {
+        Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at)) => ns().vpath(at),
+        _ => None,
+    })
 }
 
 /// struct statx (256 bytes) from an x86-64 struct stat.
@@ -597,42 +977,37 @@ fn statx(s: &[u8]) -> Vec<u8> {
 }
 
 fn stat_path(name: &str) -> Result<Vec<u8>, i64> {
-    if let Some(text) = proc_file(name) {
-        return Ok(stat_buf(0o100444, text.len() as u64, 0, ino_of(name)));
+    if let Some(n) = name.strip_prefix("dev/shm/") {
+        let size = SHM.lock().get(n).ok_or(ENOENT)?.lock().size;
+        return Ok(stat_buf(0o100600, size, 0, ino_of(name)));
     }
-    if matches!(name, "proc" | "proc/self" | "sys" | "dev" | "etc" | "tmp") {
-        return Ok(stat_buf(0o40755, 4096, 0, ino_of(name)));
-    }
-    match name {
-        "dev/null" | "dev/tty" | "dev/urandom" | "dev/random" => return Ok(stat_buf(0o20666, 0, 0, ino_of(name))),
-        _ => {}
-    }
-    if let Some((_, size, mtime)) = fs::list(name).into_iter().find(|(n, _, _)| n == name) {
-        return Ok(stat_buf(0o100644 | if name.starts_with("bin/") { 0o111 } else { 0 }, size, mtime, ino_of(name)));
-    }
-    if is_dir(name) {
-        return Ok(stat_buf(0o40755, 4096, 0, ino_of(name)));
-    }
-    Err(ENOENT)
+    ns().lstat(name).map(|m| stat_meta(&m))
 }
 
 fn stat_file(f: &OpenFile) -> Vec<u8> {
     match &f.kind {
         Kind::Tty => stat_buf(0o20620, 0, 0, 1),
-        Kind::Null | Kind::Random => stat_buf(0o20666, 0, 0, 1),
-        Kind::File { path, data, .. } => stat_buf(0o100644, data.len() as u64, rtc::unix_time(), ino_of(path)),
-        Kind::Dir { path, .. } => stat_buf(0o40755, 4096, 0, ino_of(path)),
+        Kind::Null | Kind::Random | Kind::Zero => stat_buf(0o20666, 0, 0, 1),
+        Kind::File { path, data, at, .. } => match at.mount.fs.lstat(&at.rel) {
+            Ok(meta) => stat_meta(&vfs::Meta { size: data.len() as u64, ..meta }),
+            Err(_) => stat_buf(0o100644, data.len() as u64, rtc::unix_time(), ino_of(path)),
+        },
+        Kind::Dir { at } => at.mount.fs.lstat(&at.rel).map(|m| stat_meta(&m)).unwrap_or_else(|_| stat_buf(0o40755, 4096, 0, 2)),
         Kind::Channel(e) => stat_buf(if e.rx.is_some() && e.tx.is_some() { 0o140777 } else { 0o10600 }, 0, 0, 3),
-        Kind::EventFd(_) | Kind::Epoll(_) => stat_buf(0o600, 0, 0, 4),
-        Kind::Memfd(m) => stat_buf(0o100600, m.lock().size, 0, 5),
+        Kind::EventFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) => stat_buf(0o600, 0, 0, 4),
+        Kind::Memfd(m, Some(at)) => match at.mount.fs.lstat(&at.rel) {
+            Ok(meta) => stat_meta(&vfs::Meta { size: m.lock().size, ..meta }),
+            Err(_) => stat_buf(0o100644, m.lock().size, 0, 7),
+        },
+        Kind::Memfd(m, None) => stat_buf(0o100600, m.lock().size, 0, 5),
         Kind::Inet(_) => stat_buf(0o140777, 0, 0, 6),
     }
 }
 
-fn open(path: &str, flags: u64) -> Result<FileRef, i64> {
-    let name = resolve(path);
+fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
     let acc = flags & 3;
     let (creat, excl, trunc, append, directory) = (flags & 0o100 != 0, flags & 0o200 != 0, flags & 0o1000 != 0, flags & 0o2000 != 0, flags & 0o200000 != 0);
+    let name = if flags & O_NOFOLLOW != 0 || (creat && excl) { resolve_nofollow(path) } else { resolve(path) };
     // POSIX shared memory (/dev/shm/NAME): named shared-memory objects.
     if let Some(shm_name) = name.strip_prefix("dev/shm/") {
         let mut reg = SHM.lock();
@@ -649,72 +1024,88 @@ fn open(path: &str, flags: u64) -> Result<FileRef, i64> {
         if trunc {
             obj.lock().truncate(0);
         }
-        return Ok(new_file(Kind::Memfd(obj), flags));
+        return Ok(new_file(Kind::Memfd(obj, None), flags));
     }
+    let ns = ns();
+    let (m, rel) = ns.find_mount(&name);
     // /proc/self/fd/N: a new open file description of the same object, with the
     // access mode asked for now (Chromium makes read-only handles this way).
-    if let Some(n) = name.strip_prefix("proc/self/fd/").and_then(|n| n.parse::<i64>().ok()) {
+    if m.fs.kind() == "proc"
+        && let Some(n) = proc_norm(&rel).strip_prefix("self/fd/").and_then(|n| n.parse::<i64>().ok())
+    {
         let file = fds().get(n)?;
         let f = file.lock();
         return Ok(match &f.kind {
-            Kind::Memfd(m) => new_file(Kind::Memfd(m.clone()), flags),
-            Kind::File { path, data: FileData::Static(d), .. } => new_file(Kind::File { path: path.clone(), data: FileData::Static(d), writable: false, append: false, dirty: false }, flags),
+            Kind::Memfd(m, p) => new_file(Kind::Memfd(m.clone(), p.clone()), flags),
+            Kind::File { path, data: FileData::Static(d), at, .. } => new_file(Kind::File { path: path.clone(), at: at.clone(), data: FileData::Static(d), writable: false, append: false, dirty: false }, flags),
             _ => {
                 drop(f);
                 file
             }
         });
     }
-    if let Some(text) = proc_file(&name) {
-        if acc != 0 {
-            return Err(EROFS);
-        }
-        let leaked: &'static [u8] = alloc::boxed::Box::leak(text.into_bytes().into_boxed_slice());
-        // Small and per-open; leaking keeps FileData simple (these are rare reads).
-        return Ok(Arc::new(SpinLock::new(OpenFile { kind: Kind::File { path: name, data: FileData::Static(leaked), writable: false, append: false, dirty: false }, pos: 0, flags })));
-    }
-    let kind = match name.as_str() {
-        "dev/null" => Kind::Null,
-        "dev/tty" => Kind::Tty,
-        "dev/urandom" | "dev/random" => Kind::Random,
-        _ if fs::system_file(&name).is_some() => {
-            if acc != 0 || trunc {
-                return Err(EROFS);
-            }
-            if directory {
-                return Err(ENOTDIR);
-            }
-            Kind::File { path: name.clone(), data: FileData::Static(fs::system_file(&name).unwrap()), writable: false, append: false, dirty: false }
-        }
-        _ => {
-            let existing = fs::read(&name).ok();
-            match existing {
-                Some(_) if creat && excl => return Err(EEXIST),
-                Some(_) if directory => return Err(ENOTDIR),
-                Some(data) => Kind::File {
-                    path: name,
-                    data: FileData::Owned(if trunc && acc != 0 { Vec::new() } else { data }),
-                    writable: acc != 0,
-                    append,
-                    dirty: trunc && acc != 0,
-                },
-                None if is_dir(&name) => {
+    let kind = {
+        {
+            let meta = match m.fs.lstat(&rel) {
+                Ok(_) if creat && excl => return Err(EEXIST),
+                Ok(meta) => meta,
+                Err(ENOENT) if creat => {
+                    if m.readonly {
+                        return Err(EROFS);
+                    }
+                    m.fs.create(&rel, mode & !0o022)?;
+                    m.fs.lstat(&rel)?
+                }
+                Err(e) => return Err(e),
+            };
+            match meta.ty {
+                vfs::Type::Dir => {
                     if acc != 0 {
                         return Err(EISDIR);
                     }
-                    Kind::Dir { path: name, listed: false }
+                    Kind::Dir { at: vfs::At { mount: m.clone(), rel: rel.clone() } }
                 }
-                None if creat => {
-                    if name.is_empty() || name.len() > fs::NAME_MAX {
-                        return Err(EINVAL);
+                vfs::Type::Lnk => return Err(ELOOP), // O_NOFOLLOW on a link
+                vfs::Type::Chr => match m.fs.open(&rel)? {
+                    vfs::Content::Device("null") => Kind::Null,
+                    vfs::Content::Device("zero" | "full") => Kind::Zero,
+                    vfs::Content::Device("random" | "urandom") => Kind::Random,
+                    _ => Kind::Tty,
+                },
+                vfs::Type::Reg if directory => return Err(ENOTDIR),
+                vfs::Type::Reg => {
+                    if acc != 0 && m.readonly {
+                        return Err(EROFS);
                     }
-                    Kind::File { path: name, data: FileData::Owned(Vec::new()), writable: acc != 0, append, dirty: true }
+                    let at = vfs::At { mount: m.clone(), rel: rel.clone() };
+                    match m.fs.open(&rel)? {
+                        vfs::Content::Static(s) => {
+                            if acc != 0 || trunc {
+                                return Err(EROFS);
+                            }
+                            Kind::File { path: name, at, data: FileData::Static(s), writable: false, append: false, dirty: false }
+                        }
+                        vfs::Content::Device(_) => return Err(EINVAL),
+                        vfs::Content::Copy(data) => Kind::File {
+                            path: name,
+                            at,
+                            data: FileData::Owned(if trunc && acc != 0 { Vec::new() } else { data }),
+                            writable: acc != 0,
+                            append,
+                            dirty: trunc && acc != 0,
+                        },
+                        vfs::Content::Shared(obj) => {
+                            if trunc && acc != 0 {
+                                obj.lock().truncate(0);
+                            }
+                            Kind::Memfd(obj, Some(at))
+                        }
+                    }
                 }
-                None => return Err(ENOENT),
             }
         }
     };
-    let mut f = OpenFile { kind, pos: 0, flags };
+    let mut f = OpenFile { kind, pos: 0, flags, at: Some(vfs::At { mount: m.clone(), rel: rel.clone() }) };
     if let Kind::File { dirty: true, .. } = f.kind {
         flush(&mut f); // create the file now, so it exists for stat/other opens
     }
@@ -807,6 +1198,32 @@ fn channel_write(file: &FileRef, data: &[u8], fds: Vec<FileRef>, dontwait: bool)
     }
 }
 
+/// read() on a signalfd: one 128-byte signalfd_siginfo per pending signal in `mask`.
+fn signalfd_read(f: &FileRef, mask: u64, len: usize) -> Result<Vec<u8>, i64> {
+    if len < 128 {
+        return Err(EINVAL);
+    }
+    loop {
+        let mut out = Vec::new();
+        while out.len() + 128 <= len {
+            let Some((sig, sender)) = signal::take_masked(thread(), mask) else { break };
+            let mut info = [0u8; 128];
+            info[0..4].copy_from_slice(&sig.to_le_bytes()); // ssi_signo
+            info[8..12].copy_from_slice(&(if sig == signal::SIGCHLD { 1i32 } else { 0 }).to_le_bytes()); // ssi_code: CLD_EXITED / SI_USER
+            info[12..16].copy_from_slice(&sender.to_le_bytes()); // ssi_pid
+            out.extend_from_slice(&info);
+        }
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        if f.lock().flags & O_NONBLOCK != 0 {
+            return Err(EAGAIN);
+        }
+        ipc::wait(None);
+        process::check_exiting();
+    }
+}
+
 fn is_channel(f: &FileRef) -> bool {
     matches!(f.lock().kind, Kind::Channel(_) | Kind::EventFd(_))
 }
@@ -815,6 +1232,13 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     let is_tty = matches!(f.lock().kind, Kind::Tty);
     if is_tty {
         return Ok(tty_read(len));
+    }
+    let signal_mask = match f.lock().kind {
+        Kind::SignalFd(m) => Some(m),
+        _ => None,
+    };
+    if let Some(mask) = signal_mask {
+        return signalfd_read(f, mask, len);
     }
     if is_channel(f) {
         let (data, fds, _) = channel_read(f, len, false, false)?;
@@ -828,6 +1252,7 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     let pos = at.unwrap_or(f.pos);
     let out = match &f.kind {
         Kind::Null => Vec::new(),
+        Kind::Zero => vec![0; len],
         Kind::Random => {
             let mut v = vec![0; len];
             rand::fill(&mut v);
@@ -835,9 +1260,9 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
         }
         Kind::File { data, .. } => data.get(pos..).map(|d| d[..len.min(d.len())].to_vec()).unwrap_or_default(),
         Kind::Dir { .. } => return Err(EISDIR),
-        Kind::Memfd(m) => m.lock().read(pos, len),
+        Kind::Memfd(m, _) => m.lock().read(pos, len),
         Kind::Epoll(_) | Kind::Inet(_) => return Err(EINVAL),
-        Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) => unreachable!(),
+        Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::SignalFd(_) => unreachable!(),
     };
     if at.is_none() {
         f.pos = pos + out.len();
@@ -854,19 +1279,29 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
     }
     let mut f = f.lock();
     let pos = at.unwrap_or(f.pos);
+    let flags = f.flags;
     let written = match &mut f.kind {
         Kind::Tty => {
             drop(f);
             tty_write(data);
             return Ok(data.len());
         }
-        Kind::Null | Kind::Random => data.len(),
+        Kind::Null | Kind::Random | Kind::Zero => data.len(),
         Kind::Dir { .. } => return Err(EISDIR),
-        Kind::Memfd(m) => {
-            m.lock().write(pos, data);
-            data.len()
+        Kind::Memfd(m, path) => {
+            if path.is_some() && flags & 3 == 0 {
+                return Err(EBADF);
+            }
+            let mut m = m.lock();
+            let start = if flags & 0o2000 != 0 { m.size as usize } else { pos };
+            m.write(start, data);
+            drop(m);
+            if at.is_none() {
+                f.pos = start + data.len();
+            }
+            return Ok(data.len());
         }
-        Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::Inet(_) => return Err(EINVAL),
+        Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
         Kind::File { data: contents, writable, append, dirty, .. } => {
             if !*writable {
                 return Err(EBADF);
@@ -890,31 +1325,27 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
     Ok(written)
 }
 
-/// Directory entries (linux_dirent64) of `dir`: its immediate children.
-fn dirents(dir: &str) -> Vec<u8> {
-    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
-    let mut names: BTreeSet<(String, bool)> = BTreeSet::new();
-    for (name, _, _) in fs::list(&prefix) {
-        let rest = &name[prefix.len()..];
-        if rest == ".dir" {
-            continue; // directory marker (mkdir)
-        }
-        match rest.split_once('/') {
-            Some((d, _)) => names.insert((d.into(), true)),
-            None => names.insert((rest.into(), false)),
-        };
+/// Directory entries (linux_dirent64) of `dir`: its immediate children, including mount
+/// points.
+fn dirents(at: &vfs::At) -> Vec<Vec<u8>> {
+    let ns = ns();
+    let dir = ns.vpath(at).unwrap_or_default();
+    let dir = dir.as_str();
+    let mut names: BTreeMap<String, (u8, u64)> = at.mount.fs.list(&at.rel).unwrap_or_default().into_iter().map(|(n, t, ino)| (n, (t.dtype(), ino))).collect();
+    for n in ns.mounts_in(dir) {
+        names.insert(n.clone(), (4, ino_of(&vfs::join(dir, &n))));
     }
     let mut out = Vec::new();
-    let all = [(".".to_string(), true), ("..".to_string(), true)].into_iter().chain(names);
-    for (i, (name, is_dir)) in all.enumerate() {
+    let dots = [(".".to_string(), (4, ino_of(dir))), ("..".to_string(), (4, ino_of(vfs::split(dir).0)))];
+    for (i, (name, (dtype, ino))) in dots.into_iter().chain(names).enumerate() {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
         let mut e = vec![0u8; reclen];
-        e[0..8].copy_from_slice(&ino_of(&format!("{prefix}{name}")).to_le_bytes());
+        e[0..8].copy_from_slice(&ino.to_le_bytes());
         e[8..16].copy_from_slice(&((i + 1) as u64).to_le_bytes());
         e[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
-        e[18] = if is_dir { 4 } else { 8 }; // DT_DIR / DT_REG
+        e[18] = dtype;
         e[19..19 + name.len()].copy_from_slice(name.as_bytes());
-        out.extend_from_slice(&e);
+        out.push(e);
     }
     out
 }
@@ -996,11 +1427,14 @@ fn kind_name(k: &Kind) -> String {
         Kind::Null => "null".into(),
         Kind::Random => "random".into(),
         Kind::File { path, .. } => format!("file {path}"),
-        Kind::Dir { path, .. } => format!("dir {path}"),
+        Kind::Dir { at } => format!("dir {}", at.rel),
+        Kind::Zero => "zero".into(),
         Kind::Channel(e) => format!("{}{:?}", if e.rx.is_some() && e.tx.is_some() { "socket " } else { "pipe " }, e.kind),
         Kind::EventFd(_) => "eventfd".into(),
+        Kind::SignalFd(_) => "signalfd".into(),
         Kind::Epoll(_) => "epoll".into(),
-        Kind::Memfd(_) => "memfd".into(),
+        Kind::Memfd(_, Some(at)) => format!("file {}", at.rel),
+        Kind::Memfd(_, None) => "memfd".into(),
         Kind::Inet(s) => format!("inet {}", if s.udp { "udp" } else { "tcp" }),
     }
 }
@@ -1011,7 +1445,7 @@ fn syscall_name(nr: u64) -> String {
         8 => "lseek", 9 => "mmap", 10 => "mprotect", 11 => "munmap", 12 => "brk", 13 => "rt_sigaction",
         14 => "rt_sigprocmask", 16 => "ioctl", 17 => "pread64", 19 => "readv", 20 => "writev", 21 => "access",
         22 => "pipe", 23 => "select", 24 => "sched_yield", 25 => "mremap", 28 => "madvise", 32 => "dup", 33 => "dup2",
- 39 => "getpid", 40 => "sendfile", 57 => "fork", 58 => "vfork", 59 => "execve", 61 => "wait4", 62 => "kill", 77 => "ftruncate", 87 => "unlink", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
+ 39 => "getpid", 40 => "sendfile", 57 => "fork", 58 => "vfork", 59 => "execve", 61 => "wait4", 62 => "kill", 77 => "ftruncate", 87 => "unlink", 84 => "rmdir", 88 => "symlink", 266 => "symlinkat", 86 => "link", 265 => "linkat", 280 => "utimensat", 76 => "truncate", 90 => "chmod", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
         42 => "connect", 49 => "bind", 53 => "socketpair", 307 => "sendmmsg", 56 => "clone", 60 => "exit", 63 => "uname", 72 => "fcntl", 79 => "getcwd",
         89 => "readlink", 96 => "gettimeofday", 97 => "getrlimit", 99 => "sysinfo", 137 => "statfs", 138 => "fstatfs",
         157 => "prctl", 158 => "arch_prctl", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
@@ -1046,11 +1480,11 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let (dirfd, path, flags) = if nr == 2 { (AT_FDCWD, a0, a1) } else { (a0 as i32 as i64, a1, a2) };
                 let mut p = read_cstr(path)?;
                 if dirfd != AT_FDCWD && !p.starts_with('/') {
-                    if let Kind::Dir { path: d, .. } = &fds().get(dirfd)?.lock().kind {
-                        p = format!("/{d}/{p}");
+                    if let Kind::Dir { at } = &fds().get(dirfd)?.lock().kind {
+                        p = format!("/{}/{p}", dir_path(at));
                     }
                 }
-                let file = open(&p, flags)?;
+                let file = open(&p, flags, (if nr == 2 { a2 } else { a3 }) as u32)?;
                 let mut t = fds();
                 let fd = t.add(file, 0);
                 t.set_cloexec(fd, flags & O_CLOEXEC != 0);
@@ -1071,7 +1505,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             }
             4 | 6 => {
                 // stat, lstat
-                let b = stat_path(&resolve(&read_cstr(a0)?))?;
+                let p = read_cstr(a0)?;
+                let b = stat_path(&if nr == 6 { resolve_nofollow(&p) } else { resolve(&p) })?;
                 write_user(a1, &b)?;
                 0
             }
@@ -1084,14 +1519,14 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             262 => {
                 // newfstatat
                 let p = read_cstr(a1)?;
-                let b = if p.is_empty() && a3 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&at_path(a0 as i32 as i64, &p)?)? };
+                let b = if p.is_empty() && a3 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&at_path_nf(a0 as i32 as i64, &p, a3 & 0x100 == 0)?)? };
                 write_user(a2, &b)?;
                 0
             }
             332 => {
                 // statx(dirfd, path, flags, mask, statxbuf): filled from the same data as stat
                 let p = read_cstr(a1)?;
-                let s = if p.is_empty() && a2 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&at_path(a0 as i32 as i64, &p)?)? };
+                let s = if p.is_empty() && a2 & 0x1000 != 0 { stat_file(&fds().get(a0 as i64)?.lock()) } else { stat_path(&at_path_nf(a0 as i32 as i64, &p, a2 & 0x100 == 0)?)? };
                 write_user(a4, &statx(&s))?;
                 0
             }
@@ -1377,7 +1812,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     return Err(EINVAL);
                 }
                 let flags = if a1 & 1 != 0 { 0o2000000 } else { 0 } | 2;
-                fds().add(new_file(Kind::Memfd(ipc::memfd()), flags), 0)
+                fds().add(new_file(Kind::Memfd(ipc::memfd(), None), flags), 0)
             }
             77 | 285 => {
                 // ftruncate(fd, len), fallocate(fd, mode, off, len)
@@ -1385,7 +1820,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let size = if nr == 77 { a1 } else { a2 + a3 };
                 let mut fl = file.lock();
                 match &mut fl.kind {
-                    Kind::Memfd(m) => {
+                    Kind::Memfd(m, _) => {
                         let mut m = m.lock();
                         if nr == 77 || size > m.size {
                             m.truncate(size);
@@ -1450,7 +1885,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     let file = fds().get(fd)?;
                     let fl = file.lock();
                     match &fl.kind {
-                        Kind::Memfd(m) => {
+                        Kind::Memfd(m, _) => {
                             // Shared memory: map its frames (every mapping sees the same pages).
                             mem().map_shared(addr, m.clone(), a5 as usize, len);
                         }
@@ -1695,8 +2130,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             }
             21 | 269 | 439 => {
                 // access, faccessat, faccessat2
-                let p = read_cstr(if nr == 21 { a0 } else { a1 })?;
-                stat_path(&resolve(&p))?;
+                let p = if nr == 21 { resolve(&read_cstr(a0)?) } else { at_path(a0 as i32 as i64, &read_cstr(a1)?)? };
+                stat_path(&p)?;
                 0
             }
             24 => {
@@ -1788,6 +2223,16 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 write_user(a0, cwd.as_bytes())?;
                 cwd.len() as i64
             }
+            81 => {
+                // fchdir
+                let file = fds().get(a0 as i64)?;
+                let path = match &file.lock().kind {
+                    Kind::Dir { at } => dir_path(at),
+                    _ => return Err(ENOTDIR),
+                };
+                fds().cwd = path;
+                0
+            }
             80 => {
                 // chdir
                 let name = resolve(&read_cstr(a0)?);
@@ -1800,71 +2245,275 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             85 => {
                 // creat(path, mode) = open(path, O_CREAT | O_WRONLY | O_TRUNC)
                 let p = read_cstr(a0)?;
-                let file = open(&p, 0o100 | 1 | 0o1000)?;
+                let file = open(&p, 0o100 | 1 | 0o1000, a1 as u32)?;
                 fds().add(file, 0)
             }
             86 | 265 => {
-                // link(old, new), linkat(olddirfd, old, newdirfd, new, flags): a copy
-                let (from, to) = if nr == 86 { (a0, a1) } else { (a1, a3) };
-                let (from, to) = (resolve(&read_cstr(from)?), resolve(&read_cstr(to)?));
-                if fs::exists(&to) {
-                    return Err(EEXIST);
-                }
-                let data = fs::read(&from).map_err(|_| ENOENT)?;
-                fs::write(&to, &data).map_err(|_| EINVAL)?;
+                // link(old, new), linkat(olddirfd, old, newdirfd, new, flags)
+                let (from, to) = if nr == 86 { (resolve_nofollow(&read_cstr(a0)?), resolve_nofollow(&read_cstr(a1)?)) } else { (at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, a4 & 0x400 == 0)?, at_path_nf(a2 as i32 as i64, &read_cstr(a3)?, false)?) };
+                let (m, rf, rt) = ns().same_mount(&from, &to)?;
+                m.fs.link(&rf, &rt)?;
                 0
             }
-            90 | 91 | 268 | 92 | 93 | 94 | 260 => 0, // chmod, fchmod, fchmodat, chown, fchown, lchown, fchownat
+            88 | 266 => {
+                // symlink(target, path), symlinkat(target, newdirfd, path)
+                let target = read_cstr(a0)?;
+                let p = if nr == 88 { resolve_nofollow(&read_cstr(a1)?) } else { at_path_nf(a1 as i32 as i64, &read_cstr(a2)?, false)? };
+                if target.is_empty() {
+                    return Err(ENOENT);
+                }
+                let (m, rel) = ns().writable(&p)?;
+                m.fs.symlink(&target, &rel)?;
+                0
+            }
+            84 => {
+                // rmdir
+                let p = resolve_nofollow(&read_cstr(a0)?);
+                let (m, rel) = ns().writable(&p)?;
+                m.fs.rmdir(&rel)?;
+                0
+            }
+            90 | 268 => {
+                // chmod(path, mode), fchmodat(dirfd, path, mode)
+                let p = if nr == 90 { resolve(&read_cstr(a0)?) } else { at_path(a0 as i32 as i64, &read_cstr(a1)?)? };
+                let mode = if nr == 90 { a1 } else { a2 };
+                let (m, rel) = ns().writable(&p)?;
+                m.fs.chmod(&rel, mode as u32)?;
+                0
+            }
+            91 | 93 => {
+                // fchmod(fd, mode), fchown(fd, uid, gid)
+                let path = fd_path(a0 as i64)?;
+                if let Some(p) = path {
+                    let (m, rel) = ns().find_mount(&p);
+                    if nr == 91 { m.fs.chmod(&rel, a1 as u32) } else { m.fs.chown(&rel, a1 as u32, a2 as u32) }.or_else(|e| if e == ENOENT { Ok(()) } else { Err(e) })?;
+                }
+                0
+            }
+            92 | 94 | 260 => {
+                // chown(path, uid, gid), lchown, fchownat(dirfd, path, uid, gid, flags)
+                let p = match nr {
+                    92 => resolve(&read_cstr(a0)?),
+                    94 => resolve_nofollow(&read_cstr(a0)?),
+                    _ => at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, a4 & 0x100 == 0)?,
+                };
+                let (uid, gid) = if nr == 260 { (a2, a3) } else { (a1, a2) };
+                let (m, rel) = ns().writable(&p)?;
+                m.fs.chown(&rel, uid as u32, gid as u32)?;
+                0
+            }
             83 | 258 => {
-                // mkdir, mkdirat: directories are implicit in NovaFS; a marker file makes
-                // an empty one exist.
-                let p = resolve(&read_cstr(if nr == 83 { a0 } else { a1 })?);
+                // mkdir(path, mode), mkdirat(dirfd, path, mode)
+                let (p, mode) = if nr == 83 { (resolve_nofollow(&read_cstr(a0)?), a1) } else { (at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, false)?, a2) };
                 if stat_path(&p).is_ok() {
                     return Err(EEXIST);
                 }
-                fs::write(&format!("{p}/.dir"), b"").map_err(|_| EINVAL)?;
+                let (m, rel) = ns().writable(&p)?;
+                m.fs.mkdir(&rel, mode as u32 & !0o022)?;
                 0
             }
             82 | 264 | 316 => {
-                // rename, renameat, renameat2
-                let (from, to) = if nr == 82 { (a0, a1) } else { (a1, a3) };
-                let (from, to) = (resolve(&read_cstr(from)?), resolve(&read_cstr(to)?));
-                let data = fs::read(&from).map_err(|_| ENOENT)?;
-                fs::write(&to, &data).map_err(|_| EINVAL)?;
-                fs::delete(&from).map_err(|_| ENOENT)?;
+                // rename, renameat, renameat2(olddirfd, old, newdirfd, new, flags)
+                let (from, to) = if nr == 82 { (resolve_nofollow(&read_cstr(a0)?), resolve_nofollow(&read_cstr(a1)?)) } else { (at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, false)?, at_path_nf(a2 as i32 as i64, &read_cstr(a3)?, false)?) };
+                if nr == 316 && a4 & 1 != 0 && stat_path(&to).is_ok() {
+                    return Err(EEXIST); // RENAME_NOREPLACE
+                }
+                let (m, rf, rt) = ns().same_mount(&from, &to)?;
+                m.fs.rename(&rf, &rt)?;
                 0
             }
             87 | 263 => {
-                // unlink, unlinkat
-                let p = resolve(&read_cstr(if nr == 87 { a0 } else { a1 })?);
+                // unlink(path), unlinkat(dirfd, path, flags: AT_REMOVEDIR)
+                let p = if nr == 87 { resolve_nofollow(&read_cstr(a0)?) } else { at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, false)? };
                 if let Some(n) = p.strip_prefix("dev/shm/") {
                     return SHM.lock().remove(n).map(|_| 0).ok_or(ENOENT);
                 }
-                fs::delete(&p).map_err(|_| ENOENT)?;
+                let (m, rel) = ns().writable(&p)?;
+                if nr == 263 && a2 & 0x200 != 0 { m.fs.rmdir(&rel)? } else { m.fs.unlink(&rel)? }
+                0
+            }
+            280 | 235 => {
+                // utimensat(dirfd, path, times[2], flags), utimes(path, timeval times[2]):
+                // the modification time (index 1); NULL times = now.
+                let (p, times) = if nr == 280 {
+                    let p = if a1 == 0 { fd_path(a0 as i64)?.ok_or(EBADF)? } else { at_path_nf(a0 as i32 as i64, &read_cstr(a1)?, a3 & 0x100 == 0)? };
+                    (p, a2)
+                } else {
+                    (resolve(&read_cstr(a0)?), a1)
+                };
+                let mtime = if times == 0 {
+                    Some(rtc::unix_time())
+                } else {
+                    let t = read_user(times + 16, 16)?;
+                    let (sec, frac) = (u64::from_le_bytes(t[0..8].try_into().unwrap()), u64::from_le_bytes(t[8..16].try_into().unwrap()));
+                    match frac {
+                        _ if nr == 235 => Some(sec),
+                        0x3FFF_FFFF => Some(rtc::unix_time()), // UTIME_NOW
+                        0x3FFF_FFFE => None,                   // UTIME_OMIT
+                        _ => Some(sec),
+                    }
+                };
+                stat_path(&p)?;
+                if let Some(t) = mtime {
+                    let (m, rel) = ns().find_mount(&p);
+                    m.fs.set_mtime(&rel, t)?;
+                }
+                0
+            }
+            289 | 282 => {
+                // signalfd4(fd, mask, sizemask, flags), signalfd(fd, mask, sizemask)
+                let mask = read_u64(a1)? & !(signal::bit(signal::SIGKILL) | signal::bit(signal::SIGSTOP));
+                let flags = if nr == 289 { a3 } else { 0 };
+                proc().signals.lock().watched |= mask;
+                if a0 as i32 == -1 {
+                    let fd = fds().add(new_file(Kind::SignalFd(mask), (flags & O_NONBLOCK) | 2), 0);
+                    fds().set_cloexec(fd, flags & O_CLOEXEC != 0);
+                    fd
+                } else {
+                    let file = fds().get(a0 as i64)?;
+                    let mut fl = file.lock();
+                    let Kind::SignalFd(m) = &mut fl.kind else { return Err(EINVAL) };
+                    *m = mask;
+                    a0 as i64
+                }
+            }
+            437 => {
+                // openat2(dirfd, path, struct open_how { flags, mode, resolve }, size):
+                // RESOLVE_IN_ROOT (0x10) resolves the path as if dirfd were the root.
+                let how = read_user(a2, 24)?;
+                let q = |i: usize| u64::from_le_bytes(how[i * 8..i * 8 + 8].try_into().unwrap());
+                let (flags, mode, res) = (q(0), q(1), q(2));
+                let p = read_cstr(a1)?;
+                let dirfd = a0 as i32 as i64;
+                let base = if dirfd == AT_FDCWD { fds().cwd.clone() } else { fd_path(dirfd)?.ok_or(ENOTDIR)? };
+                let name = if res & 0x10 != 0 {
+                    ns().walk_in(&base, &p, flags & O_NOFOLLOW == 0)?
+                } else {
+                    ns().walk(&base, &p, flags & O_NOFOLLOW == 0)?
+                };
+                let file = open(&format!("/{name}"), flags, mode as u32)?;
+                let mut t = fds();
+                let fd = t.add(file, 0);
+                t.set_cloexec(fd, flags & O_CLOEXEC != 0);
+                fd
+            }
+            125 => {
+                // capget(header, data): every capability, as root has (Nova does not
+                // check them). Version 3 headers carry two 32-bit sets.
+                let version = read_u32(a0)?;
+                if version != 0x2008_0522 && version != 0x2007_1026 {
+                    write_user(a0, &0x2008_0522u32.to_le_bytes())?;
+                    return if a1 == 0 { Ok(0) } else { Err(EINVAL) };
+                }
+                if a1 != 0 {
+                    let all = [u32::MAX, u32::MAX, 0, (1u32 << (CAP_LAST - 31)) - 1, (1u32 << (CAP_LAST - 31)) - 1, 0];
+                    write_user(a1, &all.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+                }
+                0
+            }
+            126 => 0, // capset: accepted
+            165 => {
+                // mount(source, target, fstype, flags, data)
+                const MS_RDONLY: u64 = 1;
+                const MS_REMOUNT: u64 = 0x20;
+                const MS_BIND: u64 = 0x1000;
+                const MS_MOVE: u64 = 0x2000;
+                const MS_REC: u64 = 0x4000;
+                const PROPAGATION: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
+                let target = resolve(&read_cstr(a1)?);
+                let ns = ns();
+                if a3 & MS_REMOUNT != 0 {
+                    ns.remount(&target, a3 & MS_RDONLY != 0)?;
+                } else if a3 & MS_BIND != 0 {
+                    let src = resolve(&read_cstr(a0)?);
+                    stat_path(&src)?;
+                    stat_path(&target)?;
+                    ns.bind(&src, &target, a3 & MS_REC != 0)?;
+                } else if a3 & MS_MOVE != 0 {
+                    ns.move_mount(&resolve(&read_cstr(a0)?), &target)?;
+                } else if a3 & PROPAGATION != 0 {
+                    // Shared/private/slave: nothing propagates between namespaces here.
+                } else {
+                    if !is_dir(&target) {
+                        return Err(if stat_path(&target).is_ok() { ENOTDIR } else { ENOENT });
+                    }
+                    let fs: Arc<dyn vfs::Backend> = match read_cstr(a2)?.as_str() {
+                        "tmpfs" | "mqueue" | "devpts" => Arc::new(vfs::TmpFs::new()),
+                        "proc" => Arc::new(ProcFs),
+                        "sysfs" => Arc::new(SysFs),
+                        "devtmpfs" => Arc::new(DevFs),
+                        _ => return Err(ENODEV),
+                    };
+                    ns.mount(&target, fs, "", a3 & MS_RDONLY != 0);
+                }
+                0
+            }
+            442 => {
+                // mount_setattr(dirfd, path, flags, struct mount_attr { set, clr, propagation,
+                // userns_fd }, size): MOUNT_ATTR_RDONLY; the other attributes (nosuid,
+                // nodev, noexec, atime) have no effect in Nova.
+                let attr = read_user(a3, 32)?;
+                let (set, clr) = (u64::from_le_bytes(attr[0..8].try_into().unwrap()), u64::from_le_bytes(attr[8..16].try_into().unwrap()));
+                let p = read_cstr(a1)?;
+                let target = if p.is_empty() && a2 & 0x1000 != 0 { fd_path(a0 as i32 as i64)?.ok_or(EBADF)? } else { at_path(a0 as i32 as i64, &p)? };
+                if set & 1 != 0 || clr & 1 != 0 {
+                    ns().set_readonly(&target, set & 1 != 0, a2 & 0x8000 != 0)?;
+                }
+                0
+            }
+            166 => {
+                // umount2(target, flags)
+                let p = read_cstr(a0)?;
+                let target = if a1 & 8 != 0 { resolve_nofollow(&p) } else { resolve(&p) };
+                ns().umount(&target)?;
+                0
+            }
+            155 => {
+                // pivot_root(new_root, put_old): the working directory keeps pointing at the
+                // same directory, wherever it now appears.
+                let (new_root, put_old) = (resolve(&read_cstr(a0)?), resolve(&read_cstr(a1)?));
+                let ns = ns();
+                let cwd = ns.at(&fds().cwd.clone());
+                ns.pivot_root(&new_root, &put_old)?;
+                fds().cwd = ns.vpath(&cwd).unwrap_or_default();
+                0
+            }
+            161 => {
+                // chroot(path): this process (and its children) see `path` as /.
+                let p = resolve(&read_cstr(a0)?);
+                if !is_dir(&p) {
+                    return Err(ENOTDIR);
+                }
+                let new = ns().chroot(&p);
+                *proc().ns.lock() = new;
+                let cwd = fds().cwd.clone();
+                fds().cwd = if cwd == p { String::new() } else { cwd.strip_prefix(&format!("{p}/")).unwrap_or("").into() };
+                0
+            }
+            272 => {
+                // unshare(flags): CLONE_NEWNS gives the process its own mount table; the
+                // other namespaces (user, pid, ipc, uts, net, cgroup) are accepted as is.
+                if a0 & CLONE_NEWNS != 0 {
+                    let copy = ns().copy();
+                    *proc().ns.lock() = copy;
+                }
+                0
+            }
+            308 => return Err(EINVAL), // setns
+            76 => {
+                // truncate(path, length)
+                let p = resolve(&read_cstr(a0)?);
+                let (m, rel) = ns().writable(&p)?;
+                m.fs.truncate(&rel, a1)?;
                 0
             }
             89 | 267 => {
                 // readlink(at): only /proc/self/exe (and /proc/self/fd/N) are links
                 let (path, buf, size) = if nr == 89 { (a0, a1, a2) } else { (a1, a2, a3) };
-                let p = resolve(&read_cstr(path)?);
-                let target = if p == "proc/self/exe" || p == format!("proc/{}/exe", proc().pid) {
-                    format!("/{}", *proc().exe.lock())
-                } else if let Some(fd) = p.strip_prefix("proc/self/fd/") {
-                    let file = fds().get(fd.parse().map_err(|_| ENOENT)?)?;
-                    let t = match &file.lock().kind {
-                        Kind::File { path, .. } | Kind::Dir { path, .. } => format!("/{path}"),
-                        Kind::Tty => "/dev/tty".into(),
-                        Kind::Null => "/dev/null".into(),
-                        Kind::Random => "/dev/urandom".into(),
-                        Kind::Channel(_) => "socket:[1]".into(),
-                        Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
-                        Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
-                        Kind::Memfd(_) => "/memfd: (deleted)".into(),
-                        Kind::Inet(_) => "socket:[2]".into(),
-                    };
-                    t
-                } else {
-                    return Err(EINVAL_OR_NOENT(&p));
+                let p = if nr == 89 { resolve_nofollow(&read_cstr(path)?) } else { at_path_nf(a0 as i32 as i64, &read_cstr(path)?, false)? };
+                let target = {
+                    let (m, rel) = ns().find_mount(&p);
+                    m.fs.readlink(&rel).ok_or_else(|| EINVAL_OR_NOENT(&p))?
                 };
                 let bytes = &target.as_bytes()[..target.len().min(size as usize)];
                 write_user(buf, bytes)?;
@@ -1873,6 +2522,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             157 => match a0 {
                 // prctl
                 3 => 1,                                     // PR_GET_DUMPABLE
+                23 => if a1 <= CAP_LAST { 1 } else { return Err(EINVAL) }, // PR_CAPBSET_READ
+                21 | 22 | 24 | 47 => 0,                     // PR_GET/SET_SECCOMP, PR_CAPBSET_DROP, PR_CAP_AMBIENT
                 1 | 4 | 8 | 15 | 36 | 38 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, SET_NAME, CHILD_SUBREAPER, NO_NEW_PRIVS, SET_VMA
                 16 => {
                     // PR_GET_NAME
@@ -1971,19 +2622,26 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 // getdents64
                 let file = fds().get(a0 as i64)?;
                 let mut fl = file.lock();
-                let Kind::Dir { path, listed } = &mut fl.kind else { return Err(ENOTDIR) };
-                if *listed {
-                    0
-                } else {
-                    let ents = dirents(path);
-                    if ents.len() > a2 as usize {
-                        return Err(EINVAL);
+                let Kind::Dir { at } = &fl.kind else { return Err(ENOTDIR) };
+                let at = at.clone();
+                // The file position counts entries already returned (lseek(fd, 0) rewinds).
+                let ents = dirents(&at);
+                let mut out = Vec::new();
+                let mut next = fl.pos;
+                for e in ents.iter().skip(fl.pos) {
+                    if out.len() + e.len() > a2 as usize {
+                        break;
                     }
-                    *listed = true;
-                    drop(fl);
-                    write_user(a1, &ents)?;
-                    ents.len() as i64
+                    out.extend_from_slice(e);
+                    next += 1;
                 }
+                if out.is_empty() && next < ents.len() {
+                    return Err(EINVAL); // the buffer cannot hold one entry
+                }
+                fl.pos = next;
+                drop(fl);
+                write_user(a1, &out)?;
+                out.len() as i64
             }
             218 => {
                 // set_tid_address
@@ -2027,7 +2685,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let mut b = vec![0u8; 120];
                 b[0..8].copy_from_slice(&0x0102_1994u64.to_le_bytes()); // TMPFS_MAGIC
                 b[8..16].copy_from_slice(&4096u64.to_le_bytes()); // f_bsize
-                let (used, total) = fs::usage().unwrap_or((0, 1 << 30));
+                let p = if nr == 137 { Some(resolve(&read_cstr(a0)?)) } else { fd_path(a0 as i64)? };
+                let (used, total) = ns().find_mount(&p.unwrap_or_default()).0.fs.usage();
+                let total = total.max(used + 4096);
                 b[16..24].copy_from_slice(&(total / 4096).to_le_bytes());
                 b[24..32].copy_from_slice(&((total - used) / 4096).to_le_bytes());
                 b[32..40].copy_from_slice(&((total - used) / 4096).to_le_bytes());
@@ -2172,6 +2832,9 @@ const CLONE_CHILD_CLEARTID: u64 = 0x200000;
 const CLONE_CHILD_SETTID: u64 = 0x1000000;
 
 const CLONE_VFORK: u64 = 0x4000;
+pub const CLONE_NEWNS: u64 = 0x20000;
+/// CAP_CHECKPOINT_RESTORE: the highest capability number Linux 7.x has.
+const CAP_LAST: u64 = 40;
 
 /// clone: a thread with CLONE_VM | CLONE_THREAD; anything else creates a process. A
 /// process always gets its own copy of the memory (CLONE_VM without CLONE_THREAD, as
@@ -2179,6 +2842,9 @@ const CLONE_VFORK: u64 = 0x4000;
 fn clone(f: &SyscallFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> Result<i64, i64> {
     if flags & CLONE_VM == 0 || flags & CLONE_THREAD == 0 {
         let pid = process::fork(f, flags & CLONE_VFORK != 0, stack, (flags & CLONE_SETTLS != 0).then_some(tls))?;
+        if flags & CLONE_NEWNS != 0 {
+            process::unshare_ns(pid);
+        }
         if flags & CLONE_PARENT_SETTID != 0 {
             write_user(parent_tid, &(pid as u32).to_le_bytes())?;
         }

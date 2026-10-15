@@ -108,6 +108,14 @@ for src in "$USERLAND_SRC"/compat32/dynamic/*.c; do
         cp -L "$lib" "$SYSROOT$lib"
     done
 done
+# bubblewrap (the container tool Steam's pressure-vessel uses), if the host has it: the
+# test for mount namespaces runs the host's binary and libraries unmodified.
+if [[ -x /usr/bin/bwrap ]]; then
+    for f in /usr/bin/bwrap $(ldd /usr/bin/bwrap | awk '/=> \//{print $3}'); do
+        mkdir -p "$SYSROOT$(dirname "$f")"
+        cp -L "$f" "$SYSROOT$f"
+    done
+fi
 # The Chromium engine (scripts/fetch-chromium.sh), if downloaded: its libraries too.
 CHROMIUM="$BUILD/chromium/chrome-headless-shell-linux64"
 if [[ -x "$CHROMIUM/chrome-headless-shell" ]]; then

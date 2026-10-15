@@ -54,7 +54,7 @@ repository plus the pinned Linux release). Kernels built without the feature are
 
 ## How it fits together
 
-* **Configuration** (`nova.config`): 64-bit, one CPU, no modules, `HZ=100` (Nova's timer
+* **Configuration** (`nova.config`): 64-bit, one CPU, no modules, `HZ=1000` (Nova's timer
   rate, so `jiffies` means the same on both sides), `printk` on, and everything off that would
   need Linux runtime machinery: jump labels, CPU mitigation thunks, ftrace, stack protector,
   paravirt, IBT. `RANDOMIZE_MEMORY` turns `PAGE_OFFSET` into the variable `page_offset_base`,
