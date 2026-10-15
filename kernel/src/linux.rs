@@ -48,6 +48,8 @@ const EAFNOSUPPORT: i64 = 97;
 const ENOTSOCK: i64 = 88;
 const ENOMEM_ERR: i64 = 12;
 const EROFS: i64 = 30;
+const EADDRINUSE: i64 = 98;
+const EISCONN: i64 = 106;
 const EACCES: i64 = 13;
 const ENODEV: i64 = 19;
 const ELOOP: i64 = 40;
@@ -103,6 +105,8 @@ pub enum Kind {
     Memfd(ipc::SharedRef, Option<vfs::At>),
     /// AF_INET TCP or UDP socket (smoltcp, net.rs).
     Inet(InetSocket),
+    /// AF_UNIX socket before connect (then it becomes a Channel), or bound / listening.
+    Unix(UnixSocket),
     /// /dev/zero (and /dev/full): reads zeros, writes are discarded.
     Zero,
     /// A regular file read into memory (NovaFS) or used in place (system files); `at`
@@ -121,6 +125,57 @@ pub struct OpenFile {
 }
 
 pub type FileRef = Arc<SpinLock<OpenFile>>;
+
+pub struct UnixSocket {
+    kind: ipc::SockType,
+    /// Bound (and after listen(), listening) socket.
+    listener: Option<ipc::ListenerRef>,
+    /// The sockaddr_un it was bound to, for getsockname.
+    name: Vec<u8>,
+}
+
+/// The registry key and sockaddr for a sockaddr_un: abstract names ("\0name") as
+/// "@name", paths by the file system that holds them (so bind mounts reach the same
+/// socket).
+fn unix_key(sa: &[u8]) -> Result<(String, bool), i64> {
+    if sa.len() < 3 || u16::from_le_bytes([sa[0], sa[1]]) != 1 {
+        return Err(EINVAL);
+    }
+    let path = &sa[2..];
+    if path[0] == 0 {
+        return Ok((format!("@{}", String::from_utf8_lossy(&path[1..])), true));
+    }
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    let p = resolve(&String::from_utf8_lossy(&path[..end]));
+    Ok((path_key(&p), false))
+}
+
+/// The registry key for socket path `p` in the initial namespace (kernel servers such
+/// as the Wayland compositor bind there).
+pub fn root_socket_key(p: &str) -> String {
+    let (m, rel) = vfs::root().find_mount(p);
+    format!("{:p}:{rel}", Arc::as_ptr(&m.fs) as *const u8)
+}
+
+/// The shared-memory object behind a descriptor (memfd, POSIX shm, tmpfs file).
+pub fn shared_memory(f: &FileRef) -> Option<ipc::SharedRef> {
+    match &f.lock().kind {
+        Kind::Memfd(m, _) => Some(m.clone()),
+        _ => None,
+    }
+}
+
+/// A new read-only memfd holding `data` (to hand to a program, e.g. a keymap).
+pub fn memfd_with(data: &[u8]) -> FileRef {
+    let m = ipc::memfd();
+    m.lock().write(0, data);
+    new_file(Kind::Memfd(m, None), 0)
+}
+
+fn path_key(p: &str) -> String {
+    let (m, rel) = ns().find_mount(p);
+    format!("{:p}:{rel}", Arc::as_ptr(&m.fs) as *const u8)
+}
 
 pub struct InetSocket {
     handle: smoltcp::iface::SocketHandle,
@@ -258,6 +313,8 @@ fn poll_file(f: &FileRef) -> (u32, u64) {
         Kind::Channel(end) => end.poll(),
         Kind::EventFd(e) => e.lock().poll(),
         Kind::SignalFd(mask) => (if signal::pending_masked(thread(), *mask) { ipc::POLLIN } else { 0 }, 0),
+        Kind::Unix(UnixSocket { listener: Some(l), .. }) => l.lock().poll(),
+        Kind::Unix(_) => (0, 0),
         Kind::Inet(s) => {
             let (r, w, hup, err) = crate::net::sock_poll(s.handle, s.udp);
             let mut ev = 0;
@@ -669,7 +726,7 @@ fn fd_link(n: i64) -> Option<String> {
         Kind::SignalFd(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Memfd(_, None) => "/memfd: (deleted)".into(),
-        Kind::Inet(_) => "socket:[2]".into(),
+        Kind::Inet(_) | Kind::Unix(_) => "socket:[2]".into(),
     })
 }
 
@@ -709,7 +766,7 @@ impl vfs::Backend for ProcFs {
         let file = fds().get(fd).ok()?;
         let f = file.lock();
         let at = match (&f.at, &f.kind) {
-            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
+            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::Unix(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
             (Some(at), _) => at.clone(),
             (None, Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at))) => at.clone(),
             _ => return None,
@@ -1000,7 +1057,7 @@ fn stat_file(f: &OpenFile) -> Vec<u8> {
             Err(_) => stat_buf(0o100644, m.lock().size, 0, 7),
         },
         Kind::Memfd(m, None) => stat_buf(0o100600, m.lock().size, 0, 5),
-        Kind::Inet(_) => stat_buf(0o140777, 0, 0, 6),
+        Kind::Inet(_) | Kind::Unix(_) => stat_buf(0o140777, 0, 0, 6),
     }
 }
 
@@ -1262,6 +1319,7 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
         Kind::Dir { .. } => return Err(EISDIR),
         Kind::Memfd(m, _) => m.lock().read(pos, len),
         Kind::Epoll(_) | Kind::Inet(_) => return Err(EINVAL),
+        Kind::Unix(_) => return Err(ENOTCONN),
         Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::SignalFd(_) => unreachable!(),
     };
     if at.is_none() {
@@ -1302,6 +1360,7 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
             return Ok(data.len());
         }
         Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
+        Kind::Unix(_) => return Err(ENOTCONN),
         Kind::File { data: contents, writable, append, dirty, .. } => {
             if !*writable {
                 return Err(EBADF);
@@ -1432,6 +1491,7 @@ fn kind_name(k: &Kind) -> String {
         Kind::Channel(e) => format!("{}{:?}", if e.rx.is_some() && e.tx.is_some() { "socket " } else { "pipe " }, e.kind),
         Kind::EventFd(_) => "eventfd".into(),
         Kind::SignalFd(_) => "signalfd".into(),
+        Kind::Unix(_) => "unix socket".into(),
         Kind::Epoll(_) => "epoll".into(),
         Kind::Memfd(_, Some(at)) => format!("file {}", at.rel),
         Kind::Memfd(_, None) => "memfd".into(),
@@ -1576,7 +1636,14 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 0
             }
             41 => {
-                // socket(domain, type, protocol): AF_INET TCP and UDP
+                // socket(domain, type, protocol): AF_UNIX, AF_INET TCP and UDP
+                if a0 == 1 {
+                    let kind = sock_type(a1)?;
+                    let mut t = fds();
+                    let fd = t.add(new_file(Kind::Unix(UnixSocket { kind, listener: None, name: Vec::new() }), (a1 & O_NONBLOCK) | 2), 0);
+                    t.set_cloexec(fd, a1 & O_CLOEXEC != 0);
+                    return Ok(fd);
+                }
                 if a0 != 2 {
                     return Err(EAFNOSUPPORT);
                 }
@@ -1595,6 +1662,22 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             42 => {
                 // connect(fd, addr, len)
                 let file = fds().get(a0 as i64)?;
+                let unix_kind = match &file.lock().kind {
+                    Kind::Unix(u) if u.listener.is_none() => Some(u.kind),
+                    Kind::Unix(_) | Kind::Channel(_) => return Err(EISCONN),
+                    _ => None,
+                };
+                if let Some(kind) = unix_kind {
+                    let sa = read_user(a1, (a2 as usize).min(110))?;
+                    let (key, abstract_name) = unix_key(&sa)?;
+                    if !abstract_name {
+                        let end = sa[2..].iter().position(|&b| b == 0).unwrap_or(sa.len() - 2);
+                        stat_path(&resolve(&String::from_utf8_lossy(&sa[2..2 + end])))?;
+                    }
+                    let end = ipc::connect_name(&key, kind)?;
+                    file.lock().kind = Kind::Channel(end);
+                    return Ok(0);
+                }
                 let (ip, port) = sockaddr_in(&read_user(a1, (a2 as usize).min(128))?)?;
                 let nonblock = {
                     let mut f = file.lock();
@@ -1691,8 +1774,33 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 0
             }
             49 => {
-                // bind(fd, addr, len): UDP ports; TCP client sockets ignore it
+                // bind(fd, addr, len): AF_UNIX names, UDP ports; TCP client sockets ignore it
                 let file = fds().get(a0 as i64)?;
+                let unix_kind = match &file.lock().kind {
+                    Kind::Unix(u) if u.listener.is_some() => return Err(EINVAL),
+                    Kind::Unix(u) => Some(u.kind),
+                    _ => None,
+                };
+                if let Some(kind) = unix_kind {
+                    let sa = read_user(a1, (a2 as usize).min(110))?;
+                    let (key, abstract_name) = unix_key(&sa)?;
+                    if !abstract_name {
+                        // The socket file: a node at the path (EADDRINUSE if it exists).
+                        let end = sa[2..].iter().position(|&b| b == 0).unwrap_or(sa.len() - 2);
+                        let p = resolve(&String::from_utf8_lossy(&sa[2..2 + end]));
+                        if stat_path(&p).is_ok() {
+                            return Err(EADDRINUSE);
+                        }
+                        let (m, rel) = ns().writable(&p)?;
+                        m.fs.create(&rel, 0o755)?;
+                    }
+                    let l = ipc::bind_name(&key, kind).map_err(|_| EADDRINUSE)?;
+                    if let Kind::Unix(u) = &mut file.lock().kind {
+                        u.listener = Some(l);
+                        u.name = sa;
+                    }
+                    return Ok(0);
+                }
                 let mut f = file.lock();
                 if let Kind::Inet(s) = &mut f.kind
                     && s.udp
@@ -1702,7 +1810,49 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 0
             }
-            50 => 0, // listen
+            50 => {
+                // listen(fd, backlog)
+                if let Kind::Unix(u) = &fds().get(a0 as i64)?.lock().kind {
+                    let l = u.listener.as_ref().ok_or(EINVAL)?;
+                    let mut l = l.lock();
+                    l.listening = true;
+                    l.backlog = (a1 as usize).clamp(1, 4096);
+                }
+                0
+            }
+            43 | 288 => {
+                // accept(fd, addr, len), accept4(fd, addr, len, flags)
+                let file = fds().get(a0 as i64)?;
+                let end = loop {
+                    let (got, nonblock) = {
+                        let f = file.lock();
+                        let Kind::Unix(UnixSocket { listener: Some(l), .. }) = &f.kind else { return Err(EINVAL) };
+                        let mut l = l.lock();
+                        let e = l.queue.pop_front();
+                        if e.is_some() {
+                            l.generation = ipc::next_gen();
+                        }
+                        (e, f.flags & O_NONBLOCK != 0)
+                    };
+                    if let Some(e) = got {
+                        break e;
+                    }
+                    if nonblock {
+                        return Err(EAGAIN);
+                    }
+                    ipc::wait(None);
+                    process::check_exiting();
+                    if signal::has_deliverable(thread()) {
+                        return Err(EINTR);
+                    }
+                };
+                let flags = if nr == 288 { a3 } else { 0 };
+                put_addr(a1, a2, &1u16.to_le_bytes())?;
+                let mut t = fds();
+                let fd = t.add(new_file(Kind::Channel(end), (flags & O_NONBLOCK) | 2), 0);
+                t.set_cloexec(fd, flags & O_CLOEXEC != 0);
+                fd
+            }
             51 | 52 => {
                 // getsockname, getpeername
                 let file = fds().get(a0 as i64)?;
@@ -1712,6 +1862,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         let (ip, port) = s.peer.ok_or(ENOTCONN)?;
                         encode_sockaddr_in(ip, port)
                     }
+                    Kind::Unix(u) if nr == 51 && !u.name.is_empty() => u.name.clone(),
                     _ => 1u16.to_le_bytes().to_vec(), // unnamed AF_UNIX
                 };
                 put_addr(a1, a2, &sa)?;
@@ -1735,7 +1886,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     (1, 4) => (so_error as i32).to_le_bytes().to_vec(), // SO_ERROR
                     (1, 3) => {
                         let t = match &fds().get(a0 as i64)?.lock().kind {
-                            Kind::Channel(e) => match e.kind { ipc::SockType::Stream => 1, ipc::SockType::Datagram => 2, ipc::SockType::SeqPacket => 5 },
+                            Kind::Channel(ipc::End { kind, .. }) | Kind::Unix(UnixSocket { kind, .. }) => match kind { ipc::SockType::Stream => 1, ipc::SockType::Datagram => 2, ipc::SockType::SeqPacket => 5 },
                             _ => 1,
                         };
                         (t as i32).to_le_bytes().to_vec()
@@ -2330,6 +2481,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 let (m, rel) = ns().writable(&p)?;
                 if nr == 263 && a2 & 0x200 != 0 { m.fs.rmdir(&rel)? } else { m.fs.unlink(&rel)? }
+                ipc::unbind_name(&path_key(&p));
                 0
             }
             280 | 235 => {
@@ -2576,6 +2728,48 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 0
             }
             102 | 104 | 107 | 108 | 111 | 112 | 121 => 0, // uid/gid/pgrp/setsid queries: root
+            // setuid, setgid, setpgid, setreuid, setregid, setresuid, setresgid, setfsuid,
+            // setfsgid: accepted (Nova does not check permissions).
+            105 | 106 | 109 | 113 | 114 | 117 | 119 | 122 | 123 => 0,
+            37 => {
+                // alarm(seconds): SIGALRM later; returns the seconds left of the previous one
+                let old = set_alarm(proc().pid, (a0 > 0).then(|| (a0 * 1_000_000, 0)));
+                old.map_or(0, |(left, _)| left.div_ceil(1_000_000)) as i64
+            }
+            38 | 36 => {
+                // setitimer(which, new, old), getitimer(which, cur): ITIMER_REAL (SIGALRM)
+                if a0 != 0 {
+                    return Err(EINVAL);
+                }
+                let tv = |p: u64| -> Result<u64, i64> {
+                    let b = read_user(p, 16)?;
+                    Ok(u64::from_le_bytes(b[0..8].try_into().unwrap()) * 1_000_000 + u64::from_le_bytes(b[8..16].try_into().unwrap()))
+                };
+                let old = if nr == 38 {
+                    let (interval, value) = (tv(a1)?, tv(a1 + 16)?);
+                    set_alarm(proc().pid, (value > 0).then_some((value, interval)))
+                } else {
+                    ALARMS.lock().get(&proc().pid).map(|&(at, interval)| (at.saturating_sub(pit::nanos() / 1000), interval))
+                };
+                let out = if nr == 38 { a2 } else { a1 };
+                if out != 0 {
+                    let (left, interval) = old.unwrap_or((0, 0));
+                    let mut b = Vec::new();
+                    for us in [interval, left] {
+                        b.extend_from_slice(&(us / 1_000_000).to_le_bytes());
+                        b.extend_from_slice(&(us % 1_000_000).to_le_bytes());
+                    }
+                    write_user(out, &b)?;
+                }
+                0
+            }
+            118 | 120 => {
+                // getresuid, getresgid: real, effective and saved ids, all 0
+                for p in [a0, a1, a2] {
+                    write_user(p, &0u32.to_le_bytes())?;
+                }
+                0
+            }
             158 => match a0 {
                 // arch_prctl
                 0x1002 => {
@@ -2858,6 +3052,50 @@ fn clone(f: &SyscallFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u
         write_user(child_tid, &(tid as u32).to_le_bytes())?;
     }
     Ok(tid as i64)
+}
+
+/// ITIMER_REAL timers: pid -> (deadline, interval), in microseconds of the monotonic clock.
+static ALARMS: SpinLock<BTreeMap<u64, (u64, u64)>> = SpinLock::new(BTreeMap::new());
+
+/// Arm (Some((after_us, interval_us))) or cancel the process's real-time timer. Returns
+/// the previous one as (microseconds left, interval).
+fn set_alarm(pid: u64, timer: Option<(u64, u64)>) -> Option<(u64, u64)> {
+    static STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    let now = pit::nanos() / 1000;
+    let mut a = ALARMS.lock();
+    let old = match timer {
+        Some((after, interval)) => a.insert(pid, (now + after, interval)),
+        None => a.remove(&pid),
+    };
+    drop(a);
+    if !STARTED.swap(true, core::sync::atomic::Ordering::Relaxed) {
+        task::spawn("alarms", || loop {
+            let now = pit::nanos() / 1000;
+            let due: Vec<u64> = ALARMS.lock().iter().filter(|(_, t)| t.0 <= now).map(|(&p, _)| p).collect();
+            for pid in due {
+                {
+                    let mut a = ALARMS.lock();
+                    match a.get(&pid).copied() {
+                        Some((at, interval)) if interval > 0 => {
+                            a.insert(pid, (at + interval, interval));
+                        }
+                        _ => {
+                            a.remove(&pid);
+                        }
+                    }
+                }
+                match process::find(pid) {
+                    Some(p) => signal::send_process(&p, signal::SIGALRM, 0),
+                    None => {
+                        ALARMS.lock().remove(&pid);
+                    }
+                }
+            }
+            // 1 ms resolution while timers run; idle checks every 10 ms.
+            task::sleep_ticks(if ALARMS.lock().is_empty() { 10 } else { 1 });
+        });
+    }
+    old.map(|(at, interval)| (at.saturating_sub(now), interval))
 }
 
 const ETIMEDOUT: i64 = 110;

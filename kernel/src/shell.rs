@@ -44,6 +44,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "install", args: "[disk]", help: "install Nova onto a disk", run: cmd_install },
     Command { name: "run", args: "<file> [args]", help: "run a Linux x86-64 program (C/C++, static or dynamic)", run: cmd_run },
     Command { name: "strace", args: "<file> [args]", help: "run a program, logging its system calls to serial", run: cmd_strace },
+    Command { name: "wayland", args: "", help: "Wayland compositor status: clients and their windows", run: cmd_wayland },
     Command { name: "browser", args: "[url]", help: "open Nova Browser (Chromium engine)", run: cmd_browser },
     Command { name: "download", args: "<url> <file>", help: "save a URL to a file (e.g. a Shields filter list)", run: cmd_download },
     Command { name: "crash", args: "<case>", help: "trigger a CPU exception or panic", run: cmd_crash },
@@ -110,6 +111,10 @@ fn cmd_browser(args: &str, _: &History) {
         return;
     }
     crate::browser::launch(if args.is_empty() { None } else { Some(String::from(args)) });
+}
+
+fn cmd_wayland(_: &str, _: &History) {
+    println!("{}", crate::wayland::status());
 }
 
 fn cmd_strace(args: &str, _: &History) {

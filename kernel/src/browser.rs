@@ -473,6 +473,7 @@ impl Browser {
         let (w, _) = wm::size(&self.win);
         match e {
             Event::Close => return false,
+            Event::RawKey { .. } | Event::Pointer { .. } | Event::PointerLeave => {}
             Event::Key(Key::Char(0x0C)) => self.editing = Some(self.url.clone()), // Ctrl-L
             Event::Key(Key::Char(0x12)) => self.cdp_send("Page.reload", json!({})), // Ctrl-R
             Event::Key(k) if self.editing.is_some() => {

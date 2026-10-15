@@ -17,6 +17,7 @@ pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGILL: u32 = 4;
 pub const SIGABRT: u32 = 6;
+pub const SIGALRM: u32 = 14;
 pub const SIGBUS: u32 = 7;
 pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;

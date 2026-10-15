@@ -62,6 +62,7 @@ mod textgrid;
 mod tls;
 mod tty;
 mod ui;
+mod wayland;
 mod vfs;
 mod wm;
 

@@ -465,7 +465,9 @@ multi-threaded, including the Chromium engine (`process.rs`, `linux.rs`, `ipc.rs
   `exit_group` stops every thread at its next kernel entry; the address space is freed with
   the last thread. Timer interrupts preempt user threads.
 * **Files and IPC.** NovaFS files, `/dev/null`, `/dev/urandom`, terminals; pipes, Unix socket
-  pairs (stream, datagram, seqpacket) with `SCM_RIGHTS` descriptor passing, eventfd, epoll
+  pairs (stream, datagram, seqpacket) and named Unix sockets (`bind`/`listen`/`accept`/
+  `connect` on a path or an abstract name; a path socket is found through bind mounts too)
+  with `SCM_RIGHTS` descriptor passing, eventfd, signalfd, epoll
   (level and edge triggered), `poll`; memfd and `/dev/shm` shared memory whose `MAP_SHARED`
   mappings alias the same physical pages; synthetic `/proc` (`self/exe`, `maps`, `status`,
   `stat`, `fd/N`, `meminfo`, `cpuinfo`, ...), `/sys/devices/system/cpu` and `/etc` files.
@@ -486,6 +488,19 @@ multi-threaded, including the Chromium engine (`process.rs`, `linux.rs`, `ipc.rs
   `CLONE_SETTLS` install TLS descriptors in the GDT; signal delivery builds i386 `sigframe`
   and `rt_sigframe` frames. Tests: `hello32`, `hello32-dyn` (glibc's i386 loader and
   `libm.so.6`), `proctest32` (proctest's 15 checks) and `threads32` (7 checks).
+* **Wayland and X11** (`wayland.rs`). A compositor in the kernel serves the Wayland
+  protocol on `/run/user/1000/wayland-0` (`WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR` are set for
+  every program): wl_compositor, wl_subcompositor, wl_shm, wl_seat (keyboard with a US XKB
+  keymap, pointer), wl_output, xdg_wm_base, wl_data_device_manager. Each `xdg_toplevel`
+  becomes a Nova window showing the client's shared-memory buffer (copied on commit,
+  released at once); the window's raw input (Linux key codes from the set-1 scancodes,
+  pointer position and buttons, wheel) goes back as `wl_keyboard`/`wl_pointer` events, and
+  frame callbacks fire at 60 Hz. In shell mode the compositor is headless and the `wayland`
+  command shows its clients and their pixels. The host's unmodified Xwayland
+  (`Xwayland :0 -shm`) runs on it, so X11 programs get a display (`DISPLAY=:0`). Tests:
+  `wltest` (libwayland-client + xdg-shell) and `xtest` (Xlib on Xwayland), case `wayland`.
+* **Timers and credentials.** `alarm`, `setitimer`/`getitimer` (ITIMER_REAL, SIGALRM with
+  1 ms resolution); the uid/gid setters are accepted (permissions are not checked).
 * **Diagnostics.** `strace <program>` logs every system call with arguments and results to
   the serial console; unimplemented calls return `-ENOSYS` and are logged once.
 
@@ -597,6 +612,7 @@ All cases run the same kernel binary. `scripts/mkimage.sh` adds `cmdline: nova.t
 | `compat32` | `hello32`, `hello32-dyn`, `proctest32`, `threads32` | 32-bit programs: static and dynamic, processes and signals, threads with TLS, no fault or unimplemented syscall |
 | `vfs` | `vfstest`, BusyBox `tar`, `cp -a`, `readlink` | symbolic and hard links, directories, rename, chmod, tmpfs with 3000 files and long names, links kept by tar and cp |
 | `containers` | host `bwrap`, BusyBox | read-only root with its own /dev, /proc, /tmp; a container rooted in a separate tree; exit status passed through |
+| `wayland` | `wltest`, host `Xwayland`, `xtest` | a Wayland client's buffer reaches the compositor with the right pixels; an Xlib client draws on Xwayland and reads its pixels back |
 | `net` | `nettest 10.0.2.2:<mock port>` | glibc DNS and a TCP HTTP exchange through the Linux socket layer |
 | `chromium` | `chrome-headless-shell --screenshot` of a `data:` URL | the Chromium engine starts, renders and writes the PNG (skipped if Chromium was not downloaded) |
 | `browser` | desktop; "open the test page" typed to Claude Code (mock API) | Claude calls `open_url`, Nova Browser starts Chromium, Chromium fetches the page from the host, Shields blocks its Google Analytics script (skipped without Chromium) |

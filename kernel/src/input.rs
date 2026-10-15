@@ -4,6 +4,7 @@
 //! rings (producer: the IRQ handler; consumer: the main loop). Decoding into
 //! [`Key`]s happens in the main loop, in [`read_key`].
 
+use alloc::collections::VecDeque;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -118,10 +119,64 @@ fn decode_serial(state: &mut SerialState, byte: u8) -> Option<Key> {
     key
 }
 
+/// Raw key events (Linux key code, pressed) decoded alongside the keys, for windows
+/// that take raw input (wm.rs); the oldest are dropped if nobody takes them.
+static RAW_KEYS: SpinLock<(bool, VecDeque<(u16, bool)>)> = SpinLock::new((false, VecDeque::new()));
+
+/// Set-1 scancode (with or without the E0 prefix) to a Linux key code. Without E0 the
+/// make codes 1..=0x58 are the Linux codes themselves.
+fn linux_keycode(code: u8, e0: bool) -> Option<u16> {
+    let make = code & 0x7F;
+    if !e0 {
+        return (1..=0x58).contains(&make).then_some(make as u16);
+    }
+    Some(match make {
+        0x1C => 96,  // KEY_KPENTER
+        0x1D => 97,  // KEY_RIGHTCTRL
+        0x35 => 98,  // KEY_KPSLASH
+        0x38 => 100, // KEY_RIGHTALT
+        0x47 => 102, // KEY_HOME
+        0x48 => 103, // KEY_UP
+        0x49 => 104, // KEY_PAGEUP
+        0x4B => 105, // KEY_LEFT
+        0x4D => 106, // KEY_RIGHT
+        0x4F => 107, // KEY_END
+        0x50 => 108, // KEY_DOWN
+        0x51 => 109, // KEY_PAGEDOWN
+        0x52 => 110, // KEY_INSERT
+        0x53 => 111, // KEY_DELETE
+        0x5B => 125, // KEY_LEFTMETA
+        0x5C => 126, // KEY_RIGHTMETA
+        0x5D => 127, // KEY_COMPOSE
+        _ => return None,
+    })
+}
+
+fn record_raw(code: u8) {
+    let mut r = RAW_KEYS.lock();
+    if code == 0xE0 {
+        r.0 = true;
+        return;
+    }
+    let e0 = core::mem::take(&mut r.0);
+    if let Some(k) = linux_keycode(code, e0) {
+        if r.1.len() >= 128 {
+            r.1.pop_front();
+        }
+        r.1.push_back((k, code & 0x80 == 0));
+    }
+}
+
+/// Raw key events since the last call.
+pub fn take_raw_keys() -> VecDeque<(u16, bool)> {
+    core::mem::take(&mut RAW_KEYS.lock().1)
+}
+
 /// Next decoded key from the PS/2 keyboard, if any.
 pub fn poll_keyboard() -> Option<Key> {
     let mut decoder = KEYBOARD.try_lock()?;
     while let Some(code) = SCANCODES.pop() {
+        record_raw(code);
         if let Some(key) = decoder.feed(code) {
             return Some(key);
         }

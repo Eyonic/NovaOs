@@ -57,6 +57,14 @@ pub enum Event {
     Resized,
     /// The user closed the window: clean up and return.
     Close,
+    /// Raw input (windows opened with [`set_raw_input`], e.g. Wayland clients): a key
+    /// pressed or released, as a Linux key code (KEY_*).
+    RawKey { code: u16, pressed: bool },
+    /// Raw input: the pointer over the client area, with the buttons held (bit 0 left,
+    /// bit 1 right, bit 2 middle). Sent for every pointer report.
+    Pointer { x: i32, y: i32, buttons: u8 },
+    /// Raw input: the pointer left the client area.
+    PointerLeave,
 }
 
 pub enum Content {
@@ -80,6 +88,8 @@ pub struct Window {
     pub dirty: bool,
     pub closed: bool,
     pub minimized: bool,
+    /// Wants [`Event::RawKey`] and [`Event::Pointer`] (see [`set_raw_input`]).
+    pub raw_input: bool,
 }
 
 pub type WindowRef = Arc<SpinLock<Window>>;
@@ -154,6 +164,7 @@ pub fn open(title: &str, icon: char, accent: u32, w: i32, h: i32, content: Conte
         dirty: true,
         closed: false,
         minimized: false,
+        raw_input: false,
     }));
     WINDOWS.lock().push(win.clone());
     FOCUS.store(id, Ordering::Relaxed);
@@ -218,6 +229,21 @@ pub fn present(win: &WindowRef, canvas: &Canvas) {
         c.clone_from(canvas);
     }
     w.dirty = true;
+}
+
+/// Deliver raw key and pointer events to this window (besides the usual ones).
+pub fn set_raw_input(win: &WindowRef) {
+    win.lock().raw_input = true;
+}
+
+/// Resize a window's client area (a Wayland client chose its size).
+pub fn set_size(win: &WindowRef, w: i32, h: i32) {
+    let (sw, sh) = work_area();
+    let mut win = win.lock();
+    win.w = w.clamp(1, sw - 2);
+    win.h = h.clamp(1, sh - TITLE_H - 1);
+    win.dirty = true;
+    request_redraw();
 }
 
 pub fn set_title(win: &WindowRef, title: &str) {
@@ -375,6 +401,8 @@ struct Desktop {
     last_compose_tick: u64,
     /// Cursor position drawn on the framebuffer (to restore the scene under it).
     drawn_cursor: Option<(i32, i32)>,
+    /// The raw-input window the pointer is over.
+    raw_pointer: Option<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -412,6 +440,7 @@ pub fn start() -> bool {
     let Some(screen) = crate::console::screen() else { return false };
     *SCREEN_SIZE.lock() = (screen.width as i32, screen.height as i32);
     RUNNING.store(true, Ordering::Relaxed);
+    crate::wayland::start();
     crate::console::suspend();
     task::spawn("desktop", move || {
         let mut home = crate::home::Home::new(screen.width as i32, screen.height as i32);
@@ -429,6 +458,7 @@ pub fn start() -> bool {
             last_status_tick: 0,
             last_compose_tick: 0,
             drawn_cursor: None,
+            raw_pointer: None,
         };
         d.run();
     });
@@ -442,6 +472,14 @@ impl Desktop {
             while let Some(key) = input::poll_keyboard() {
                 self.key(key);
                 changed = true;
+            }
+            for (code, pressed) in input::take_raw_keys() {
+                if let Some(w) = self.focused() {
+                    let mut w = w.lock();
+                    if w.raw_input {
+                        w.push(Event::RawKey { code, pressed });
+                    }
+                }
             }
             let mut moved = false;
             while let Some(report) = mouse::poll() {
@@ -625,6 +663,29 @@ impl Desktop {
             }
         }
         let over_window = self.window_at(x, y);
+        // Raw-input windows see every pointer report while the pointer is over their
+        // client area (or they hold a drag), and a leave event when it goes.
+        let raw_target = match self.drag {
+            Some(Drag::Client { id }) => window_by_id(id),
+            _ => over_window.clone(),
+        }
+        .filter(|w| {
+            let w = w.lock();
+            let (ox, oy) = w.client_origin();
+            w.raw_input && (matches!(self.drag, Some(Drag::Client { .. })) || Rect::new(ox, oy, w.w, w.h).contains(x, y))
+        });
+        let raw_id = raw_target.as_ref().map(|w| w.lock().id);
+        if self.raw_pointer != raw_id {
+            if let Some(old) = self.raw_pointer.and_then(window_by_id) {
+                old.lock().push(Event::PointerLeave);
+            }
+            self.raw_pointer = raw_id;
+        }
+        if let Some(w) = raw_target {
+            let mut w = w.lock();
+            let (ox, oy) = w.client_origin();
+            w.push(Event::Pointer { x: x - ox, y: y - oy, buttons: r.left as u8 | (r.right as u8) << 1 | (r.middle as u8) << 2 });
+        }
         if r.wheel != 0 {
             match &over_window {
                 Some(w) => {

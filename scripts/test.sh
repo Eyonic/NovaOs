@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -152,16 +152,16 @@ define_case() {
                         "threads32: 7 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
         vfs)    # The file system Linux programs see (vfs.rs): symbolic and hard links, directories,
-                # rename, permissions, tmpfs at /run (userland/vfstest.c), and BusyBox tar and cp
-                # keeping symbolic links.
+                # rename, permissions, tmpfs at /run (userland/vfstest.c), named Unix sockets
+                # (userland/unixtest.c), and BusyBox tar and cp keeping symbolic links.
                 CMDLINE="nova.mode=shell"
                 [[ -x "$BUILD/busybox/busybox" ]] || SKIP="BusyBox not built (scripts/fetch-busybox.sh)"
-                INPUT=("wait:$PROMPT" "ser:vfstest" "wait:vfstest: " "wait:$PROMPT" "ser:sh" "sleep:1"
+                INPUT=("wait:$PROMPT" "ser:vfstest" "wait:vfstest: " "wait:$PROMPT" "ser:unixtest" "wait:unixtest: " "wait:$PROMPT" "ser:sh" "sleep:1"
                        "ser:mkdir /run/t && cd /run/t && echo hi > target && ln -s target l && ln -s ../t/target up"
                        "ser:tar cf /run/a.tar . && mkdir /run/x && cd /run/x && tar xf /run/a.tar && readlink l && cat up"
                        "wait:hi" "ser:cp -a /run/x /run/y && echo copied-\$(readlink /run/y/up)" "wait:copied-")
                 EXPECT=("${shell[@]}" "  ok   a link loop gives ELOOP" "  ok   tmpfs hard link: same inode, nlink 2"
-                        "  ok   3000 files in one directory" "vfstest: 43 passed, 0 failed" "target" "hi" "copied-../t/target")
+                        "  ok   3000 files in one directory" "vfstest: 43 passed, 0 failed" "  ok   SCM_RIGHTS over a named socket" "unixtest: 13 passed, 0 failed" "target" "hi" "copied-../t/target")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault" "can't") ;;
         containers) # Mount namespaces (vfs.rs): the host's unmodified bubblewrap, the container
                 # tool Steam's runtime uses, builds a read-only view of / with its own /dev,
@@ -180,6 +180,23 @@ define_case() {
                 EXPECT=("${shell[@]}" "in-container" "sh: line 0: can't create /etc/y: Read-only file system" "own-root"
                         "root-has-bin dev etc listing proc" "exit-status-3")
                 FORBID=("$PANIC" "$EXC" "NESTED" "unimplemented Linux syscall" "segmentation fault" "bwrap:") ;;
+        wayland) # Nova's Wayland compositor (wayland.rs), headless in shell mode: a libwayland
+                # client draws into shared memory and the compositor holds its pixels; then
+                # the host's unmodified Xwayland serves an Xlib client (the path X11 programs
+                # such as Steam take).
+                CMDLINE="nova.mode=shell"
+                [[ -x "$BUILD/busybox/busybox" ]] || SKIP="BusyBox not built (scripts/fetch-busybox.sh)"
+                [[ -x /usr/bin/Xwayland && -x /usr/bin/wayland-scanner && -f /usr/include/X11/Xlib.h ]] || SKIP="Xwayland, wayland-scanner or Xlib headers are not installed on this machine"
+                INPUT=("wait:$PROMPT" "ser:sh" "sleep:1" "ser:wltest" "wait:wltest: done"
+                       "ser:wltest 20 > /dev/null &" "sleep:2" "ser:exit" "wait:$PROMPT" "ser:wayland" "wait:toplevel"
+                       "ser:sh" "sleep:1" "ser:Xwayland :0 -shm -geometry 800x600 > /run/xw.log 2>&1 &" "sleep:5"
+                       "ser:DISPLAY=:0 xtest" "wait:xtest: done" "ser:exit" "wait:$PROMPT" "ser:wayland" "wait:Xwayland on")
+                EXPECT=("${shell[@]}" "wltest: connected, configured, keymap received, XRGB8888 offered"
+                        "wltest: buffer shown (320x240), frame callback done, buffer released"
+                        "xtest: connected to :0, screen 800x600, vendor The X.Org Foundation"
+                        "xtest: window mapped and exposed; pixels corner #22aa44 center #dd2222")
+                CONTAINS=('320x240 toplevel "wltest" center #ff8800' '800x600 toplevel "Xwayland on :0"')
+                FORBID=("$PANIC" "$EXC" "NESTED" "unimplemented Linux syscall" "segmentation fault" "Fatal server error") ;;
         busybox) # A Unix userland on Nova: BusyBox's shell runs pipelines, loops, subshells and
                 # command substitution, which fork, execve, wait and pipes underneath.
                 CMDLINE="nova.mode=shell"

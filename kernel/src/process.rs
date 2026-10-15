@@ -1500,7 +1500,7 @@ fn load_program(mem: &mut Memory, path: &str, elf: &[u8], is_static: bool, args:
     Ok((start, rsp))
 }
 
-const DEFAULT_ENV: [&str; 5] = ["HOME=/", "PATH=/bin", "TERM=xterm", "LANG=C.UTF-8", "USER=nova"];
+const DEFAULT_ENV: [&str; 7] = ["HOME=/", "PATH=/bin:/usr/bin", "TERM=xterm", "LANG=C.UTF-8", "USER=nova", "XDG_RUNTIME_DIR=/run/user/1000", "WAYLAND_DISPLAY=wayland-0"];
 
 fn run_with(path: &str, args: &[String], trace: bool, extra: Vec<(usize, crate::linux::FileRef)>, on_start: impl FnOnce(Arc<Process>)) -> Result<i32, String> {
     if task::current_user().is_some() {

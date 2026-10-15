@@ -28,7 +28,7 @@ const CAPACITY: usize = 512 * 1024;
 static WAITERS: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
-fn next_gen() -> u64 {
+pub fn next_gen() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -194,6 +194,79 @@ pub fn pipe() -> (End, End) {
 pub fn socketpair(kind: SockType) -> (End, End) {
     let (a, b) = (channel(), channel());
     (End { rx: Some(a.clone()), tx: Some(b.clone()), kind }, End { rx: Some(b), tx: Some(a), kind })
+}
+
+// ---------------------------------------------------------------------------
+// Named Unix sockets: a listening socket queues the server ends of new connections.
+
+pub struct Listener {
+    pub kind: SockType,
+    /// Server ends of connections not accepted yet.
+    pub queue: VecDeque<End>,
+    /// listen() was called (before that, connect gets ECONNREFUSED).
+    pub listening: bool,
+    pub backlog: usize,
+    pub generation: u64,
+    /// Registry key while bound.
+    pub key: alloc::string::String,
+}
+
+pub type ListenerRef = Arc<SpinLock<Listener>>;
+
+impl Listener {
+    pub fn poll(&self) -> (u32, u64) {
+        (if self.queue.is_empty() { 0 } else { POLLIN }, self.generation)
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let mut names = NAMES.lock();
+        if names.get(&self.key).is_some_and(|w| w.strong_count() == 0) {
+            names.remove(&self.key);
+        }
+    }
+}
+
+/// Bound socket addresses: abstract names as "@name", paths by file system and path.
+static NAMES: SpinLock<alloc::collections::BTreeMap<alloc::string::String, alloc::sync::Weak<SpinLock<Listener>>>> = SpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Bind a socket to `key`; Err(()) if the address is in use.
+pub fn bind_name(key: &str, kind: SockType) -> Result<ListenerRef, ()> {
+    let mut names = NAMES.lock();
+    if names.get(key).is_some_and(|w| w.strong_count() > 0) {
+        return Err(());
+    }
+    let l = Arc::new(SpinLock::new(Listener { kind, queue: VecDeque::new(), listening: false, backlog: 128, generation: next_gen(), key: key.into() }));
+    names.insert(key.into(), Arc::downgrade(&l));
+    Ok(l)
+}
+
+/// Forget the name (the socket file was removed): new connections fail.
+pub fn unbind_name(key: &str) {
+    NAMES.lock().remove(key);
+}
+
+/// Connect to the socket bound at `key`: the client's end, or the error number
+/// (ECONNREFUSED 111, EPROTOTYPE 91, EAGAIN 11 with a full backlog).
+pub fn connect_name(key: &str, kind: SockType) -> Result<End, i64> {
+    let l = NAMES.lock().get(key).and_then(|w| w.upgrade()).ok_or(111i64)?;
+    let mut l = l.lock();
+    if !l.listening {
+        return Err(111);
+    }
+    if l.kind != kind {
+        return Err(91);
+    }
+    if l.queue.len() >= l.backlog {
+        return Err(11);
+    }
+    let (client, server) = socketpair(kind);
+    l.queue.push_back(server);
+    l.generation = next_gen();
+    drop(l);
+    notify();
+    Ok(client)
 }
 
 // ---------------------------------------------------------------------------

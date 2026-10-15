@@ -986,6 +986,7 @@ impl Editor {
                 continue;
             };
             match e {
+                Event::RawKey { .. } | Event::Pointer { .. } | Event::PointerLeave => {}
                 Event::Close => {
                     if self.docs.iter().any(|d| d.dirty) {
                         // Keep unsaved work: save it before closing.

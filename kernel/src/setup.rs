@@ -214,6 +214,7 @@ pub fn run() -> ! {
     hardware();
     if cmdline_flag("nova.mode") == Some("shell") || crate::console::screen().is_none() {
         println!("[nova] starting shell");
+        crate::wayland::start(); // headless: no windows, the `wayland` command shows clients
         loop {
             crate::shell::run();
         }

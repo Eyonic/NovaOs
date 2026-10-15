@@ -538,6 +538,7 @@ fn run(name: &str, src: &str, win: WindowRef, w: i32, h: i32) {
         match event {
             None => app.call("tick", (), 0),
             Some(Event::Close) => return,
+            Some(Event::RawKey { .. } | Event::Pointer { .. } | Event::PointerLeave) => {}
             Some(Event::Key(k)) => app.call("key", (key_name(k),), 1),
             Some(Event::MouseDown { x, y, button }) => {
                 app.call(if button == 2 { "right_click" } else { "click" }, (x as INT, y as INT), 2);
