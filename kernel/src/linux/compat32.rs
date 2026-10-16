@@ -91,6 +91,12 @@ pub fn syscall32(f: &mut Frame32) -> i64 {
     let nr = f.rax & 0xFFFF_FFFF;
     let [a0, a1, a2, a3, a4, a5] = a(f);
     let trace = proc().trace.load(core::sync::atomic::Ordering::Relaxed);
+    if thread().seccomp.mode != seccomp::MODE_DISABLED
+        && let Some(r) = seccomp::check(f.rip, nr, [a0, a1, a2, a3, a4, a5], true)
+    {
+        thread().recent.push(0x1000 | nr, [a0, a1, a2], r);
+        return r;
+    }
     thread().in_syscall = 0x1000 | nr; // i386 numbers shown as 0x1000 + nr
     thread().syscall_arg = a0;
     thread().syscall_arg2 = a1;
@@ -845,7 +851,11 @@ fn push_frame(f: &mut Frame32, sig: u32, sender: u32, to_thread: bool, action: &
     write_user(frame, &alloc::vec![0u8; size as usize])?;
     if rt {
         put_words(frame, &[ret, sig, (frame + RT_INFO) as u32, (frame + RT_UC) as u32])?;
-        put_words(frame + RT_INFO, &[sig, 0, if to_thread { -6i32 as u32 } else { 0 }, sender, 0])?;
+        match signal::sigsys_info(t, sig, to_thread) {
+            // _sigsys: si_errno = filter data, SYS_SECCOMP, call address, number, arch.
+            Some(i) => put_words(frame + RT_INFO, &[sig, i.errno, seccomp::SYS_SECCOMP, i.call_addr as u32, i.syscall, i.arch])?,
+            None => put_words(frame + RT_INFO, &[sig, 0, if to_thread { -6i32 as u32 } else { 0 }, sender, 0])?,
+        }
         let stack_flags = if use_alt { t.altstack.2 } else { 2 };
         put_words(frame + RT_UC, &[0, 0, t.altstack.0 as u32, stack_flags, t.altstack.1 as u32])?;
         put_words(frame + RT_MCONTEXT, &sc)?;

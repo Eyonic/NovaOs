@@ -448,6 +448,12 @@ pub struct UserState {
     pub phase: &'static str,
     /// set_robust_list head.
     pub robust_list: u64,
+    /// prctl(PR_SET_NO_NEW_PRIVS); inherited, never cleared.
+    pub no_new_privs: bool,
+    /// seccomp mode and filters (linux/seccomp.rs); inherited and kept across execve.
+    pub seccomp: crate::linux::seccomp::State,
+    /// siginfo for the SIGSYS a seccomp trap queued.
+    pub sigsys: Option<crate::linux::seccomp::Sigsys>,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -1156,7 +1162,7 @@ pub fn terminate(p: &Process, sig: u32) {
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, comm: String::new(), recent: Recent::default(), in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0 })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, comm: String::new(), recent: Recent::default(), in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0, no_new_privs: false, seccomp: Default::default(), sigsys: None })
     }
 }
 
@@ -1983,6 +1989,7 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     let (fs, sigmask, altstack) = (tls.unwrap_or(me.fs_base), me.sigmask, me.altstack);
     let (compat, tls32, sel) = (me.compat, me.tls, current_fs_gs(me));
     let robust = me.robust_list;
+    let (nnp, seccomp) = (me.no_new_privs, me.seccomp.clone());
     let pid = child.pid;
     let name = format!("{}[{pid}]", child.name);
     let c = child.clone();
@@ -1995,6 +2002,8 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
             t.compat = compat;
             t.tls = tls32;
             t.robust_list = robust; // the child's thread keeps its robust list (fork)
+            t.no_new_privs = nnp;
+            t.seccomp = seccomp;
             (t.user_fs, t.user_gs) = sel;
         }, |_| {});
     });
@@ -2123,6 +2132,7 @@ pub fn spawn_thread32(parent: &SyscallFrame, stack: u64, tls: [u64; gdt::TLS_ENT
         regs.rsp = stack;
     }
     let (fs, gs) = current_fs_gs(me);
+    let (sigmask, nnp, seccomp) = (me.sigmask, me.no_new_privs, me.seccomp.clone());
     process.threads.fetch_add(1, Ordering::SeqCst);
     let name = format!("{}:{tid}", process.name);
     task::spawn_with_tty(&name, task::current_tty(), move || {
@@ -2132,6 +2142,10 @@ pub fn spawn_thread32(parent: &SyscallFrame, stack: u64, tls: [u64; gdt::TLS_ENT
         thread.user_fs = fs;
         thread.user_gs = gs;
         thread.clear_tid = clear_tid;
+        // As on Linux, a new thread starts with its creator's signal mask and seccomp state.
+        thread.sigmask = sigmask;
+        thread.no_new_privs = nnp;
+        thread.seccomp = seccomp;
         thread.kernel_rsp = kernel_stack_here();
         task::set_user(Some(thread));
         let ctx = &raw mut task::current_user().unwrap().exit_ctx;
@@ -2153,12 +2167,17 @@ pub fn spawn_thread(parent: &SyscallFrame, stack: u64, tls: Option<u64>, clear_t
         regs.rsp = stack;
     }
     let fs = tls.unwrap_or(me.fs_base);
+    let (sigmask, nnp, seccomp) = (me.sigmask, me.no_new_privs, me.seccomp.clone());
     process.threads.fetch_add(1, Ordering::SeqCst);
     let name = format!("{}:{tid}", process.name);
     task::spawn_with_tty(&name, task::current_tty(), move || {
         let mut thread = UserState::new_thread(process.clone(), tid);
         thread.fs_base = fs;
         thread.clear_tid = clear_tid;
+        // As on Linux, a new thread starts with its creator's signal mask and seccomp state.
+        thread.sigmask = sigmask;
+        thread.no_new_privs = nnp;
+        thread.seccomp = seccomp;
         thread.kernel_rsp = kernel_stack_here();
         task::set_user(Some(thread));
         let ctx = &raw mut task::current_user().unwrap().exit_ctx;

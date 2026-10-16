@@ -29,6 +29,7 @@ use crate::gdt;
 use crate::vfs;
 
 pub mod compat32;
+pub mod seccomp;
 pub mod sysv;
 use crate::sync::SpinLock;
 use crate::{ipc, pit, rand, rtc, task};
@@ -792,10 +793,11 @@ fn proc_file(name: &str) -> Option<String> {
     Some(match name.as_str() {
         "proc/self/maps" => mem().maps(),
         "proc/self/status" => format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t{pp}\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t{pp}\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n{}",
             proc().name,
             proc().threads.load(core::sync::atomic::Ordering::Relaxed),
             used / 1024,
+            seccomp_status(proc().pid),
             p = proc().pid,
             pp = proc().parent.load(core::sync::atomic::Ordering::Relaxed),
             u = { let c = proc().cred.lock(); c.show(c.uid, false) },
@@ -872,7 +874,8 @@ fn proc_pid_file(p: &Process, file: &str) -> Option<String> {
     Some(match file {
         "stat" => format!("{} ({comm}) R {ppid} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 0 0\n", p.pid, p.pid, p.pid),
         "status" => format!(
-            "Name:\t{comm}\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nThreads:\t{threads}\nVmRSS:\t0 kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            "Name:\t{comm}\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nThreads:\t{threads}\nVmRSS:\t0 kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n{}",
+            seccomp_status(p.pid),
             pid = p.pid
         ),
         "cmdline" => {
@@ -882,6 +885,21 @@ fn proc_pid_file(p: &Process, file: &str) -> Option<String> {
         "comm" => format!("{comm}\n"),
         _ => return None,
     })
+}
+
+/// status's NoNewPrivs/Seccomp lines: the calling thread's for its own process, the
+/// main thread's for another.
+fn seccomp_status(pid: u64) -> String {
+    if pid == proc().pid {
+        return seccomp::status_lines(thread().no_new_privs, &thread().seccomp);
+    }
+    let mut out = None;
+    task::each_thread(pid, |t| {
+        if out.is_none() || t.tid == pid {
+            out = Some(seccomp::status_lines(t.no_new_privs, &t.seccomp));
+        }
+    });
+    out.unwrap_or_default()
 }
 
 fn proc_norm(rel: &str) -> String {
@@ -1756,6 +1774,12 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     let (nr, a0, a1, a2, a3, a4, a5) = (f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let trace = proc().trace.load(core::sync::atomic::Ordering::Relaxed);
     let tid = thread().tid;
+    if thread().seccomp.mode != seccomp::MODE_DISABLED
+        && let Some(r) = seccomp::check(f.rip, nr, [a0, a1, a2, a3, a4, a5], false)
+    {
+        thread().recent.push(nr, [a0, a1, a2], r);
+        return r;
+    }
     thread().in_syscall = nr;
     thread().syscall_arg = a0;
     thread().syscall_arg2 = a1;
@@ -1813,7 +1837,7 @@ fn syscall_name(nr: u64) -> String {
  39 => "getpid", 40 => "sendfile", 57 => "fork", 58 => "vfork", 59 => "execve", 61 => "wait4", 62 => "kill", 77 => "ftruncate", 87 => "unlink", 84 => "rmdir", 88 => "symlink", 266 => "symlinkat", 86 => "link", 265 => "linkat", 280 => "utimensat", 76 => "truncate", 90 => "chmod", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
         42 => "connect", 49 => "bind", 53 => "socketpair", 307 => "sendmmsg", 56 => "clone", 60 => "exit", 63 => "uname", 72 => "fcntl", 79 => "getcwd",
         89 => "readlink", 96 => "gettimeofday", 97 => "getrlimit", 99 => "sysinfo", 137 => "statfs", 138 => "fstatfs",
-        157 => "prctl", 158 => "arch_prctl", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
+        157 => "prctl", 158 => "arch_prctl", 317 => "seccomp", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
         213 => "epoll_create", 217 => "getdents64", 218 => "set_tid_address", 228 => "clock_gettime",
         231 => "exit_group", 232 => "epoll_wait", 233 => "epoll_ctl", 257 => "openat", 262 => "newfstatat",
         273 => "set_robust_list", 332 => "statx", 281 => "epoll_pwait", 284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1",
@@ -3215,8 +3239,19 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 // prctl
                 3 => 1,                                     // PR_GET_DUMPABLE
                 23 => if a1 <= CAP_LAST { 1 } else { return Err(EINVAL) }, // PR_CAPBSET_READ
-                21 | 22 | 24 | 47 => 0,                     // PR_GET/SET_SECCOMP, PR_CAPBSET_DROP, PR_CAP_AMBIENT
-                1 | 4 | 8 | 36 | 38 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, CHILD_SUBREAPER, NO_NEW_PRIVS, SET_VMA
+                24 | 47 => 0,                               // PR_CAPBSET_DROP, PR_CAP_AMBIENT
+                1 | 4 | 8 | 36 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, CHILD_SUBREAPER, SET_VMA
+                21 => thread().seccomp.mode as i64,         // PR_GET_SECCOMP
+                22 => seccomp::prctl_set(a1, a2)?,          // PR_SET_SECCOMP
+                38 => {
+                    // PR_SET_NO_NEW_PRIVS: one way only
+                    if a1 != 1 || a2 | a3 | a4 != 0 {
+                        return Err(EINVAL);
+                    }
+                    thread().no_new_privs = true;
+                    0
+                }
+                39 => if a1 | a2 | a3 | a4 != 0 { return Err(EINVAL) } else { thread().no_new_privs as i64 }, // PR_GET_NO_NEW_PRIVS
                 15 => {
                     // PR_SET_NAME: the thread's name (up to 15 bytes)
                     let mut n = read_cstr(a1).unwrap_or_default();
@@ -3235,6 +3270,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 _ => return Err(EINVAL),
             },
+            317 => seccomp::seccomp(a0, a1, a2)?,
             95 => 0o022,                   // umask
             96 => {
                 // gettimeofday
