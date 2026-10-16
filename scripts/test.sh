@@ -13,6 +13,8 @@
 #   scripts/test.sh --panic           same as --case panic
 #   scripts/test.sh --no-build        reuse the existing kernel build
 #   TIMEOUT=60 scripts/test.sh        boot timeout per case in seconds (default 30)
+#   NOVA_SMP=1 scripts/test.sh        QEMU with one CPU (default 4, see scripts/common.sh)
+#   NOVA_TEST_CMDLINE="nova.cpus=1" scripts/test.sh   append to every case's kernel command line
 #
 # Exit status: 0 = all selected cases passed, 1 = a build or VM check failed.
 source "$(dirname "$0")/common.sh"
@@ -28,7 +30,10 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 smp vfs containers wayland busybox net linuxnet linuxmsi usbinput audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+# CPUs the guest should use: QEMU's (NOVA_SMP), or fewer with nova.cpus=N.
+SMP_CPUS=${NOVA_SMP:-4}
+if [[ "${NOVA_TEST_CMDLINE:-}" =~ nova\.cpus=([0-9]+) ]] && (( BASH_REMATCH[1] < SMP_CPUS )); then SMP_CPUS=${BASH_REMATCH[1]}; fi
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -150,6 +155,15 @@ define_case() {
                         "Hello from a dynamically linked 32-bit program! sqrt(2) = 1.414214"
                         "proctest: 15 passed, 0 failed" "  ok   each thread has its own __thread variable"
                         "threads32: 7 passed, 0 failed")
+                FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
+        smp)    # Several CPUs (QEMU -smp, scripts/common.sh): every CPU-count source agrees, busy
+                # threads run in parallel on all CPUs, contended futexes, and mmap/munmap from
+                # many threads with a reader on another CPU (TLB shootdown) (userland/smptest.c).
+                CMDLINE="nova.mode=shell"; CASE_TIMEOUT=$(( TIMEOUT > 60 ? TIMEOUT : 60 ))
+                INPUT=("wait:$PROMPT" "ser:smptest $SMP_CPUS" "wait:failed")
+                EXPECT=("${shell[@]}" "smptest: $SMP_CPUS CPUs (sysconf online $SMP_CPUS, configured $SMP_CPUS, get_nprocs $SMP_CPUS, affinity $SMP_CPUS, /proc/cpuinfo $SMP_CPUS)"
+                        "smptest: $(( SMP_CPUS > 1 ? 9 : 6 )) passed, 0 failed")
+                CONTAINS=("[nova] smp: $SMP_CPUS of ")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
         vfs)    # The file system Linux programs see (vfs.rs): symbolic and hard links, directories,
                 # rename, permissions, tmpfs at /run (userland/vfstest.c), named Unix sockets
@@ -435,7 +449,7 @@ run_case() {
         [[ -f "$BOOT_IMAGE" ]] || { echo "  $BOOT_IMAGE missing: run the setup case first (--case setup --case $name)"; return 1; }
         image="$BOOT_IMAGE"
     else
-        IMAGE="$image" "$ROOT/scripts/mkimage.sh" "$image" "$CMDLINE" >/dev/null || { echo "  image build failed"; return 1; }
+        IMAGE="$image" "$ROOT/scripts/mkimage.sh" "$image" "$CMDLINE${NOVA_TEST_CMDLINE:+ $NOVA_TEST_CMDLINE}" >/dev/null || { echo "  image build failed"; return 1; }
     fi
     if [[ -n "$FRESH_TARGET" ]]; then
         rm -f "${run_dir:-}/$FRESH_TARGET"

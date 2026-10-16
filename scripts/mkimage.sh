@@ -63,6 +63,7 @@ if [[ "${NOVA_BOOT_MENU:-0}" == 1 ]]; then
         entry "Nova (safe graphics: GPU driver without display takeover)" "${cmdline:+$cmdline }amdgpu.dc=0"
         entry "Nova" "$cmdline"
         entry "Nova (no GPU driver)" "${cmdline:+$cmdline }nova.disable_driver=amdgpu"
+        entry "Nova (safe graphics, one CPU)" "${cmdline:+$cmdline }amdgpu.dc=0 nova.cpus=1"
     } >"$conf"
 else
     { grep -v '^/\|^[[:space:]]' "$ROOT/boot/limine.conf"; entry "Project Nova" "$cmdline"; } >"$conf"
