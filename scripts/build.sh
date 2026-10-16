@@ -200,6 +200,23 @@ if [[ ",${FEATURES:-}," == *,linux-drivers,* && -d /usr/lib/firmware/rtl_nic ]];
     done
     log "Including Realtek NIC firmware ($(ls "$SYSROOT/usr/lib/firmware/rtl_nic" | wc -l) files)"
 fi
+# amdgpu's firmware for the GPUs Nova is brought up on: sienna_cichlid (Navi 21: RX 6800,
+# 6800 XT, 6900 XT) and navy_flounder (Navi 22: RX 6700 XT). Override with
+# NOVA_AMDGPU_FIRMWARE="name ...". Symbolic links (shared images) are followed.
+if [[ ",${FEATURES:-}," == *,linux-drivers,* && -d /usr/lib/firmware/amdgpu ]]; then
+    mkdir -p "$SYSROOT/usr/lib/firmware/amdgpu"
+    for chip in ${NOVA_AMDGPU_FIRMWARE:-sienna_cichlid navy_flounder}; do
+        for f in /usr/lib/firmware/amdgpu/"$chip"_*; do
+            [[ -e "$f" ]] || continue
+            case "$f" in
+                *.zst) zstd -qdcf "$f" > "$SYSROOT/usr/lib/firmware/amdgpu/$(basename "${f%.zst}")" ;;
+                *.xz) xz -dc "$f" > "$SYSROOT/usr/lib/firmware/amdgpu/$(basename "${f%.xz}")" ;;
+                *) cp -L "$f" "$SYSROOT/usr/lib/firmware/amdgpu/" ;;
+            esac
+        done
+    done
+    log "Including amdgpu firmware ($(ls "$SYSROOT/usr/lib/firmware/amdgpu" | wc -l) files: ${NOVA_AMDGPU_FIRMWARE:-sienna_cichlid navy_flounder})"
+fi
 
 # PulseAudio clients (Steam): each connection reserves a shared memory pool (64 MiB by
 # default), which Nova's server never uses (audio comes over the socket), and Steam's
