@@ -4,7 +4,7 @@
  * framebuffer description, power supplies, perf PMUs, taint and emergency power paths.
  *
  * Each is an interface to a Linux subsystem Nova does not have (the CEC core, sysfb,
- * the power-supply class, perf events, reboot notifiers). The functions report what a
+ * the power-supply class, perf events, reboot notifiers, configfs). The functions report what a
  * Linux kernel built without that subsystem would, so the drivers take their "feature
  * absent" paths.
  */
@@ -17,6 +17,7 @@
 #include <linux/perf_event.h>
 #include <linux/sysfb.h>
 #include <linux/string.h>
+#include <linux/configfs.h>
 #include <media/cec.h>
 #include <media/cec-notifier.h>
 #include <asm/video.h>
@@ -98,4 +99,32 @@ void emergency_restart(void)
 void orderly_poweroff(bool force)
 {
 	pr_emerg("lx_emul: a driver requested a power-off (overheating?); ignored\n");
+}
+
+/* ---------------------------------------------------------------- configfs */
+
+/* No configfs mount: vkms's configuration directory is never seen, so the subsystem is
+ * accepted and nothing in it is ever created (vkms still makes its default device). */
+void config_group_init(struct config_group *group)
+{
+	kref_init(&group->cg_item.ci_kref);
+	INIT_LIST_HEAD(&group->cg_item.ci_entry);
+	INIT_LIST_HEAD(&group->cg_children);
+	INIT_LIST_HEAD(&group->default_groups);
+}
+
+void config_group_init_type_name(struct config_group *group, const char *name,
+				 const struct config_item_type *type)
+{
+	group->cg_item.ci_type = type;
+	config_group_init(group);
+}
+
+int configfs_register_subsystem(struct configfs_subsystem *subsys)
+{
+	return 0;
+}
+
+void configfs_unregister_subsystem(struct configfs_subsystem *subsys)
+{
 }

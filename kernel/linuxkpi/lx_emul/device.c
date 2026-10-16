@@ -27,6 +27,7 @@
 #include <linux/property.h>
 #include <linux/sysfs.h>
 #include <linux/hwmon.h>
+#include <linux/device/faux.h>
 #include "nova.h"
 
 struct device_private {
@@ -1025,4 +1026,98 @@ bool device_property_present(const struct device *dev, const char *propname)
 bool fwnode_device_is_available(const struct fwnode_handle *fwnode)
 {
 	return !IS_ERR_OR_NULL(fwnode);
+}
+
+/* ---------------------------------------------------------------- the faux bus */
+
+/*
+ * Faux devices stand for drivers with no hardware behind them (vgem, vkms). The
+ * software DRM drivers among them would make a real machine look as if it had another
+ * GPU and display, so their devices are created only when the kernel command line asks
+ * for them (nova.vgem=1, nova.vkms=1); without that the driver's init fails with
+ * -ENODEV and nothing appears.
+ */
+static const struct bus_type lx_faux_bus = { .name = "faux" };
+
+static const char *const lx_faux_on_request[] = { "vgem", "vkms" };
+
+static bool lx_cmdline_flag(const char *word)
+{
+	size_t len, n = strlen(word);
+	const char *p = nova_cmdline(&len), *end = p + len;
+
+	while (p < end) {
+		const char *e = memchr(p, ' ', end - p) ?: end;
+
+		if (e - p == n + 2 && !memcmp(p, word, n) && p[n] == '=' && p[n + 1] == '1')
+			return true;
+		p = e + 1;
+	}
+	return false;
+}
+
+struct lx_faux {
+	struct faux_device faux_dev;
+	const struct faux_device_ops *ops;
+};
+
+static void lx_faux_release(struct device *dev)
+{
+	kfree(container_of(dev, struct lx_faux, faux_dev.dev));
+}
+
+struct faux_device *faux_device_create_with_groups(const char *name, struct device *parent,
+						   const struct faux_device_ops *faux_ops,
+						   const struct attribute_group **groups)
+{
+	struct lx_faux *f;
+	char flag[32];
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(lx_faux_on_request); i++) {
+		if (strcmp(name, lx_faux_on_request[i]))
+			continue;
+		snprintf(flag, sizeof(flag), "nova.%s", name);
+		if (!lx_cmdline_flag(flag))
+			return NULL;
+	}
+	f = kzalloc(sizeof(*f), GFP_KERNEL);
+	if (!f)
+		return NULL;
+	f->ops = faux_ops;
+	device_initialize(&f->faux_dev.dev);
+	f->faux_dev.dev.release = lx_faux_release;
+	f->faux_dev.dev.parent = parent;
+	f->faux_dev.dev.bus = &lx_faux_bus;
+	dev_set_name(&f->faux_dev.dev, "%s", name);
+	if (device_add(&f->faux_dev.dev)) {
+		put_device(&f->faux_dev.dev);
+		return NULL;
+	}
+	/* Linux's faux driver binds every faux device and runs the ops' probe. */
+	if (faux_ops && faux_ops->probe && faux_ops->probe(&f->faux_dev)) {
+		device_del(&f->faux_dev.dev);
+		put_device(&f->faux_dev.dev);
+		return NULL;
+	}
+	return &f->faux_dev;
+}
+
+struct faux_device *faux_device_create(const char *name, struct device *parent,
+				       const struct faux_device_ops *faux_ops)
+{
+	return faux_device_create_with_groups(name, parent, faux_ops, NULL);
+}
+
+void faux_device_destroy(struct faux_device *faux_dev)
+{
+	struct lx_faux *f;
+
+	if (!faux_dev)
+		return;
+	f = container_of(faux_dev, struct lx_faux, faux_dev);
+	if (f->ops && f->ops->remove)
+		f->ops->remove(faux_dev);
+	device_del(&faux_dev->dev);
+	put_device(&faux_dev->dev);
 }
