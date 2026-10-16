@@ -41,6 +41,7 @@ calls. (The sign-in QR code is blurred.)*
 | Assistant | Nova Assistant on DeepSeek (or Claude Code on Anthropic); sign-in from the host's key or Anthropic CLI login, streaming agent loop with tools (files, shell, HTTP, hardware, web search), app creation with screenshot checks |
 | Apps | Rhai scripts with a drawing API (including PNG images); the assistant designs them with a generated mockup, builds them with generated artwork, and they appear on Home |
 | Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory; processes (fork, vfork, posix_spawn, execve with `#!` scripts, wait) and signals (handlers, masks, kill, SIGCHLD); with BusyBox, a Unix shell and ~400 tools (`sh`, then pipelines, loops, `tar`, `awk`, ...). A real file-system view for them: symbolic and hard links, permissions, tmpfs at `/run` and `/home` without NovaFS's size limits, and mount namespaces with bind mounts and `pivot_root`, so container tools (bubblewrap, which Steam's runtime uses) work. 32-bit (i386) Linux programs run too, in compatibility mode (`int 0x80`, TLS descriptors, `ld-linux.so.2`), as Steam's bootstrap needs. GUI programs get a Wayland compositor (each window becomes a Nova window), and X11 programs a display through Xwayland. Valve's Steam client runs on it up to the sign-in window: the launcher downloads and installs the client, then the 32-bit client starts its Chromium-based web helper (zygote, GPU, network, storage and renderer processes), which draws Steam's UI through Xwayland. Supporting pieces: loopback TCP, `SCM_CREDENTIALS`, a built-in PulseAudio-protocol server that plays programs' sound through the HD Audio driver, `/proc/<pid>` identity files and an `lsof` for Steam's connection check |
+| Office and creative apps | Optional (`NOVA_CRAFT=1 scripts/build.sh`): the Craft App Suite's unmodified Linux release builds (Rust, egui) on Nova's Wayland compositor with Mesa's software renderer: WordCraft (.docx), GridCraft (.xlsx), DeckCraft (.pptx), PdfCraft and PhotoCraft, in Home's Office & Creative row, and Files opens documents with them ([docs/craft-apps.md](docs/craft-apps.md)) |
 | Browser | Nova Browser: the Chromium engine (rendering, JavaScript, TLS) driven by a Rust shell with Shields (ad/tracker blocking, HTTPS upgrades, tracking-parameter removal) |
 
 ## Quick start
@@ -51,6 +52,7 @@ scripts/fetch-chromium.sh  # optional: the browser engine (about 100 MB download
 scripts/fetch-filters.sh   # optional: EasyList + EasyPrivacy for Shields (recommended)
 scripts/fetch-linux.sh     # optional: Linux source for FEATURES=linux-drivers (docs/linux-drivers.md)
 scripts/fetch-busybox.sh   # optional: BusyBox, a Unix userland (sh, coreutils, tar, ...) in bin/
+                           # optional: NOVA_CRAFT=1 on build.sh adds the Craft office apps (docs/craft-apps.md)
 scripts/build.sh           # kernel, user programs, build/nova.img
 scripts/run.sh             # boot like a real machine: installer image + empty 2 GiB disk
 ```

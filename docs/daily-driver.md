@@ -18,13 +18,13 @@ Priorities are DeepSeek's: *must*, *should*, *nice*.
 | Task manager | must | Have | System Monitor |
 | Settings | must | Have | Settings |
 | Screenshot tool | must | Partial | only the shell's `wayland save`; needs a Print Screen key and a capture UI |
-| PDF viewer | must | Missing | the browser's Chromium engine could show PDFs (pdfium) |
-| Image viewer | must | Missing | Nova decodes PNG only; needs JPEG/WebP, then a viewer app |
+| PDF viewer | must | Have | PdfCraft (Craft App Suite, `NOVA_CRAFT=1`, see [craft-apps.md](craft-apps.md)) |
+| Image viewer | must | Partial | PhotoCraft opens PNG, JPEG, WebP, PSD... (`NOVA_CRAFT=1`); no light viewer app |
 | Video player | must | Missing | needs codecs (below) and a player; mpv runs on Linux ABIs |
 | Calculator | must | Missing | small native app |
 | Archive manager | must | Partial | BusyBox `tar`, `unzip`, `gzip` in the terminal; no app |
 | Software store / updates | must | Missing | installing Linux apps (Flatpak) and updating Nova itself |
-| Office suite | must | Missing | LibreOffice (Linux build) once the GPU, multi-core and file pieces are in; web office in the browser |
+| Office suite | must | Have | WordCraft, GridCraft, DeckCraft (Craft App Suite, `NOVA_CRAFT=1`): .docx, .xlsx, .pptx; software rendering, no clipboard with other programs yet |
 | Music player | should | Missing | |
 | Screen recorder | should | Missing | |
 | Calendar, clock/alarms, notes | should | Missing | small native apps |
