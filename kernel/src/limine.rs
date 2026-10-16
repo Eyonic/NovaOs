@@ -330,6 +330,46 @@ impl Request<RsdpResponse> {
 #[unsafe(link_section = ".limine_requests")]
 pub static RSDP: Request<RsdpResponse> = Request::new([0xc5e77b6b397e7b43, 0x27637845accdcf3c]);
 
+/// One processor, as Limine's MP response describes it. Limine starts every application
+/// processor before the kernel runs and parks it until `goto_address` is written; the AP
+/// then jumps there in long mode, on the BSP's page tables, with RDI = this struct.
+#[repr(C)]
+pub struct MpInfo {
+    pub processor_id: u32,
+    pub lapic_id: u32,
+    reserved: u64,
+    pub goto_address: core::sync::atomic::AtomicU64,
+    pub extra_argument: core::sync::atomic::AtomicU64,
+}
+
+#[repr(C)]
+pub struct MpResponse {
+    revision: u64,
+    flags: u32,
+    pub bsp_lapic_id: u32,
+    cpu_count: u64,
+    cpus: *const *const MpInfo,
+}
+
+impl MpResponse {
+    pub fn cpus(&self) -> impl Iterator<Item = &'static MpInfo> {
+        let (ptr, count) = (self.cpus, self.cpu_count as usize);
+        // SAFETY: Limine provides `count` valid pointers in reclaimable memory.
+        (0..count).filter_map(move |i| unsafe { (*ptr.add(i)).as_ref() })
+    }
+}
+
+impl Request<MpResponse, u64> {
+    pub fn get(&self) -> Option<&'static MpResponse> {
+        self.response()
+    }
+}
+
+/// Multiprocessor request (flags 0: xAPIC mode, which Nova's apic.rs uses).
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+pub static MP: Request<MpResponse, u64> = Request::with_extra([0x95a67b819a1b857e, 0xa0b61b723b6a73e0], 0);
+
 /// Stack for kmain. Limine's default (64 KiB) is too small for TLS and the script engine.
 pub const KERNEL_STACK_SIZE: u64 = 1024 * 1024;
 

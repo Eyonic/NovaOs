@@ -71,11 +71,13 @@ pub fn as_syscall_frame(f: &Frame32) -> SyscallFrame {
 extern "C" fn int80_dispatch(f: &mut Frame32) {
     // SAFETY: re-enable interrupts: system calls may block and let other tasks run.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+    crate::smp::lock();
     process::check_exiting();
     let r = syscall32(f);
     f.rax = r as i32 as u32 as u64;
     process::check_exiting();
     deliver_signals(f);
+    process::leave_kernel();
 }
 
 fn a(f: &Frame32) -> [u64; 6] {

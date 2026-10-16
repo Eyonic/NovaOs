@@ -9,12 +9,17 @@
 //! References: Intel SDM Vol. 3A, chapters "Protected-Mode Memory Management"
 //! (segment descriptors), "Task Management" (64-bit TSS layout), "Interrupt and
 //! Exception Handling" (Interrupt Stack Table); AMD APM Vol. 2 (long-mode TSS).
+//!
+//! Every CPU has its own GDT (the 32-bit TLS entries belong to the thread running there)
+//! and its own TSS (kernel stack, #DF stack). CPU n's TSS descriptor sits at entry
+//! 16 + 2n, so `str` (the TSS selector) tells code which CPU it runs on (smp::id).
 
 use core::arch::asm;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::bootcell::BootCell;
+use crate::smp::MAX_CPUS;
 
 pub const KERNEL_CODE: u16 = 0x08;
 pub const KERNEL_DATA: u16 = 0x10;
@@ -23,7 +28,9 @@ pub const KERNEL_DATA: u16 = 0x10;
 pub const USER_CODE32: u16 = 0x18 | 3;
 pub const USER_DATA: u16 = 0x20 | 3;
 pub const USER_CODE: u16 = 0x28 | 3;
-const TSS_SELECTOR: u16 = 0x30;
+/// Selector of CPU 0's TSS; CPU n's is this + 16 * n.
+pub const TSS_SELECTOR_BASE: u16 = (TSS_FIRST * 8) as u16;
+const TSS_FIRST: usize = 16;
 /// Thread-local storage descriptors for 32-bit programs (set_thread_area), entries 12-14
 /// as on Linux: glibc's i386 TLS lives in %gs = 0x63.
 pub const TLS_FIRST: usize = 12;
@@ -68,36 +75,38 @@ const USER_CODE32_DESCRIPTOR: u64 = 0x00CF_FA00_0000_FFFF;
 /// Access byte for an available 64-bit TSS: present, DPL0, type 0b1001.
 const TSS_ACCESS: u64 = 0x89;
 
-/// null, kernel code, kernel data, user code 32, user data, user code 64, TSS (16-byte system
-/// descriptor = 2 slots), unused, TLS 12-14.
-const GDT_ENTRIES: usize = TLS_FIRST + TLS_ENTRIES;
-static GDT: BootCell<[u64; GDT_ENTRIES]> = BootCell::new([0; GDT_ENTRIES]);
-static TSS: BootCell<Tss> = BootCell::new(Tss {
-    _reserved0: 0,
-    rsp: [0; 3],
-    _reserved1: 0,
-    ist: [0; 7],
-    _reserved2: 0,
-    _reserved3: 0,
-    iomap_base: 0,
-});
-static DOUBLE_FAULT_STACK: BootCell<Stack> = BootCell::new(Stack([0; IST_STACK_SIZE]));
-static LOADED: AtomicBool = AtomicBool::new(false);
+/// null, kernel code, kernel data, user code 32, user data, user code 64, unused, TLS 12-14,
+/// unused, then one TSS slot pair (16-byte system descriptor) per CPU.
+const GDT_ENTRIES: usize = TSS_FIRST + 2 * MAX_CPUS;
+const _: () = assert!(TLS_FIRST + TLS_ENTRIES <= TSS_FIRST);
+static GDT: BootCell<[[u64; GDT_ENTRIES]; MAX_CPUS]> = BootCell::new([[0; GDT_ENTRIES]; MAX_CPUS]);
+const EMPTY_TSS: Tss = Tss { _reserved0: 0, rsp: [0; 3], _reserved1: 0, ist: [0; 7], _reserved2: 0, _reserved3: 0, iomap_base: 0 };
+static TSS: BootCell<[Tss; MAX_CPUS]> = BootCell::new([EMPTY_TSS; MAX_CPUS]);
+static DOUBLE_FAULT_STACK: BootCell<[Stack; MAX_CPUS]> = BootCell::new([const { Stack([0; IST_STACK_SIZE]) }; MAX_CPUS]);
+static LOADED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
 
-/// Build and load the GDT and TSS, then reload every segment register.
-///
-/// Must run once, on the boot CPU, with interrupts disabled (Limine guarantees IF=0).
+/// The boot CPU's GDT and TSS (see [`init_cpu`]).
 pub fn init() {
-    // `ltr` on an already-busy TSS would #GP; make a second call a clear panic instead.
-    assert!(!LOADED.swap(true, Ordering::SeqCst), "gdt::init called twice");
+    init_cpu(0);
+}
 
-    let ist_top = DOUBLE_FAULT_STACK.get() as u64 + IST_STACK_SIZE as u64; // 16-byte aligned
-    let tss = TSS.get();
+/// Build and load CPU `cpu`'s GDT and TSS, then reload every segment register.
+///
+/// Runs once per CPU, on that CPU, with interrupts disabled (Limine starts the BSP and the
+/// APs with IF=0). Each CPU only ever writes its own tables.
+pub fn init_cpu(cpu: usize) {
+    // `ltr` on an already-busy TSS would #GP; make a second call a clear panic instead.
+    assert!(!LOADED[cpu].swap(true, Ordering::SeqCst), "gdt::init_cpu called twice");
+
+    // SAFETY: in bounds; the stack is only used by this CPU's #DF gate.
+    let ist_top = unsafe { (&raw mut (*DOUBLE_FAULT_STACK.get())[cpu]) as u64 } + IST_STACK_SIZE as u64; // 16-byte aligned
+    // SAFETY: in bounds; only this CPU touches its TSS.
+    let tss = unsafe { &raw mut (*TSS.get())[cpu] };
     // SAFETY: init runs once before the TSS is loaded; nothing else references it yet.
     unsafe {
         tss.write(Tss {
             _reserved0: 0,
-            rsp: [0; 3], // only used on privilege changes; Nova has no user mode
+            rsp: [0; 3], // RSP0: set on every switch to a user thread (set_kernel_stack)
             _reserved1: 0,
             ist: [ist_top, 0, 0, 0, 0, 0, 0], // IST1 = #DF stack
             _reserved2: 0,
@@ -115,13 +124,17 @@ pub fn init() {
         | (((base >> 24) & 0xFF) << 56);
     let tss_high = base >> 32;
 
-    let gdt = GDT.get();
-    // SAFETY: as above; the GDT is not loaded yet.
+    // SAFETY: in bounds; this CPU's GDT is not loaded yet.
+    let gdt = unsafe { &raw mut (*GDT.get())[cpu] };
+    // SAFETY: as above.
     unsafe {
         let mut table = [0u64; GDT_ENTRIES];
-        table[..8].copy_from_slice(&[0, CODE_DESCRIPTOR, DATA_DESCRIPTOR, USER_CODE32_DESCRIPTOR, USER_DATA_DESCRIPTOR, USER_CODE_DESCRIPTOR, tss_low, tss_high]);
+        table[..6].copy_from_slice(&[0, CODE_DESCRIPTOR, DATA_DESCRIPTOR, USER_CODE32_DESCRIPTOR, USER_DATA_DESCRIPTOR, USER_CODE_DESCRIPTOR]);
+        table[TSS_FIRST + 2 * cpu] = tss_low;
+        table[TSS_FIRST + 2 * cpu + 1] = tss_high;
         gdt.write(table);
     }
+    let tss_selector = TSS_SELECTOR_BASE + 16 * cpu as u16;
 
     let pointer = DescriptorTablePointer { limit: (size_of::<[u64; GDT_ENTRIES]>() - 1) as u16, base: gdt as u64 };
 
@@ -147,24 +160,29 @@ pub fn init() {
             code = in(reg) KERNEL_CODE as u64,
             data = in(reg) KERNEL_DATA as u64,
             null = in(reg) 0u64,
-            tss = in(reg) TSS_SELECTOR as u64,
+            tss = in(reg) tss_selector as u64,
             tmp = out(reg) _, // not lateout: must not share a register with the inputs
             options(preserves_flags),
         );
     }
 }
 
-/// Stack the CPU switches to when an interrupt or exception arrives in user mode
+/// Stack this CPU switches to when an interrupt or exception arrives in user mode
 /// (TSS.RSP0). Set to the running task's kernel stack on every task switch.
 pub fn set_kernel_stack(top: u64) {
+    let cpu = crate::smp::id();
     // SAFETY: RSP0 is read by the CPU only on a privilege change, which cannot
-    // happen while this (kernel) code runs; the TSS stays loaded.
-    unsafe { core::ptr::write_unaligned(core::ptr::addr_of_mut!((*TSS.get()).rsp[0]), top) };
+    // happen while this (kernel) code runs; the TSS stays loaded. Only this CPU
+    // writes its own TSS.
+    unsafe { core::ptr::write_unaligned(core::ptr::addr_of_mut!((*TSS.get())[cpu].rsp[0]), top) };
 }
 
-/// Install the running thread's TLS descriptors (entries 12-14; 0 = not present).
+/// Install the running thread's TLS descriptors in this CPU's GDT (entries 12-14; 0 = not
+/// present).
 pub fn set_tls(entries: &[u64; TLS_ENTRIES]) {
-    let gdt = GDT.get();
+    let cpu = crate::smp::id();
+    // SAFETY: in bounds; only this CPU writes its own GDT.
+    let gdt = unsafe { &raw mut (*GDT.get())[cpu] };
     for (i, d) in entries.iter().enumerate() {
         // SAFETY: TLS slots are only used by user mode; the CPU reads a descriptor when a
         // selector is loaded, which happens after this (switch_in reloads %fs/%gs).

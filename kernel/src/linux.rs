@@ -824,8 +824,21 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/sys/kernel/overflowuid" | "proc/sys/kernel/overflowgid" => "65534\n".into(),
         "proc/sys/fs/nr_open" => "1048576\n".into(),
         "proc/meminfo" => format!("MemTotal:       {total_kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n", free / 1024, free / 1024),
-        "proc/cpuinfo" => format!("processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: {}\ncpu MHz\t\t: 3000.000\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n\n", crate::cpu::brand()),
-        "proc/stat" => format!("cpu  {0} 0 0 {0} 0 0 0 0 0 0\ncpu0 {0} 0 0 {0} 0 0 0 0 0 0\nbtime {1}\nprocesses 1\n", pit::ticks(), rtc::unix_time() - pit::ticks() / pit::HZ),
+        "proc/cpuinfo" => {
+            let (n, brand) = (crate::smp::count(), crate::cpu::brand());
+            (0..crate::smp::MAX_CPUS)
+                .filter(|c| crate::smp::online_mask() & (1 << c) != 0)
+                .map(|c| format!("processor\t: {c}\nvendor_id\t: GenuineIntel\nmodel name\t: {brand}\ncpu MHz\t\t: 3000.000\nphysical id\t: 0\nsiblings\t: {n}\ncore id\t\t: {c}\ncpu cores\t: {n}\napicid\t\t: {c}\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n\n"))
+                .collect()
+        }
+        "proc/stat" => {
+            let t = pit::ticks();
+            let mut out = format!("cpu  {t} 0 0 {t} 0 0 0 0 0 0\n");
+            for c in (0..crate::smp::MAX_CPUS).filter(|c| crate::smp::online_mask() & (1 << c) != 0) {
+                out += &format!("cpu{c} {t} 0 0 {t} 0 0 0 0 0 0\n");
+            }
+            out + format!("btime {}\nprocesses 1\n", rtc::unix_time() - t / pit::HZ).as_str()
+        }
         "proc/nova/tcp" => loopback_table(),
         "proc/nova/net" => {
             let ((rx, tx), (polls, frames)) = (crate::net::counters(), crate::net::poll_counters());
@@ -839,8 +852,8 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/sys/kernel/pid_max" => "4194304\n".into(),
         "proc/sys/vm/overcommit_memory" => "1\n".into(),
         "proc/sys/fs/inotify/max_user_watches" => "8192\n".into(),
-        "sys/devices/system/cpu/online" | "sys/devices/system/cpu/possible" | "sys/devices/system/cpu/present" => "0\n".into(),
-        "sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq" => "3000000\n".into(),
+        "sys/devices/system/cpu/online" | "sys/devices/system/cpu/possible" | "sys/devices/system/cpu/present" => format!("{}\n", crate::smp::online_list()),
+        f if f.strip_prefix("sys/devices/system/cpu/cpu").and_then(|r| r.strip_suffix("/cpufreq/cpuinfo_max_freq")).and_then(|n| n.parse::<usize>().ok()).is_some_and(|n| n < 64 && crate::smp::online_mask() & (1 << n) != 0) => "3000000\n".into(),
         _ => return None,
     })
 }
@@ -1143,7 +1156,15 @@ impl vfs::Backend for DevFs {
     }
 }
 
-const SYS_FILES: &[&str] = &["devices/system/cpu/online", "devices/system/cpu/possible", "devices/system/cpu/present", "devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"];
+/// The files under /sys: what programs read to count CPUs (glibc's get_nprocs reads
+/// `online`, get_nprocs_conf counts the cpuN directories).
+fn sys_files() -> Vec<String> {
+    let mut files: Vec<String> = ["devices/system/cpu/online", "devices/system/cpu/possible", "devices/system/cpu/present"].map(String::from).to_vec();
+    for c in (0..crate::smp::MAX_CPUS).filter(|c| crate::smp::online_mask() & (1 << c) != 0) {
+        files.push(format!("devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq"));
+    }
+    files
+}
 
 struct SysFs;
 
@@ -1155,7 +1176,7 @@ impl vfs::Backend for SysFs {
         if let Some(t) = proc_file(&format!("sys/{p}")) {
             return Ok(meta(vfs::Type::Reg, 0o444, t.len() as u64, p));
         }
-        if p.is_empty() || SYS_FILES.iter().any(|f| f.starts_with(p) && f.as_bytes().get(p.len()) == Some(&b'/')) {
+        if p.is_empty() || sys_files().iter().any(|f| f.starts_with(p) && f.as_bytes().get(p.len()) == Some(&b'/')) {
             return Ok(meta(vfs::Type::Dir, 0o555, 0, p));
         }
         Err(ENOENT)
@@ -1166,7 +1187,7 @@ impl vfs::Backend for SysFs {
     fn list(&self, p: &str) -> Result<Vec<(String, vfs::Type, u64)>, i64> {
         let prefix = if p.is_empty() { String::new() } else { format!("{p}/") };
         let mut names = BTreeMap::new();
-        for f in SYS_FILES.iter().filter_map(|f| f.strip_prefix(prefix.as_str())) {
+        for f in sys_files().iter().filter_map(|f| f.strip_prefix(prefix.as_str())) {
             match f.split_once('/') {
                 Some((d, _)) => names.insert(d.to_string(), vfs::Type::Dir),
                 None => names.insert(f.to_string(), vfs::Type::Reg),
@@ -1817,7 +1838,7 @@ fn syscall_name(nr: u64) -> String {
         213 => "epoll_create", 217 => "getdents64", 218 => "set_tid_address", 228 => "clock_gettime",
         231 => "exit_group", 232 => "epoll_wait", 233 => "epoll_ctl", 257 => "openat", 262 => "newfstatat",
         273 => "set_robust_list", 332 => "statx", 281 => "epoll_pwait", 284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1",
-        293 => "pipe2", 302 => "prlimit64", 318 => "getrandom", 319 => "memfd_create", 334 => "rseq", 435 => "clone3",
+        293 => "pipe2", 302 => "prlimit64", 318 => "getrandom", 319 => "memfd_create", 334 => "rseq", 309 => "getcpu", 435 => "clone3",
         _ => return format!("syscall_{nr}"),
     };
     n.into()
@@ -3410,13 +3431,25 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 clone(f, flags, if stack != 0 { stack + stack_size } else { 0 }, parent_tid, child_tid, tls)?
             }
             204 => {
-                // sched_getaffinity: one CPU
-                let mut mask = vec![0u8; (a1 as usize).min(128)];
-                if let Some(b) = mask.first_mut() {
-                    *b = 1;
+                // sched_getaffinity(tid, size, mask): the CPUs the thread may run on
+                let cpus = task::affinity(a0).ok_or(ESRCH)?;
+                if (a1 as usize) < 8 {
+                    return Err(EINVAL);
                 }
+                let mut mask = vec![0u8; (a1 as usize).min(128)];
+                mask[..8].copy_from_slice(&cpus.to_le_bytes());
                 write_user(a2, &mask)?;
                 mask.len() as i64
+            }
+            203 => {
+                // sched_setaffinity(tid, size, mask)
+                let bytes = read_user(a2, (a1 as usize).min(8))?;
+                let mut word = [0u8; 8];
+                word[..bytes.len()].copy_from_slice(&bytes);
+                if !task::set_affinity(a0, u64::from_le_bytes(word)) {
+                    return Err(if task::affinity(a0).is_none() { ESRCH } else { EINVAL });
+                }
+                0
             }
             217 => {
                 // getdents64
@@ -3476,7 +3509,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 0
             }
             140 => 20,        // getpriority: nice 0
-            141 | 203 => 0,   // setpriority, sched_setaffinity
+            141 => 0,         // setpriority
             // Scheduling policy: every thread is SCHED_OTHER with priority 0; requests to
             // change it are accepted and ignored (Nova schedules round-robin).
             142 | 144 => 0,   // sched_setparam, sched_setscheduler
@@ -3518,6 +3551,16 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 v.len() as i64
             }
             334 => return Err(ENOSYS), // rseq: glibc copes without it
+            309 => {
+                // getcpu(cpu, node, cache): where this thread runs right now
+                if a0 != 0 {
+                    write_user(a0, &(crate::smp::id() as u32).to_le_bytes())?;
+                }
+                if a1 != 0 {
+                    write_user(a1, &0u32.to_le_bytes())?;
+                }
+                0
+            }
             40 | 326 => {
                 // sendfile(out, in, offset*, count), copy_file_range(in, off_in*, out, off_out*, len, flags)
                 let (out_fd, in_fd, in_off, out_off, count) = if nr == 40 { (a0, a1, a2, 0, a3) } else { (a2, a0, a1, a3, a4) };
@@ -3885,8 +3928,17 @@ fn futex(addr: u64, op: u64, val: u32, a3: u64, addr2: u64, val3: u32) -> Result
             if opcode & 8 != 0 {
                 oparg = 1 << oparg.min(31);
             }
-            let old = read_u32(addr2)?;
-            let new = match opcode & 7 {
+            if addr2 % 4 != 0 {
+                return Err(EINVAL);
+            }
+            if !mem().ensure(addr2, 4, true) {
+                return Err(EFAULT);
+            }
+            // Atomic, as on Linux: threads on other CPUs update the word with lock cmpxchg
+            // meanwhile.
+            // SAFETY: mapped, writable and aligned in the live address space.
+            let word = unsafe { core::sync::atomic::AtomicU32::from_ptr(addr2 as *mut u32) };
+            let op = |old: u32| match opcode & 7 {
                 0 => oparg,
                 1 => old.wrapping_add(oparg),
                 2 => old | oparg,
@@ -3894,7 +3946,7 @@ fn futex(addr: u64, op: u64, val: u32, a3: u64, addr2: u64, val3: u32) -> Result
                 4 => old ^ oparg,
                 _ => old,
             };
-            write_user(addr2, &new.to_le_bytes())?;
+            let old = word.fetch_update(core::sync::atomic::Ordering::SeqCst, core::sync::atomic::Ordering::SeqCst, |v| Some(op(v))).unwrap();
             let mut n = futex_wake(proc(), addr, val as usize);
             let hit = match cmp {
                 0 => old == cmparg,

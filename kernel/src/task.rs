@@ -1,32 +1,47 @@
-//! Cooperative kernel tasks.
+//! Cooperative kernel tasks and the scheduler.
 //!
 //! Every task has its own stack and runs until it calls [`yield_now`] or
-//! [`wait_event`]. There is no preemption: a task is never interrupted by another
-//! task, only by IRQ handlers (which never touch scheduler state). That makes all
-//! kernel data structures single-threaded from the tasks' point of view, as long as
-//! no task yields while holding a lock.
+//! [`wait_event`]. Kernel code is never preempted: a task is never interrupted by another
+//! task, only by IRQ handlers (which never touch scheduler state), and kernel code runs
+//! under the big kernel lock on every CPU (smp.rs). That makes all kernel data structures
+//! single-threaded from the tasks' point of view, as long as no task yields while holding
+//! a lock. Only user code is preempted, by the timer.
 //!
-//! [`wait_event`] parks the current task until the next interrupt of any kind (timer,
-//! keyboard, mouse, serial). The timer fires at `pit::HZ`, so a task that polls a
-//! device in a `wait_event` loop checks it at least that often. When every task is
-//! parked, the CPU halts until an interrupt arrives.
+//! Tasks are not bound to a CPU: a CPU that schedules picks the next runnable task (round
+//! robin) that no other CPU is running. A CPU with nothing to run switches to its own idle
+//! task, which halts with the big kernel lock released until it is kicked (a task woke up
+//! or was started, smp::kick_idle) or, on the boot CPU, until any interrupt arrives.
+//!
+//! [`wait_event`] parks the current task until the next interrupt of any kind on the boot
+//! CPU (timer, keyboard, mouse, serial). The timer fires at `pit::HZ`, so a task that polls
+//! a device in a `wait_event` loop checks it at least that often.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+use crate::smp::{self, MAX_CPUS};
 
 const STACK_SIZE: usize = 512 * 1024;
+/// Idle tasks only halt, but interrupt handlers run on their stack.
+const IDLE_STACK_SIZE: usize = 64 * 1024;
 
 /// Incremented by every IRQ (see interrupts.rs); parked tasks wait for it to change.
 pub static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Timestamp-counter cycles spent halted with every task parked.
+/// Timestamp-counter cycles spent halted in idle tasks, summed over the CPUs.
 static IDLE_CYCLES: AtomicU64 = AtomicU64::new(0);
 /// (TSC, idle cycles) at the previous `cpu_usage` call.
 static LAST_SAMPLE: crate::sync::SpinLock<(u64, u64)> = crate::sync::SpinLock::new((0, 0));
+
+/// Tasks waiting or ready but not running anywhere, as of the last scheduling decision:
+/// whether an idle CPU might find something to do.
+static QUEUED: AtomicUsize = AtomicUsize::new(0);
+/// An idle CPU was kicked by the timer to look for work and has not looked yet.
+static TICK_KICKED: AtomicBool = AtomicBool::new(false);
 
 fn rdtsc() -> u64 {
     let (lo, hi): (u32, u32);
@@ -35,14 +50,14 @@ fn rdtsc() -> u64 {
     (hi as u64) << 32 | lo as u64
 }
 
-/// CPU load in percent since the previous call.
+/// CPU load in percent since the previous call (all CPUs together).
 pub fn cpu_usage() -> u64 {
     let now = rdtsc();
     let idle = IDLE_CYCLES.load(Ordering::Relaxed);
     let Some(mut last) = LAST_SAMPLE.try_lock() else { return 0 };
     let (t0, i0) = *last;
     *last = (now, idle);
-    let total = now.wrapping_sub(t0);
+    let total = now.wrapping_sub(t0).saturating_mul(smp::count() as u64);
     if t0 == 0 || total == 0 {
         return 0;
     }
@@ -72,17 +87,33 @@ struct Task {
     user: Option<Box<crate::process::UserState>>,
     /// Times switched in (debugging: `ps`).
     runs: u64,
+    /// The CPU running this task (it is that CPU's current task).
+    cpu: Option<usize>,
+    /// Set for CPU n's idle task: it runs only there, and only when nothing else can.
+    idle_of: Option<usize>,
+    /// CPUs the task may run on (bit n = CPU n; sched_setaffinity).
+    affinity: u64,
+}
+
+impl Task {
+    fn new(id: usize, name: &str, rsp: u64, stack: Option<Box<[u8]>>, entry: Option<Box<dyn FnOnce() + Send>>, tty: Option<crate::tty::TtyRef>) -> Self {
+        Self { id, name: name.into(), state: State::Ready, rsp, stack, entry, tty, user: None, runs: 0, cpu: None, idle_of: None, affinity: u64::MAX }
+    }
 }
 
 struct Scheduler {
     tasks: Vec<Task>,
-    current: usize,
+    /// Index of each CPU's current task (in `tasks`).
+    current: [usize; MAX_CPUS],
+    /// Id of each CPU's idle task (0 = none yet).
+    idle: [usize; MAX_CPUS],
     next_id: usize,
 }
 
 struct SchedulerCell(UnsafeCell<Option<Scheduler>>);
-// SAFETY: only tasks touch the scheduler, and tasks never run concurrently (one CPU,
-// no preemption, IRQ handlers do not use it).
+// SAFETY: only kernel code under the big kernel lock touches the scheduler (one CPU at a
+// time), with interrupts disabled where it changes structure, and IRQ handlers do not use
+// it.
 unsafe impl Sync for SchedulerCell {}
 static SCHEDULER: SchedulerCell = SchedulerCell(UnsafeCell::new(None));
 
@@ -91,26 +122,72 @@ fn scheduler() -> &'static mut Scheduler {
     unsafe { (*SCHEDULER.0.get()).as_mut().expect("task::init not called") }
 }
 
-/// Turn the running boot code into task 0 ("kernel").
-pub fn init() {
-    // SAFETY: called once, before any other task exists.
-    unsafe {
-        *SCHEDULER.0.get() = Some(Scheduler {
-            tasks: alloc::vec![Task { id: 0, name: "kernel".into(), state: State::Ready, rsp: 0, stack: None, entry: None, tty: None, user: None, runs: 0 }],
-            current: 0,
-            next_id: 1,
-        });
+/// Index of the task running on this CPU.
+fn cur(s: &Scheduler) -> usize {
+    s.current[smp::id()]
+}
+
+fn irq_save() -> u64 {
+    let flags: u64;
+    // SAFETY: save RFLAGS, disable interrupts.
+    unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem)) };
+    flags
+}
+
+fn irq_restore(flags: u64) {
+    if flags & (1 << 9) != 0 {
+        // SAFETY: interrupts were enabled before irq_save.
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
     }
 }
 
-/// Start a new task. It first runs when the current task yields.
+/// Turn the running boot code into task 0 ("kernel"), and give the boot CPU its idle task.
+pub fn init() {
+    let mut boot = Task::new(0, "kernel", 0, None, None, None);
+    boot.cpu = Some(0);
+    // SAFETY: called once, before any other task exists.
+    unsafe {
+        *SCHEDULER.0.get() = Some(Scheduler { tasks: alloc::vec![boot], current: [0; MAX_CPUS], idle: [0; MAX_CPUS], next_id: 1 });
+    }
+    let id = spawn_with_tty("idle0", None, || idle_loop(0, true));
+    let s = scheduler();
+    let t = s.tasks.iter_mut().find(|t| t.id == id).unwrap();
+    t.idle_of = Some(0);
+    t.affinity = 1;
+    s.idle[0] = id;
+}
+
+/// CPU `cpu`'s idle task, before the CPU starts: it starts on this task's stack, already
+/// running it ([`run_idle`]). Returns the stack top.
+pub fn add_idle(cpu: usize) -> u64 {
+    let s = scheduler();
+    let mut stack = alloc::vec![0u8; IDLE_STACK_SIZE].into_boxed_slice();
+    let top = (stack.as_mut_ptr() as u64 + IDLE_STACK_SIZE as u64) & !15;
+    let id = s.next_id;
+    s.next_id += 1;
+    let mut t = Task::new(id, &alloc::format!("idle{cpu}"), 0, Some(stack), None, None);
+    t.idle_of = Some(cpu);
+    t.affinity = 1 << cpu;
+    t.cpu = Some(cpu);
+    s.tasks.push(t);
+    s.current[cpu] = s.tasks.len() - 1;
+    s.idle[cpu] = id;
+    top
+}
+
+/// An application processor, fully initialised, becomes its idle task. It does not hold
+/// the big kernel lock yet.
+pub fn run_idle(cpu: usize) -> ! {
+    idle_loop(cpu, false)
+}
+
+/// Start a new task. It first runs when a CPU schedules (an idle one is woken for it).
 pub fn spawn(name: &str, f: impl FnOnce() + Send + 'static) -> usize {
     spawn_with_tty(name, None, f)
 }
 
 /// Start a new task attached to a terminal.
 pub fn spawn_with_tty(name: &str, tty: Option<crate::tty::TtyRef>, f: impl FnOnce() + Send + 'static) -> usize {
-    let s = scheduler();
     let mut stack = alloc::vec![0u8; STACK_SIZE].into_boxed_slice();
     let top = (stack.as_mut_ptr() as u64 + STACK_SIZE as u64) & !15;
     // Initial frame consumed by `switch`: RFLAGS (IF set), six callee-saved
@@ -121,20 +198,26 @@ pub fn spawn_with_tty(name: &str, tty: Option<crate::tty::TtyRef>, f: impl FnOnc
     let rsp = top - (frame.len() * 8) as u64;
     // SAFETY: the frame fits at the top of the freshly allocated stack.
     unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), rsp as *mut u64, frame.len()) };
+    let flags = irq_save();
+    let s = scheduler();
     let id = s.next_id;
     s.next_id += 1;
-    s.tasks.push(Task { id, name: name.into(), state: State::Ready, rsp, stack: Some(stack), entry: Some(Box::new(f)), tty, user: None, runs: 0 });
+    s.tasks.push(Task::new(id, name, rsp, Some(stack), Some(Box::new(f)), tty));
+    irq_restore(flags);
+    smp::kick_idle();
     id
 }
 
 extern "C" fn task_trampoline() -> ! {
     let entry = {
         let s = scheduler();
-        s.tasks[s.current].entry.take().expect("task started twice")
+        let i = cur(s);
+        s.tasks[i].entry.take().expect("task started twice")
     };
     entry();
     let s = scheduler();
-    s.tasks[s.current].state = State::Finished;
+    let i = cur(s);
+    s.tasks[i].state = State::Finished;
     loop {
         yield_now(); // never scheduled again; reaped by another task
     }
@@ -144,13 +227,13 @@ extern "C" fn task_trampoline() -> ! {
 pub fn current_tty() -> Option<crate::tty::TtyRef> {
     // SAFETY: see SchedulerCell.
     let s = unsafe { (*SCHEDULER.0.get()).as_ref()? };
-    s.tasks.get(s.current)?.tty.clone()
+    s.tasks.get(s.current[smp::id()])?.tty.clone()
 }
 
 /// Attach (or detach) the current task's terminal.
 pub fn set_tty(tty: Option<crate::tty::TtyRef>) {
     let s = scheduler();
-    let current = s.current;
+    let current = cur(s);
     s.tasks[current].tty = tty;
 }
 
@@ -167,18 +250,25 @@ pub fn yield_now() {
 /// Park until the next interrupt, letting other tasks run meanwhile.
 pub fn wait_event() {
     let s = scheduler();
-    let current = s.current;
+    let current = cur(s);
     s.tasks[current].state = State::Waiting(IRQ_COUNT.load(Ordering::SeqCst));
     schedule();
 }
 
 /// Make a parked task runnable now (e.g. a futex waiter), instead of at the next interrupt.
 pub fn wake(id: usize) {
+    let flags = irq_save();
     let s = scheduler();
+    let mut kick = false;
     if let Some(t) = s.tasks.iter_mut().find(|t| t.id == id)
         && matches!(t.state, State::Waiting(_))
     {
         t.state = State::Ready;
+        kick = t.cpu.is_none();
+    }
+    irq_restore(flags);
+    if kick {
+        smp::kick_idle();
     }
 }
 
@@ -190,6 +280,15 @@ pub fn sleep_ticks(ticks: u64) {
     }
 }
 
+/// The boot CPU's timer tick (interrupt context): parked tasks may be runnable now; if this
+/// CPU is busy, wake an idle one to run them (one at a time: it wakes others if it finds
+/// more work than it can run).
+pub fn tick_kick() {
+    if smp::count() > 1 && QUEUED.load(Ordering::Relaxed) > 0 && !smp::is_idle(smp::id()) && !TICK_KICKED.load(Ordering::Relaxed) && smp::kick_idle() {
+        TICK_KICKED.store(true, Ordering::Relaxed);
+    }
+}
+
 fn runnable(state: State) -> bool {
     match state {
         State::Ready => true,
@@ -198,45 +297,128 @@ fn runnable(state: State) -> bool {
     }
 }
 
-fn schedule() {
-    loop {
-        let s = scheduler();
-        // Free the stacks of finished tasks other than the current one.
-        let current_id = s.tasks[s.current].id;
-        s.tasks.retain(|t| t.state != State::Finished || t.id == current_id);
-        s.current = s.tasks.iter().position(|t| t.id == current_id).unwrap();
-
-        let n = s.tasks.len();
-        let next = (1..=n).map(|i| (s.current + i) % n).find(|&i| runnable(s.tasks[i].state));
-        match next {
-            Some(next) => {
-                s.tasks[next].state = State::Ready;
-                if next != s.current {
-                    s.tasks[next].runs += 1;
-                    let old = s.current;
-                    s.current = next;
-                    crate::process::switch_out(s.tasks[old].user.as_deref_mut());
-                    crate::process::switch_in(s.tasks[next].user.as_deref());
-                    #[cfg(feature = "linux-drivers")]
-                    crate::linuxkpi::switch_to(s.tasks[next].id);
-                    let old_rsp = &raw mut s.tasks[old].rsp;
-                    let new_rsp = s.tasks[next].rsp;
-                    // SAFETY: new_rsp was saved by `switch` or built by `spawn`; old_rsp
-                    // points into the task list, which is not modified while switched out
-                    // (Vec reallocation moves Task values, but `rsp` is written before
-                    // any other task runs).
-                    unsafe { switch(old_rsp, new_rsp) };
-                }
-                return;
-            }
-            None => {
-                // Everyone is parked: halt until an interrupt changes IRQ_COUNT.
-                let seen = IRQ_COUNT.load(Ordering::SeqCst);
-                let t0 = rdtsc();
-                crate::input::wait_for_interrupt(|| IRQ_COUNT.load(Ordering::SeqCst) == seen);
-                IDLE_CYCLES.fetch_add(rdtsc().wrapping_sub(t0), Ordering::Relaxed);
+impl Scheduler {
+    /// Free the stacks of finished tasks that no CPU runs any more, keeping each CPU's
+    /// current index right.
+    fn reap(&mut self) {
+        if !self.tasks.iter().any(|t| t.state == State::Finished && t.cpu.is_none()) {
+            return;
+        }
+        let online = smp::online_mask();
+        let mut ids = [usize::MAX; MAX_CPUS];
+        for (c, id) in ids.iter_mut().enumerate() {
+            if online & (1 << c) != 0 {
+                *id = self.tasks[self.current[c]].id;
             }
         }
+        self.tasks.retain(|t| t.state != State::Finished || t.cpu.is_some());
+        for (c, &id) in ids.iter().enumerate() {
+            if id != usize::MAX {
+                self.current[c] = self.tasks.iter().position(|t| t.id == id).unwrap();
+            }
+        }
+    }
+
+    /// May CPU `cpu`, whose current task is at `current`, run task `i` now?
+    fn eligible(&self, i: usize, cpu: usize, current: usize) -> bool {
+        let t = &self.tasks[i];
+        t.idle_of.is_none() && (t.cpu.is_none() || i == current) && t.affinity & (1 << cpu) != 0 && runnable(t.state)
+    }
+}
+
+fn schedule() {
+    let flags = irq_save();
+    let me = smp::id();
+    let s = scheduler();
+    s.reap();
+    let current = s.current[me];
+    let n = s.tasks.len();
+    // Round robin from the task after the current one; the current task itself last.
+    let mut next = None;
+    let mut more = false;
+    let mut queued = 0;
+    for k in 1..=n {
+        let i = (current + k) % n;
+        let t = &s.tasks[i];
+        if t.cpu.is_none() && t.idle_of.is_none() && t.state != State::Finished {
+            queued += 1;
+        }
+        if s.eligible(i, me, current) {
+            if next.is_none() {
+                next = Some(i);
+            } else if i != current {
+                more = true;
+            }
+        }
+    }
+    QUEUED.store(queued, Ordering::Relaxed);
+    let next = match next {
+        Some(i) => {
+            s.tasks[i].state = State::Ready;
+            i
+        }
+        // Nothing to run: this CPU's idle task (if it is not the one asking).
+        None if s.tasks[current].idle_of == Some(me) => current,
+        None => s.tasks.iter().position(|t| t.id == s.idle[me]).expect("CPU without an idle task"),
+    };
+    if next != current {
+        // The task this CPU leaves may be picked up elsewhere if it can run; and work that
+        // this CPU cannot take now goes to an idle CPU.
+        if more || (s.tasks[current].idle_of.is_none() && runnable(s.tasks[current].state)) {
+            smp::kick_idle();
+        }
+        switch_to(s, current, next, me);
+    } else if more {
+        smp::kick_idle();
+    }
+    irq_restore(flags);
+}
+
+/// Switch CPU `me` from task `old` to task `new` (indices; BKL held, interrupts off).
+/// Returns when `old` runs again, on whichever CPU picks it.
+fn switch_to(s: &mut Scheduler, old: usize, new: usize, me: usize) {
+    s.tasks[new].runs += 1;
+    s.tasks[old].cpu = None;
+    s.tasks[new].cpu = Some(me);
+    s.current[me] = new;
+    crate::process::switch_out(s.tasks[old].user.as_deref_mut());
+    crate::process::switch_in(s.tasks[new].user.as_deref());
+    #[cfg(feature = "linux-drivers")]
+    crate::linuxkpi::switch_to(s.tasks[new].id);
+    let old_rsp = &raw mut s.tasks[old].rsp;
+    let new_rsp = s.tasks[new].rsp;
+    // SAFETY: new_rsp was saved by `switch` or built by `spawn`; old_rsp points into the
+    // task list, which is not modified until `switch` has written it (no other CPU runs
+    // kernel code before this one releases the big kernel lock, which only the next
+    // task can do). Vec reallocation later moves Task values, `rsp` with them.
+    unsafe { switch(old_rsp, new_rsp) };
+}
+
+/// The idle task of CPU `cpu`: run whatever is runnable; when nothing is, halt with the
+/// big kernel lock released until kicked (or, on the boot CPU, any interrupt: parked tasks
+/// wait for exactly that). `held`: this CPU holds the lock already.
+fn idle_loop(cpu: usize, mut held: bool) -> ! {
+    loop {
+        if !held {
+            smp::lock();
+        }
+        let seen = IRQ_COUNT.load(Ordering::SeqCst);
+        schedule(); // runs other tasks; returns when this CPU has nothing to do
+        TICK_KICKED.store(false, Ordering::Relaxed);
+        let flags = irq_save();
+        smp::set_idle(cpu, true);
+        smp::unlock();
+        held = false;
+        let t0 = rdtsc();
+        // Interrupts stay off between each check and `hlt` (`sti; hlt` is atomic), so a
+        // wake-up between them is not lost.
+        while !smp::take_kick(cpu) && (cpu != 0 || IRQ_COUNT.load(Ordering::SeqCst) == seen) {
+            // SAFETY: halts until the next interrupt, which is handled at once.
+            unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
+        }
+        IDLE_CYCLES.fetch_add(rdtsc().wrapping_sub(t0), Ordering::Relaxed);
+        smp::set_idle(cpu, false);
+        irq_restore(flags);
     }
 }
 
@@ -257,17 +439,52 @@ unsafe extern "C" fn switch(old_rsp: *mut u64, new_rsp: u64) {
     )
 }
 
+/// The CPUs task `tid` (a thread id; 0 = the calling thread) may run on.
+pub fn affinity(tid: u64) -> Option<u64> {
+    let s = scheduler();
+    let i = find_thread(s, tid)?;
+    Some(s.tasks[i].affinity & smp::online_mask())
+}
+
+/// sched_setaffinity: restrict thread `tid` (0 = the calling thread) to the CPUs in
+/// `mask`. False if there is no such thread or no online CPU in the mask.
+pub fn set_affinity(tid: u64, mask: u64) -> bool {
+    let s = scheduler();
+    let Some(i) = find_thread(s, tid) else { return false };
+    if mask & smp::online_mask() == 0 {
+        return false;
+    }
+    s.tasks[i].affinity = mask;
+    // Move off a CPU it may no longer use.
+    if i == cur(s) && mask & (1 << smp::id()) == 0 {
+        yield_now();
+    }
+    true
+}
+
+fn find_thread(s: &Scheduler, tid: u64) -> Option<usize> {
+    if tid == 0 {
+        return Some(cur(s));
+    }
+    s.tasks.iter().position(|t| t.user.as_deref().is_some_and(|u| u.tid == tid))
+}
+
+/// CPUs that run a thread of process `pid` now (to kick them into the kernel).
+pub fn cpus_running(pid: u64) -> u64 {
+    scheduler().tasks.iter().filter(|t| t.user.as_deref().is_some_and(|u| u.process.pid == pid)).filter_map(|t| t.cpu).fold(0, |m, c| m | 1 << c)
+}
+
 /// The current task's user-program state.
 pub fn current_user() -> Option<&'static mut crate::process::UserState> {
     let s = scheduler();
-    let current = s.current;
+    let current = cur(s);
     s.tasks[current].user.as_deref_mut()
 }
 
 /// Attach or detach user-program state to the current task (and load it).
 pub fn set_user(user: Option<Box<crate::process::UserState>>) {
     let s = scheduler();
-    let current = s.current;
+    let current = cur(s);
     let old = core::mem::replace(&mut s.tasks[current].user, user);
     // Load the new address space before the old one (and its page tables) is freed.
     crate::process::switch_in(s.tasks[current].user.as_deref());
@@ -276,7 +493,14 @@ pub fn set_user(user: Option<Box<crate::process::UserState>>) {
 
 pub fn current_id() -> usize {
     let s = scheduler();
-    s.tasks[s.current].id
+    s.tasks[cur(s)].id
+}
+
+/// `current_id`, or None before the scheduler exists.
+pub fn current_id_checked() -> Option<usize> {
+    // SAFETY: see SchedulerCell.
+    let s = unsafe { (*SCHEDULER.0.get()).as_ref()? };
+    s.tasks.get(s.current[smp::id()]).map(|t| t.id)
 }
 
 /// The last system calls of every thread of process `pid` (the `recent` command).
@@ -299,9 +523,9 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
     let s = scheduler();
     s.tasks
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
-            let state = if i == s.current {
+        .filter(|t| t.idle_of.is_none())
+        .map(|t| {
+            let state = if t.cpu.is_some() {
                 "running"
             } else {
                 match t.state {
@@ -336,7 +560,11 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
                 let comm = if u.comm.is_empty() { String::new() } else { alloc::format!(" \"{}\"", u.comm) };
                 alloc::format!(" <{exe}{}{kind}>{comm}", if kind.is_empty() { "" } else { " " })
             });
-            (t.id, alloc::format!("{name}{} [runs {}, {:?}]", prog.unwrap_or_default(), t.runs, t.state), state)
+            let on = match t.cpu {
+                Some(c) if smp::count() > 1 => alloc::format!(", cpu {c}"),
+                _ => String::new(),
+            };
+            (t.id, alloc::format!("{name}{} [runs {}, {:?}{on}]", prog.unwrap_or_default(), t.runs, t.state), state)
         })
         .collect()
 }

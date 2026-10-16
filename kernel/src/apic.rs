@@ -28,7 +28,12 @@ const LAPIC_TPR: u32 = 0x80;
 const LAPIC_EOI: u32 = 0xB0;
 const LAPIC_SVR: u32 = 0xF0;
 const LAPIC_ESR: u32 = 0x280;
+const LAPIC_ICR_LOW: u32 = 0x300;
+const LAPIC_ICR_HIGH: u32 = 0x310;
 const LAPIC_LVT_TIMER: u32 = 0x320;
+const LAPIC_TIMER_INITIAL: u32 = 0x380;
+const LAPIC_TIMER_CURRENT: u32 = 0x390;
+const LAPIC_TIMER_DIVIDE: u32 = 0x3E0;
 const LAPIC_LVT_LINT0: u32 = 0x350;
 const LAPIC_LVT_LINT1: u32 = 0x360;
 const LAPIC_LVT_ERROR: u32 = 0x370;
@@ -46,7 +51,9 @@ pub const SYSCALL32_VECTOR: u8 = 0x80;
 pub const MSI_IRQ_BASE: u32 = 0x1000;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The local APIC's register page (every CPU sees its own APIC at the same address).
 static LAPIC: AtomicU64 = AtomicU64::new(0);
+static LAPIC_PHYS: AtomicU64 = AtomicU64::new(0);
 static BSP_ID: AtomicU32 = AtomicU32::new(0);
 
 struct IoApic {
@@ -123,15 +130,9 @@ pub fn init() -> Option<alloc::string::String> {
     }
     let phys = madt.local_apic & !0xFFF;
     wrmsr(IA32_APIC_BASE, phys | (1 << 11) | (base & (1 << 8)));
+    LAPIC_PHYS.store(phys, Ordering::Relaxed);
     LAPIC.store(memory::map_mmio(phys, 0x1000), Ordering::Relaxed);
-    lapic_write(LAPIC_TPR, 0);
-    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
-    lapic_write(LAPIC_LVT_LINT0, LVT_MASKED); // the PIC's ExtINT path: unused from now on
-    lapic_write(LAPIC_LVT_LINT1, LVT_NMI);
-    lapic_write(LAPIC_LVT_ERROR, LVT_MASKED);
-    lapic_write(LAPIC_ESR, 0);
-    lapic_write(LAPIC_SVR, 0x100 | SPURIOUS_VECTOR as u32);
-    lapic_write(LAPIC_EOI, 0);
+    lapic_setup(LVT_NMI);
     BSP_ID.store(lapic_read(LAPIC_ID) >> 24, Ordering::Relaxed);
 
     // I/O APICs: every pin masked until something is routed to it.
@@ -148,13 +149,17 @@ pub fn init() -> Option<alloc::string::String> {
         }
     }
     *OVERRIDES.lock() = madt.overrides.clone();
+    for irq in 0..16u8 {
+        let (gsi, level, _) = isa_gsi(irq);
+        ISA_GSI[irq as usize].store(gsi | (level as u32) << 31, Ordering::Relaxed);
+    }
 
     pic::mask_all();
     ACTIVE.store(true, Ordering::Relaxed);
     for irq in [pic::IRQ_TIMER, pic::IRQ_KEYBOARD, pic::IRQ_COM1, pic::IRQ_MOUSE] {
         route_isa(irq, false);
     }
-    let gsis: u32 = irqs_off(|| IOAPICS.try_lock().map_or(0, |a| a.iter().map(|a| a.pins).sum()));
+    let gsis: u32 = irqs_off(|| ioapics().iter().map(|a| a.pins).sum());
     Some(alloc::format!(
         "local APIC {} at {phys:#x}, {} I/O APIC(s) with {gsis} inputs, {} override(s)",
         BSP_ID.load(Ordering::Relaxed),
@@ -163,9 +168,122 @@ pub fn init() -> Option<alloc::string::String> {
     ))
 }
 
+/// This CPU's local APIC registers in a known state: no priority filter, timer and
+/// LINT0 masked, `lint1` on LINT1 (NMI on the boot CPU), enabled with the spurious vector.
+fn lapic_setup(lint1: u32) {
+    lapic_write(LAPIC_TPR, 0);
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
+    lapic_write(LAPIC_LVT_LINT0, LVT_MASKED); // the PIC's ExtINT path: unused from now on
+    lapic_write(LAPIC_LVT_LINT1, lint1);
+    lapic_write(LAPIC_LVT_ERROR, LVT_MASKED);
+    lapic_write(LAPIC_ESR, 0);
+    lapic_write(LAPIC_SVR, 0x100 | SPURIOUS_VECTOR as u32);
+    lapic_write(LAPIC_EOI, 0);
+}
+
+/// An application processor's local APIC: xAPIC mode at the boot CPU's address (the
+/// firmware may have left it in x2APIC mode), registers as on the boot CPU, LINT1 masked.
+pub fn init_ap() {
+    let base = rdmsr(IA32_APIC_BASE);
+    if base & (1 << 10) != 0 {
+        wrmsr(IA32_APIC_BASE, base & !((1 << 11) | (1 << 10)));
+    }
+    wrmsr(IA32_APIC_BASE, LAPIC_PHYS.load(Ordering::Relaxed) | (1 << 11));
+    lapic_setup(LVT_MASKED);
+}
+
+/// Send interrupt `vector` to the CPU with local APIC id `dest` (fixed delivery, physical
+/// destination).
+pub fn send_ipi(dest: u32, vector: u8) {
+    irqs_off(|| {
+        // xAPIC: the previous IPI must have left before the ICR is written again.
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        lapic_write(LAPIC_ICR_HIGH, dest << 24);
+        lapic_write(LAPIC_ICR_LOW, vector as u32 | 1 << 14);
+    })
+}
+
+/// Send `vector` to every CPU but this one (the "all excluding self" shorthand).
+pub fn send_ipi_others(vector: u8) {
+    irqs_off(|| {
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        lapic_write(LAPIC_ICR_HIGH, 0);
+        lapic_write(LAPIC_ICR_LOW, vector as u32 | 1 << 14 | 0b11 << 18);
+    })
+}
+
+/// LAPIC timer counts (divide by 16) per PIT tick, measured once on the boot CPU; every
+/// CPU's timer runs at the same rate.
+static TIMER_PER_TICK: AtomicU32 = AtomicU32::new(0);
+
+/// Measure the LAPIC timer against the TSC (calibrated already) over 10 ms.
+pub fn calibrate_timer() {
+    lapic_write(LAPIC_TIMER_DIVIDE, 0b0011); // divide by 16
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
+    let t0 = crate::pit::nanos();
+    lapic_write(LAPIC_TIMER_INITIAL, u32::MAX);
+    while crate::pit::nanos() - t0 < 10_000_000 {
+        core::hint::spin_loop();
+    }
+    let elapsed = u32::MAX - lapic_read(LAPIC_TIMER_CURRENT);
+    let ns = crate::pit::nanos() - t0;
+    lapic_write(LAPIC_TIMER_INITIAL, 0);
+    let per_tick = (elapsed as u64 * (1_000_000_000 / crate::pit::HZ) / ns.max(1)) as u32;
+    TIMER_PER_TICK.store(per_tick.max(1), Ordering::Relaxed);
+}
+
+/// Start this CPU's LAPIC timer: periodic, `vector`, at the PIT's rate.
+pub fn start_timer(vector: u8) {
+    lapic_write(LAPIC_TIMER_DIVIDE, 0b0011);
+    lapic_write(LAPIC_LVT_TIMER, vector as u32 | 1 << 17); // periodic
+    lapic_write(LAPIC_TIMER_INITIAL, TIMER_PER_TICK.load(Ordering::Relaxed));
+}
+
+/// ISA IRQ -> GSI (bit 31: level triggered), from the overrides, for interrupt context.
+static ISA_GSI: [AtomicU32; 16] = [const { AtomicU32::new(0) }; 16];
+
+/// Mask or unmask the I/O APIC line that delivers `vector` (a level-triggered GSI: a PCI
+/// INTx line or ACPI's SCI) while its handler is deferred. False for vectors that are not
+/// such a line (MSI, edge-triggered ISA lines). Interrupt context.
+pub fn mask_vector(vector: u8, masked: bool) -> bool {
+    if !active() {
+        return false;
+    }
+    let gsi = if (pic::IRQ_BASE..pic::IRQ_BASE + 16).contains(&vector) {
+        let g = ISA_GSI[(vector - pic::IRQ_BASE) as usize].load(Ordering::Relaxed);
+        if g & 1 << 31 == 0 {
+            return false;
+        }
+        g & !(1 << 31)
+    } else {
+        match vector_irq(vector) {
+            Some(irq) if irq < MSI_IRQ_BASE => irq,
+            _ => return false,
+        }
+    };
+    set_masked(gsi, masked);
+    true
+}
+
+/// The I/O APIC registers, with interrupts off. I/O APIC programming happens both in
+/// tasks and in interrupt handlers (Linux's disable_irq), on any CPU, so IOAPICS is only
+/// ever held with interrupts off and for a few register accesses: waiting for it is short.
+fn ioapics() -> crate::sync::SpinLockGuard<'static, Vec<IoApic>> {
+    loop {
+        if let Some(g) = IOAPICS.try_lock() {
+            return g;
+        }
+        core::hint::spin_loop();
+    }
+}
+
 /// Run `f` with interrupts disabled. I/O APIC programming happens both in tasks and in
 /// interrupt handlers (Linux's disable_irq), so IOAPICS is only ever held with interrupts
-/// off: a handler can never find it taken.
+/// off: a handler on the same CPU can never find it taken.
 fn irqs_off<R>(f: impl FnOnce() -> R) -> R {
     let flags: u64;
     // SAFETY: save RFLAGS, disable interrupts; restored below.
@@ -184,7 +302,7 @@ fn redirect(gsi: u32, vector: u8, level: bool, active_low: bool, masked: bool) -
 }
 
 fn redirect_locked(gsi: u32, vector: u8, level: bool, active_low: bool, masked: bool) -> bool {
-    let Some(ioapics) = IOAPICS.try_lock() else { return false };
+    let ioapics = ioapics();
     let Some(a) = ioapics.iter().find(|a| gsi >= a.first_gsi && gsi < a.first_gsi + a.pins) else {
         return false;
     };
@@ -197,7 +315,7 @@ fn redirect_locked(gsi: u32, vector: u8, level: bool, active_low: bool, masked: 
 
 fn set_masked(gsi: u32, masked: bool) {
     irqs_off(|| {
-        let Some(ioapics) = IOAPICS.try_lock() else { return };
+        let ioapics = ioapics();
         if let Some(a) = ioapics.iter().find(|a| gsi >= a.first_gsi && gsi < a.first_gsi + a.pins) {
             let reg = 0x10 + 2 * (gsi - a.first_gsi);
             let low = ioapic_read(a.base, reg);

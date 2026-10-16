@@ -1,13 +1,13 @@
 //! Terminal input from the PS/2 keyboard and the serial port.
 //!
-//! IRQ handlers only push raw bytes into lock-free single-producer/single-consumer
-//! rings (producer: the IRQ handler; consumer: the main loop). Decoding into
+//! IRQ handlers only push raw bytes into lock-free rings (producer: the IRQ handler;
+//! consumer: the main loop). Decoding into
 //! [`Key`]s happens in the main loop, in [`read_key`].
 
 use alloc::collections::VecDeque;
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::keyboard;
 use crate::sync::SpinLock;
@@ -40,27 +40,41 @@ pub struct Ring {
     head: AtomicUsize,
     /// Next slot to read; only the consumer stores it.
     tail: AtomicUsize,
+    /// Held while a byte is pushed: producers on different CPUs (COM1's interrupt on the
+    /// boot CPU, the remote console's or USB keyboard's task anywhere) take turns. Always
+    /// taken with interrupts off, so a producer never waits for itself.
+    producing: AtomicBool,
 }
 
-// SAFETY: single producer and single consumer; each slot is written before the
-// Release store of `head` publishes it and read before the Release store of
-// `tail` frees it.
+// SAFETY: producers are serialised by `producing`, and there is one consumer at a time
+// (it runs under the big kernel lock); each slot is written before the Release store of
+// `head` publishes it and read before the Release store of `tail` frees it.
 unsafe impl Sync for Ring {}
 
 impl Ring {
     pub const fn new() -> Self {
-        Self { buf: UnsafeCell::new([0; RING_SIZE]), head: AtomicUsize::new(0), tail: AtomicUsize::new(0) }
+        Self { buf: UnsafeCell::new([0; RING_SIZE]), head: AtomicUsize::new(0), tail: AtomicUsize::new(0), producing: AtomicBool::new(false) }
     }
 
-    /// Producer side. Drops the byte if the ring is full.
+    /// Producer side (any context). Drops the byte if the ring is full.
     pub fn push(&self, byte: u8) {
-        let head = self.head.load(Ordering::Relaxed);
-        if head.wrapping_sub(self.tail.load(Ordering::Acquire)) == RING_SIZE {
-            return;
+        let flags: u64;
+        // SAFETY: save RFLAGS and disable interrupts; restored below.
+        unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags, options(nomem)) };
+        while self.producing.swap(true, Ordering::Acquire) {
+            core::hint::spin_loop();
         }
-        // SAFETY: the slot is free (checked above) and only the producer writes.
-        unsafe { (*self.buf.get())[head % RING_SIZE] = byte };
-        self.head.store(head.wrapping_add(1), Ordering::Release);
+        let head = self.head.load(Ordering::Relaxed);
+        if head.wrapping_sub(self.tail.load(Ordering::Acquire)) != RING_SIZE {
+            // SAFETY: the slot is free (checked above) and only this producer writes.
+            unsafe { (*self.buf.get())[head % RING_SIZE] = byte };
+            self.head.store(head.wrapping_add(1), Ordering::Release);
+        }
+        self.producing.store(false, Ordering::Release);
+        if flags & (1 << 9) != 0 {
+            // SAFETY: interrupts were enabled on entry.
+            unsafe { asm!("sti", options(nomem, nostack)) };
+        }
     }
 
     /// Consumer side.
@@ -206,22 +220,5 @@ pub fn read_key() -> Key {
             return key;
         }
         crate::task::wait_event();
-    }
-}
-
-/// Sleep until the next interrupt, unless `still_idle` turns false. The check
-/// runs with interrupts disabled, and `sti; hlt` executes atomically (STI delays
-/// interrupt delivery by one instruction), so a wake-up cannot be lost between
-/// the check and the `hlt`.
-pub fn wait_for_interrupt(still_idle: impl FnOnce() -> bool) {
-    // SAFETY: only toggles IF and halts until the next interrupt; interrupts are
-    // enabled again on every path.
-    unsafe {
-        asm!("cli", options(nomem, nostack));
-        if still_idle() {
-            asm!("sti", "hlt", options(nomem, nostack));
-        } else {
-            asm!("sti", options(nomem, nostack));
-        }
     }
 }

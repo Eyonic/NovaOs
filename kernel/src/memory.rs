@@ -356,9 +356,13 @@ pub fn vunmap(virt: u64) {
         crate::log::warn(&alloc::format!("linux: vunmap of unknown address {virt:#x}"));
         return;
     };
-    for i in 0..pages {
-        unmap_page(VMAP_BASE + (start + i) * PAGE_SIZE);
+    let virts: alloc::vec::Vec<u64> = (0..pages).map(|i| VMAP_BASE + (start + i) * PAGE_SIZE).collect();
+    for &v in &virts {
+        unmap_page(v);
     }
+    // Other CPUs run kernel code too (one at a time): none may keep a translation for a
+    // range that is about to be handed out again.
+    crate::smp::flush_kernel(&virts);
     let mut guard = VMAP.lock();
     let free = &mut guard.as_mut().unwrap().free;
     // Give back the range with its guard page, merged with free neighbours.
