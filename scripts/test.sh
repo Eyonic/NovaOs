@@ -159,7 +159,7 @@ define_case() {
                 EXPECT=("${shell[@]}" "seccomptest: seccomp filters and strict mode"
                         "  ok   SECCOMP_RET_TRAP: SIGSYS handler sees siginfo and ucontext, sets the result in rax"
                         "  ok   SECCOMP_FILTER_FLAG_TSYNC: other threads get the filter; a diverged thread blocks it"
-                        "  ok   strict mode: write() still works" "seccomptest: 11 passed, 0 failed")
+                        "  ok   strict mode: write() still works" "seccomptest: 13 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall") ;;
         vfs)    # The file system Linux programs see (vfs.rs): symbolic and hard links, directories,
                 # rename, permissions, tmpfs at /run (userland/vfstest.c), named Unix sockets

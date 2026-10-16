@@ -10,12 +10,14 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <ucontext.h>
@@ -337,6 +339,63 @@ static int t_validation(void)
 	return getppid_blocked() && getpid() > 0 ? 0 : 30;
 }
 
+/* The namespace sandbox's other half (Chromium's zygote): a PID namespace whose first
+ * process is pid 1, and dropping file system access by chrooting a CLONE_FS child into
+ * its own /proc/self/fdinfo. Both run in a new user namespace, as Chromium does. */
+static int pidns_init(void)
+{
+	if (getpid() != 1 || getppid() != 0)
+		return 1;
+	fflush(stdout);
+	pid_t c = fork();
+	if (c == 0)
+		_exit(getpid() == 2 && getppid() == 1 ? 0 : 1);
+	int st;
+	if (c != 2 || waitpid(c, &st, 0) != 2 || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+		return 2;
+	return 0;
+}
+
+static int t_pidns(void)
+{
+	if (unshare(CLONE_NEWUSER))
+		return 1;
+	fflush(stdout);
+	long pid = syscall(SYS_clone, CLONE_NEWPID | SIGCHLD, 0, 0, 0, 0);
+	if (pid == 0)
+		_exit(pidns_init());
+	if (pid <= 1 || kill(pid, 0) != 0)
+		return 2;
+	int st;
+	if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st))
+		return 3;
+	return WEXITSTATUS(st) ? 10 + WEXITSTATUS(st) : 0;
+}
+
+static int chroot_fdinfo(void *arg)
+{
+	_exit(chroot("/proc/self/fdinfo/") == 0 && chdir("/") == 0 ? 0 : 1);
+}
+
+static int t_chroot_fs(void)
+{
+	static char stack[65536] __attribute__((aligned(16)));
+	if (unshare(CLONE_NEWUSER))
+		return 1;
+	int proc_fd = open("/proc", O_DIRECTORY | O_RDONLY);
+	pid_t pid = clone(chroot_fdinfo, stack + sizeof(stack), CLONE_FS | SIGCHLD, NULL);
+	int st;
+	if (pid <= 0 || waitpid(pid, &st, 0) != pid || !WIFEXITED(st) || WEXITSTATUS(st) != 0)
+		return 2;
+	if (access("/proc", F_OK) != -1 || access("/bin", F_OK) != -1)
+		return 3;
+	/* A descriptor opened before still reaches its directory (Chromium checks
+	 * /proc/self/fd through one for open directories). */
+	int fd_dir = openat(proc_fd, "self/fd", O_DIRECTORY | O_RDONLY);
+	struct stat st0;
+	return fd_dir >= 0 && fstatat(fd_dir, "0", &st0, 0) == 0 ? 0 : 4;
+}
+
 int main(int argc, char **argv)
 {
 	self = argv[0][0] == '/' ? argv[0] : "/bin/seccomptest";
@@ -359,6 +418,8 @@ int main(int argc, char **argv)
 	st = in_child(t_strict_violation);
 	check(WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL, "strict mode: any other call is SIGKILL");
 	check(prctl(PR_GET_SECCOMP) == 0 && syscall(SYS_getppid) >= 0, "the parent is unaffected");
+	check(child_ok(t_pidns), "clone(CLONE_NEWPID): the child is pid 1 of its namespace, its child pid 2");
+	check(child_ok(t_chroot_fs), "CLONE_FS: a child's chroot into its /proc/self/fdinfo leaves the parent without /proc; old dirfds work");
 	printf("seccomptest: %d passed, %d failed\n", passed, failed);
 	return failed != 0;
 }

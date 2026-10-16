@@ -291,7 +291,7 @@ fn push_frame(u: &mut UserState, f: &mut SyscallFrame, sig: u32, sender: u32, to
         w64(UC_SIGMASK, old_mask);
         w32(INFO, sig);
         w32(INFO + 8, if to_thread { SI_TKILL as u32 } else { SI_USER as u32 });
-        w32(INFO + 16, sender);
+        w32(INFO + 16, process::pid_view(&u.process, sender as u64) as u32);
         if let Some(t) = sigsys_info(u, sig, to_thread) {
             // _sigsys: call address, call number, audit architecture; si_errno = filter data.
             w32(INFO + 4, t.errno);

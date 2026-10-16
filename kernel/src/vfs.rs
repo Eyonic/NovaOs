@@ -468,6 +468,14 @@ impl Namespace {
         Arc::new(Namespace { inner: SpinLock::new(Tree { entries, root: rid }) })
     }
 
+    /// A namespace whose root is the directory `at` alone: lookups relative to a
+    /// directory descriptor that the caller's root no longer reaches (after chroot).
+    pub fn rooted_at(at: &At) -> Arc<Namespace> {
+        let id = NEXT_MOUNT.fetch_add(1, Ordering::Relaxed);
+        let m = Mount::new(at.mount.fs.clone(), &at.rel, at.mount.readonly);
+        Arc::new(Namespace { inner: SpinLock::new(Tree { entries: alloc::vec![Entry { id, parent: id, path: String::new(), m }], root: id }) })
+    }
+
     /// /proc/self/mountinfo: "id parent 0:dev root mountpoint options - type source super".
     pub fn mountinfo(&self) -> String {
         let t = self.inner.lock();

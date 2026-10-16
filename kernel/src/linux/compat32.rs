@@ -102,6 +102,7 @@ pub fn syscall32(f: &mut Frame32) -> i64 {
     thread().syscall_arg2 = a1;
     thread().phase = "convert";
     let r = res(convert(f, nr, a0, a1, a2, a3, a4, a5));
+    thread().ns_override = None;
     thread().recent.push(0x1000 | nr, [a0, a1, a2], r);
     thread().phase = "returned";
     thread().in_syscall = u64::MAX;
@@ -372,7 +373,7 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
                     tls_entries[index] = descriptor(w(1), w(2), w(3));
                 }
                 let sf = as_syscall_frame(f);
-                let tid = process::spawn_thread32(&sf, stack, tls_entries, if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 });
+                let tid = process::pid_view(proc(), process::spawn_thread32(&sf, stack, tls_entries, if flags & CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 }));
                 if flags & CLONE_PARENT_SETTID != 0 {
                     wr32(ptid, tid as u32)?;
                 }
@@ -382,13 +383,14 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
                 tid as i64
             } else {
                 let sf = as_syscall_frame(f);
-                let pid = process::fork(&sf, flags & CLONE_VFORK != 0, stack, None)?;
+                let pid = process::fork(&sf, flags & CLONE_VFORK != 0, stack, None, flags)?;
                 if flags & super::CLONE_NEWNS != 0 {
                     process::unshare_ns(pid);
                 }
                 if flags & super::CLONE_NEWUSER != 0 {
                     process::unshare_user(pid);
                 }
+                let pid = process::pid_view(proc(), pid);
                 if flags & CLONE_PARENT_SETTID != 0 {
                     wr32(ptid, pid as u32)?;
                 }
@@ -409,7 +411,7 @@ fn convert(f: &mut Frame32, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64
         2 | 190 => {
             // fork, vfork
             let sf = as_syscall_frame(f);
-            process::fork(&sf, nr == 190, 0, None)? as i64
+            process::pid_view(proc(), process::fork(&sf, nr == 190, 0, None, 0)?) as i64
         }
         243 => set_thread_area(a0)?,
         126 => {
@@ -854,7 +856,7 @@ fn push_frame(f: &mut Frame32, sig: u32, sender: u32, to_thread: bool, action: &
         match signal::sigsys_info(t, sig, to_thread) {
             // _sigsys: si_errno = filter data, SYS_SECCOMP, call address, number, arch.
             Some(i) => put_words(frame + RT_INFO, &[sig, i.errno, seccomp::SYS_SECCOMP, i.call_addr as u32, i.syscall, i.arch])?,
-            None => put_words(frame + RT_INFO, &[sig, 0, if to_thread { -6i32 as u32 } else { 0 }, sender, 0])?,
+            None => put_words(frame + RT_INFO, &[sig, 0, if to_thread { -6i32 as u32 } else { 0 }, process::pid_view(proc(), sender as u64) as u32, 0])?,
         }
         let stack_flags = if use_alt { t.altstack.2 } else { 2 };
         put_words(frame + RT_UC, &[0, 0, t.altstack.0 as u32, stack_flags, t.altstack.1 as u32])?;

@@ -345,6 +345,59 @@ pub struct Process {
     /// execve in a multi-threaded process: the thread that stays (the others leave as
     /// on exit_group); 0 otherwise.
     pub exec_tid: AtomicU64,
+    /// The PID namespace the process is in (None: the initial one).
+    pub pidns: SpinLock<Option<Arc<PidNs>>>,
+    /// unshare(CLONE_NEWPID): the namespace its later children are created in.
+    pub child_pidns: SpinLock<Option<Arc<PidNs>>>,
+    /// clone with CLONE_FS: processes holding the same token share root and working
+    /// directory (chroot, chdir apply to all of them).
+    pub fs_share: SpinLock<Option<Arc<()>>>,
+}
+
+/// A PID namespace below the initial one (clone or unshare with CLONE_NEWPID). Nova keeps
+/// global ids internally (the initial namespace's numbers); a namespace numbers the
+/// processes and threads created in it or below it from 1, and system calls translate
+/// ids at the boundary (getpid, kill, wait, SCM_CREDENTIALS, ...).
+pub struct PidNs {
+    parent: Option<Arc<PidNs>>,
+    next: AtomicU64,
+    /// global id -> id in this namespace
+    local: SpinLock<BTreeMap<u64, u64>>,
+    /// id in this namespace -> global id
+    global: SpinLock<BTreeMap<u64, u64>>,
+}
+
+impl PidNs {
+    pub fn new(parent: Option<Arc<PidNs>>) -> Arc<Self> {
+        Arc::new(Self { parent, next: AtomicU64::new(1), local: SpinLock::new(BTreeMap::new()), global: SpinLock::new(BTreeMap::new()) })
+    }
+}
+
+/// Number the new process or thread `id` in `ns` and every namespace above it.
+pub fn pidns_add(ns: &Option<Arc<PidNs>>, id: u64) {
+    let mut n = ns.as_deref();
+    while let Some(ns) = n {
+        let local = ns.next.fetch_add(1, Ordering::Relaxed);
+        ns.local.lock().insert(id, local);
+        ns.global.lock().insert(local, id);
+        n = ns.parent.as_deref();
+    }
+}
+
+/// Process or thread `id` as `viewer` numbers it (0: outside its namespace).
+pub fn pid_view(viewer: &Process, id: u64) -> u64 {
+    match &*viewer.pidns.lock() {
+        None => id,
+        Some(ns) => ns.local.lock().get(&id).copied().unwrap_or(0),
+    }
+}
+
+/// The global id of what `viewer` calls `pid` (None: no such process in its namespace).
+pub fn pid_lookup(viewer: &Process, pid: u64) -> Option<u64> {
+    match &*viewer.pidns.lock() {
+        None => Some(pid),
+        Some(ns) => ns.global.lock().get(&pid).copied(),
+    }
 }
 
 /// Credentials of a process. Ids are kept as seen from the initial user namespace; in a
@@ -454,6 +507,9 @@ pub struct UserState {
     pub seccomp: crate::linux::seccomp::State,
     /// siginfo for the SIGSYS a seccomp trap queued.
     pub sigsys: Option<crate::linux::seccomp::Sigsys>,
+    /// For the current system call: resolve paths in this namespace instead of the
+    /// process's (a directory descriptor outside its root; see linux::dir_base).
+    pub ns_override: Option<Arc<crate::vfs::Namespace>>,
 }
 
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
@@ -1025,6 +1081,9 @@ impl Process {
             ns: SpinLock::new(crate::vfs::root()),
             cred: SpinLock::new(Cred::user()),
             exec_tid: AtomicU64::new(0),
+            pidns: SpinLock::new(None),
+            child_pidns: SpinLock::new(None),
+            fs_share: SpinLock::new(None),
         });
         TABLE.lock().insert(p.pid, Entry { parent, process: Arc::downgrade(&p), status: None });
         p
@@ -1082,6 +1141,16 @@ pub fn processes() -> Vec<Arc<Process>> {
 /// one, and tell the parent (SIGCHLD).
 fn finish(process: &Process, status: i32) {
     crate::linux::sysv::process_gone(process.pid);
+    // The init process of a PID namespace ends it: everything else in it is killed.
+    let ns = process.pidns.lock().clone();
+    if let Some(ns) = ns
+        && ns.global.lock().get(&1) == Some(&process.pid)
+    {
+        let members: Vec<u64> = ns.local.lock().keys().copied().collect();
+        for p in members.into_iter().filter(|&id| id != process.pid).filter_map(find) {
+            terminate(&p, crate::signal::SIGKILL);
+        }
+    }
     let parent = process.parent.load(Ordering::SeqCst);
     {
         let mut table = TABLE.lock();
@@ -1162,7 +1231,7 @@ pub fn terminate(p: &Process, sig: u32) {
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, comm: String::new(), recent: Recent::default(), in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0, no_new_privs: false, seccomp: Default::default(), sigsys: None })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, comm: String::new(), recent: Recent::default(), in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0, no_new_privs: false, seccomp: Default::default(), sigsys: None, ns_override: None })
     }
 }
 
@@ -1954,7 +2023,10 @@ pub fn current_fs_gs(u: &UserState) -> (u16, u16) {
 /// fork (and vfork, and clone without CLONE_VM): a new process with a copy of the
 /// caller's memory and open files, whose one thread resumes after the system call with
 /// rax = 0. With `vfork`, the caller waits until the child execs or exits.
-pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Option<u64>) -> Result<u64, i64> {
+pub const CLONE_FS: u64 = 0x200;
+pub const CLONE_NEWPID: u64 = 0x2000_0000;
+
+pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Option<u64>, flags: u64) -> Result<u64, i64> {
     let me = task::current_user().expect("fork outside a process");
     let parent = me.process.clone();
     let child = Process::new(&parent.name, &parent.exe.lock(), parent.pid);
@@ -1962,6 +2034,16 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
     child.trace.store(parent.trace.load(Ordering::Relaxed), Ordering::Relaxed);
     *child.ns.lock() = parent.ns.lock().clone();
     *child.cred.lock() = parent.cred.lock().clone();
+    // Its PID namespace: a new one below the parent's (CLONE_NEWPID), or the one the
+    // parent creates children in. Numbered before the child can run.
+    let base = parent.child_pidns.lock().clone().or_else(|| parent.pidns.lock().clone());
+    let ns = if flags & CLONE_NEWPID != 0 { Some(PidNs::new(base)) } else { base };
+    pidns_add(&ns, child.pid);
+    *child.pidns.lock() = ns;
+    if flags & CLONE_FS != 0 {
+        let token = parent.fs_share.lock().get_or_insert_with(|| Arc::new(())).clone();
+        *child.fs_share.lock() = Some(token);
+    }
     crate::linux::sysv::process_forked(parent.pid, child.pid);
     {
         let src = parent.mem.lock();
@@ -2126,6 +2208,7 @@ pub fn spawn_thread32(parent: &SyscallFrame, stack: u64, tls: [u64; gdt::TLS_ENT
     let me = task::current_user().expect("clone outside a process");
     let process = me.process.clone();
     let tid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    pidns_add(&process.pidns.lock().clone(), tid);
     let mut regs = SyscallFrame { ..*parent };
     regs.rax = 0;
     if stack != 0 {
@@ -2161,6 +2244,7 @@ pub fn spawn_thread(parent: &SyscallFrame, stack: u64, tls: Option<u64>, clear_t
     let me = task::current_user().expect("clone outside a process");
     let process = me.process.clone();
     let tid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    pidns_add(&process.pidns.lock().clone(), tid);
     let mut regs = SyscallFrame { ..*parent };
     regs.rax = 0;
     if stack != 0 {
