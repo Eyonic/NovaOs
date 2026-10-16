@@ -78,7 +78,7 @@ define_case() {
                         "Porting drivers with Claude" "⏺ PciConfig(00:03.0)" "⏺ Write(drivers/ac97.rs)"
                         "  ✓ Nova is installed. Your settings and files were copied." "[nova] rebooting")
                 CONTAINS=("e1000  Intel 82540EM" "sata1 (QEMU HARDDISK) 2048 MiB"
-                          "Intel audio device  no driver yet" "✓ Signed in." "network: online, address 10.0.2.15/24")
+                          "Intel audio device         no driver yet" "✓ Signed in." "network: online, address 10.0.2.15/24")
                 FORBID=("$PANIC" "$EXC" "API error") ;;
         installed) # Boot the disk the setup case installed: desktop, Claude Code builds an app.
                 CMDLINE=""; MOCK=1; BOOT_IMAGE="${run_dir:-}/target.img"
