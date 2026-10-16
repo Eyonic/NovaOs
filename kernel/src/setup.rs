@@ -256,6 +256,14 @@ pub fn run() -> ! {
     // Its terminal also mirrors the serial line.
     // The assistant waits behind its bubble (bottom-right) until clicked.
     wm::spawn_assistant(true, false, None);
+    // nova.launch=<app path>[,<file>]: open an app (and a file) as soon as the desktop is
+    // up, for screenshots and tests.
+    if let Some(what) = cmdline_flag("nova.launch") {
+        task::sleep_ticks(pit::HZ / 2);
+        for p in what.split(',') {
+            let _ = crate::apps::launch(p);
+        }
+    }
     loop {
         task::wait_event();
     }

@@ -260,6 +260,11 @@ pub fn system_file(path: &str) -> Option<&'static [u8]> {
     SYSTEM_FILES.lock().get(path).copied()
 }
 
+/// The system files whose path starts with `prefix` (e.g. the sample media).
+pub fn system_list(prefix: &str) -> Vec<String> {
+    SYSTEM_FILES.lock().range(String::from(prefix)..).take_while(|(p, _)| p.starts_with(prefix)).map(|(p, _)| p.clone()).collect()
+}
+
 pub fn read(name: &str) -> Result<Vec<u8>, String> {
     if let Some(data) = system_file(name) {
         return Ok(data.to_vec());

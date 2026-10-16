@@ -377,21 +377,45 @@ impl Reader<'_> {
 
     /// Skip a property list.
     fn proplist(&mut self) -> Option<()> {
+        self.props().map(|_| ())
+    }
+
+    /// A property list as (key, value) pairs; values are kept without their NUL.
+    fn props(&mut self) -> Option<Vec<(String, String)>> {
         self.tag(b'P')?;
-        while self.str()?.is_some() {
+        let mut out = Vec::new();
+        while let Some(key) = self.str()? {
             self.u32()?;
             self.tag(b'x')?;
             let len = self.be32()? as usize;
-            self.take(len)?;
+            let v = self.take(len)?;
+            out.push((key, String::from_utf8_lossy(v.strip_suffix(&[0]).unwrap_or(v)).into_owned()));
         }
-        Some(())
+        Some(out)
     }
 
-    /// Skip a format description.
-    fn format_info(&mut self) -> Option<()> {
+    /// A format description (pa_format_info, as `pa_stream_new_extended` sends): the
+    /// sample spec it describes if it is PCM with a known format, rate and channels (the
+    /// values are JSON: `"s16le"`, `48000`, `2`).
+    fn format_info(&mut self) -> Option<Option<Spec>> {
         self.tag(b'f')?;
-        self.u8()?;
-        self.proplist()
+        let encoding = self.u8()?;
+        let props = self.props()?;
+        if encoding != 1 {
+            return Some(None);
+        }
+        let get = |k: &str| props.iter().find(|(key, _)| key == k).map(|(_, v)| String::from(v.trim().trim_matches('"')));
+        let format = match get("format.sample_format").as_deref() {
+            Some("u8") => U8,
+            Some("s16le") => S16LE,
+            Some("s16be") => S16BE,
+            Some("float32le") => FLOAT32LE,
+            Some("s32le") => S32LE,
+            _ => return Some(None),
+        };
+        let rate: u32 = get("format.rate")?.parse().ok()?;
+        let channels: u8 = get("format.channels")?.parse().ok()?;
+        Some(Some(Spec { format, channels, rate }))
     }
 }
 
@@ -757,8 +781,8 @@ impl Client {
         if v < 13 {
             r.str().ok_or(bad)?; // name (in the property list since)
         }
-        let spec = r.spec().ok_or(bad)?;
-        let map = r.map().ok_or(bad)?;
+        let mut spec = r.spec().ok_or(bad)?;
+        let mut map = r.map().ok_or(bad)?;
         let (sink_index, sink_name) = (r.u32().ok_or(bad)?, r.str().ok_or(bad)?);
         let maxlength = r.u32().ok_or(bad)?;
         let corked = r.bool().ok_or(bad)?;
@@ -796,8 +820,20 @@ impl Client {
             r.bool().ok_or(bad)?; // passthrough
         }
         if v >= 21 {
+            // pa_stream_new_extended (VLC, GStreamer): the sample spec is left invalid
+            // and a list of acceptable formats is sent instead; the first PCM one wins.
             for _ in 0..r.u8().ok_or(bad)? {
-                r.format_info().ok_or(bad)?;
+                if let Some(f) = r.format_info().ok_or(bad)?
+                    && !spec.supported()
+                    && f.supported()
+                {
+                    spec = f;
+                    map = match f.channels {
+                        1 => alloc::vec![0],
+                        2 => alloc::vec![1, 2],
+                        n => (0..n).collect(),
+                    };
+                }
             }
         }
         if sink_index != INVALID && sink_index != 0 || !is_sink(Some(INVALID), sink_name.as_deref()) {

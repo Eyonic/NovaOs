@@ -627,6 +627,22 @@ impl Namespace {
 
 /// Write a whole file at canonical path `p` in the initial namespace (kernel use: the
 /// `wayland save` command), creating it if needed.
+/// The contents of the file at `p` (any mount), for kernel code.
+pub fn read_file(p: &str) -> Result<Vec<u8>, i64> {
+    let ns = root();
+    let (m, rel) = ns.find_mount(&ns.walk("", p, true)?);
+    match m.fs.open(&rel)? {
+        Content::Static(d) => Ok(d.to_vec()),
+        Content::Copy(d) => Ok(d),
+        Content::Shared(s) => {
+            let mut s = s.lock();
+            let n = s.size as usize;
+            Ok(s.read(0, n))
+        }
+        Content::Device(_) => Err(EINVAL),
+    }
+}
+
 pub fn write_file(p: &str, data: &[u8]) -> Result<(), i64> {
     let ns = root();
     let (m, rel) = ns.find_mount(p);

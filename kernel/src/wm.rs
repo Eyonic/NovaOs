@@ -105,6 +105,8 @@ pub struct Window {
     pub minimized: bool,
     /// Wants [`Event::RawKey`] and [`Event::Pointer`] (see [`set_raw_input`]).
     pub raw_input: bool,
+    /// Covering the whole screen ([`set_fullscreen`]): the geometry to go back to.
+    pub fullscreen: Option<(i32, i32, i32, i32)>,
 }
 
 pub type WindowRef = Arc<SpinLock<Window>>;
@@ -181,6 +183,7 @@ pub fn open(title: &str, icon: char, accent: u32, w: i32, h: i32, content: Conte
         closed: false,
         minimized: false,
         raw_input: false,
+        fullscreen: None,
     }));
     WINDOWS.lock().push(win.clone());
     FOCUS.store(id, Ordering::Relaxed);
@@ -259,6 +262,34 @@ pub fn set_size(win: &WindowRef, w: i32, h: i32) {
     win.w = w.clamp(1, sw - 2);
     win.h = h.clamp(1, sh - TITLE_H - 1);
     win.dirty = true;
+    request_redraw();
+}
+
+/// Make the client area cover the screen (the frame moves off it), or restore the
+/// window's previous place and size. Apps leave it with a key (Escape, F).
+pub fn set_fullscreen(win: &WindowRef, on: bool) {
+    let (sw, sh) = *SCREEN_SIZE.lock();
+    let mut w = win.lock();
+    match (on, w.fullscreen) {
+        (true, None) => {
+            w.fullscreen = Some((w.x, w.y, w.w, w.h));
+            w.x = -1;
+            w.y = -TITLE_H;
+            w.w = sw;
+            w.h = sh;
+        }
+        (false, Some((x, y, cw, ch))) => {
+            w.fullscreen = None;
+            w.x = x;
+            w.y = y;
+            w.w = cw;
+            w.h = ch;
+        }
+        _ => return,
+    }
+    w.push(Event::Resized);
+    w.dirty = true;
+    drop(w);
     request_redraw();
 }
 
@@ -1054,7 +1085,7 @@ fn draw_window(scene: &mut Canvas, w: &Window, focused: bool, hover: Option<(i32
 
     let (ox, oy) = w.client_origin();
     let client = Rect::new(ox, oy, w.w, w.h);
-    let inner = radius - 1;
+    let inner = if w.fullscreen.is_some() { 0 } else { radius - 1 };
     match &w.content {
         Content::Canvas(c) => {
             scene.fill_round_rect_corners(client, inner, theme::WINDOW_BG, BOTTOM_CORNERS, 255);

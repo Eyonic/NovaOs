@@ -521,7 +521,7 @@ impl FdTable {
         }
     }
 
-    fn get(&self, fd: i64) -> Result<FileRef, i64> {
+    pub fn get(&self, fd: i64) -> Result<FileRef, i64> {
         // File descriptors are C ints: the upper half of the register is not part of them.
         let fd = fd as i32 as i64;
         if fd < 0 {
