@@ -274,13 +274,33 @@ copy_with_deps() {
 # system, not from Steam's runtime.
 if [[ "${NOVA_STEAM:-0}" == 1 && -f /usr/lib/libGL.so.1 ]]; then
     copy_with_deps /usr/lib/libGL.so.1 /usr/lib/libGLX.so.0 /usr/lib/libGLdispatch.so.0 /usr/lib/libGLX_mesa.so.0 \
-        /usr/lib/libEGL.so.1 /usr/lib/libEGL_mesa.so.0 /usr/lib/libgbm.so.1 /usr/lib/dri/swrast_dri.so /usr/lib/dri/kms_swrast_dri.so
+        /usr/lib/libEGL.so.1 /usr/lib/libEGL_mesa.so.0 /usr/lib/libgbm.so.1 /usr/lib/gbm/dri_gbm.so \
+        /usr/lib/dri/swrast_dri.so /usr/lib/dri/kms_swrast_dri.so
 fi
 if [[ "${NOVA_STEAM:-0}" == 1 && -f /usr/lib32/libGL.so.1 ]]; then
     copy_with_deps /usr/lib32/libGL.so.1 /usr/lib32/libGLX.so.0 /usr/lib32/libGLdispatch.so.0 /usr/lib32/libGLX_mesa.so.0 \
         /usr/lib32/libEGL.so.1 /usr/lib32/libEGL_mesa.so.0 /usr/lib32/libva.so.2 /usr/lib32/libdrm.so.2 \
         /usr/lib32/dri/swrast_dri.so /usr/lib32/dri/kms_swrast_dri.so
     [[ -d /usr/share/glvnd ]] && { mkdir -p "$SYSROOT/usr/share"; cp -r /usr/share/glvnd "$SYSROOT/usr/share/"; }
+fi
+# NOVA_DRM_TOOLS=1: the host's DRM and EGL tools for trying the user-space GPU path on
+# /dev/dri (docs/linux-drivers.md): libdrm's modetest, vbltest and proptest, mesa-utils'
+# eglinfo, Mesa's EGL, GBM (with its backend) and GLES with the software rasterizer and
+# AMD's radeonsi, RADV with the Vulkan loader and vulkaninfo (for the RX 6000 machine),
+# and kmscube if NOVA_KMSCUBE names a build of it. Into this image only.
+if [[ "${NOVA_DRM_TOOLS:-0}" == 1 ]]; then
+    copy_with_deps /usr/bin/modetest /usr/bin/vbltest /usr/bin/proptest /usr/bin/eglinfo /usr/lib/libEGL.so.1 \
+        /usr/lib/libEGL_mesa.so.0 /usr/lib/libgbm.so.1 /usr/lib/gbm/dri_gbm.so /usr/lib/libGLESv2.so.2 \
+        /usr/lib/dri/swrast_dri.so /usr/lib/dri/kms_swrast_dri.so /usr/lib/dri/radeonsi_dri.so \
+        /usr/bin/vulkaninfo /usr/lib/libvulkan.so.1 /usr/lib/libvulkan_radeon.so /usr/lib/libVkLayer_MESA_device_select.so
+    for d in /usr/share/glvnd /usr/share/vulkan /usr/share/libdrm; do
+        [[ -d "$d" ]] && { mkdir -p "$SYSROOT/usr/share"; cp -r "$d" "$SYSROOT/usr/share/"; }
+    done
+    if [[ -n "${NOVA_KMSCUBE:-}" && -x "$NOVA_KMSCUBE" ]]; then
+        mkdir -p "$SYSROOT/usr/bin"
+        cp "$NOVA_KMSCUBE" "$SYSROOT/usr/bin/kmscube"
+        copy_with_deps $(ldd "$NOVA_KMSCUBE" | awk '/=> \//{print $3}')
+    fi
 fi
 # Steam's launcher and bootstrap (Valve's proprietary redistributable), if the host has the
 # steam package: only into this local image, never into the repository.

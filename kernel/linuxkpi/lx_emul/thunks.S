@@ -12,55 +12,68 @@ SYM_FUNC_END(preempt_schedule_thunk)
 
 /*
  * __get_user_N / __put_user_N with Linux's register convention (arch/x86/lib/getuser.S,
- * putuser.S): get takes the address in %rax and returns the value in %rdx and 0 in
- * %rax; put takes the value in %rax and the address in %rcx and returns 0 in %rcx. All
- * Linux code in Nova runs in the kernel with kernel pointers, so these are plain loads
- * and stores (no fault handling needed).
+ * putuser.S): get takes the address in %rax and returns the value in %rdx and 0 (or
+ * -EFAULT) in %rax; put takes the value in %rax and the address in %rcx and returns 0
+ * (or -EFAULT) in %rcx. Every other register is preserved. The address is checked
+ * against the program's mappings first (nova_lx_user_ok, user.c; kernel pointers pass);
+ * a page that is not present yet is filled by Nova's page-fault handler.
  */
-SYM_FUNC_START(__get_user_1)
-	movzbl	(%rax), %edx
+.macro LX_USER_CHECK addr, size, write
+	push	%rax
+	push	%rcx
+	push	%rdx
+	push	%rsi
+	push	%rdi
+	push	%r8
+	push	%r9
+	push	%r10
+	push	%r11
+	mov	\addr, %rdi
+	mov	$\size, %esi
+	mov	$\write, %edx
+	call	nova_lx_user_ok
+	test	%al, %al
+	pop	%r11
+	pop	%r10
+	pop	%r9
+	pop	%r8
+	pop	%rdi
+	pop	%rsi
+	pop	%rdx
+	pop	%rcx
+	pop	%rax
+.endm
+
+.macro LX_GET_USER size, load
+SYM_FUNC_START(__get_user_\size)
+	LX_USER_CHECK %rax, \size, 0
+	jz	1f
+	\load
 	xorl	%eax, %eax
 	RET
-SYM_FUNC_END(__get_user_1)
-
-SYM_FUNC_START(__get_user_2)
-	movzwl	(%rax), %edx
-	xorl	%eax, %eax
+1:	xorl	%edx, %edx
+	movq	$-14, %rax		/* -EFAULT */
 	RET
-SYM_FUNC_END(__get_user_2)
+SYM_FUNC_END(__get_user_\size)
+.endm
 
-SYM_FUNC_START(__get_user_4)
-	movl	(%rax), %edx
-	xorl	%eax, %eax
-	RET
-SYM_FUNC_END(__get_user_4)
-
-SYM_FUNC_START(__get_user_8)
-	movq	(%rax), %rdx
-	xorl	%eax, %eax
-	RET
-SYM_FUNC_END(__get_user_8)
-
-SYM_FUNC_START(__put_user_1)
-	movb	%al, (%rcx)
+.macro LX_PUT_USER size, store
+SYM_FUNC_START(__put_user_\size)
+	LX_USER_CHECK %rcx, \size, 1
+	jz	1f
+	\store
 	xorl	%ecx, %ecx
 	RET
-SYM_FUNC_END(__put_user_1)
-
-SYM_FUNC_START(__put_user_2)
-	movw	%ax, (%rcx)
-	xorl	%ecx, %ecx
+1:	movq	$-14, %rcx		/* -EFAULT */
 	RET
-SYM_FUNC_END(__put_user_2)
+SYM_FUNC_END(__put_user_\size)
+.endm
 
-SYM_FUNC_START(__put_user_4)
-	movl	%eax, (%rcx)
-	xorl	%ecx, %ecx
-	RET
-SYM_FUNC_END(__put_user_4)
-
-SYM_FUNC_START(__put_user_8)
-	movq	%rax, (%rcx)
-	xorl	%ecx, %ecx
-	RET
-SYM_FUNC_END(__put_user_8)
+LX_GET_USER 1, "movzbl (%rax), %edx"
+LX_GET_USER 2, "movzwl (%rax), %edx"
+LX_GET_USER 4, "movl (%rax), %edx"
+LX_GET_USER 8, "movq (%rax), %rdx"
+LX_PUT_USER 1, "movb %al, (%rcx)"
+LX_PUT_USER 2, "movw %ax, (%rcx)"
+LX_PUT_USER 4, "movl %eax, (%rcx)"
+LX_PUT_USER 8, "movq %rax, (%rcx)"

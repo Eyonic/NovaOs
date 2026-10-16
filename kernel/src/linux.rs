@@ -30,6 +30,8 @@ use crate::vfs;
 
 pub mod compat32;
 pub mod seccomp;
+#[cfg(feature = "linux-drivers")]
+pub mod lxfile;
 pub mod sysv;
 use crate::sync::SpinLock;
 use crate::{ipc, pit, rand, rtc, task};
@@ -123,6 +125,9 @@ pub enum Kind {
     /// is where it is written back.
     File { path: String, at: vfs::At, data: FileData, writable: bool, append: bool, dirty: bool },
     Dir { at: vfs::At },
+    /// A Linux driver's file: a DRM device node, a dma-buf, a sync file (lxfile.rs).
+    #[cfg(feature = "linux-drivers")]
+    Linux(lxfile::LxFile),
 }
 
 pub struct OpenFile {
@@ -444,6 +449,11 @@ fn new_file(kind: Kind, flags: u64) -> FileRef {
 
 /// Readiness of a file for poll/epoll: (events, generation).
 fn poll_file(f: &FileRef) -> (u32, u64) {
+    // A Linux driver's file: its f_op->poll (without the OpenFile lock; it may sleep).
+    #[cfg(feature = "linux-drivers")]
+    if let Some(r) = lxfile::poll(f) {
+        return r;
+    }
     let f = f.lock();
     match &f.kind {
         Kind::Channel(end) => end.poll(),
@@ -482,6 +492,9 @@ fn fds_stdin_empty() -> bool {
 
 pub struct FdTable {
     fds: Vec<Option<FileRef>>,
+    /// Slots Linux code reserved (get_unused_fd_flags) and fills next (fd_install),
+    /// with their close-on-exec flag.
+    reserved: BTreeMap<usize, bool>,
     /// Descriptors closed by execve (O_CLOEXEC / FD_CLOEXEC).
     cloexec: alloc::collections::BTreeSet<usize>,
     pub cwd: String,
@@ -492,12 +505,12 @@ pub struct FdTable {
 impl FdTable {
     pub fn new() -> Self {
         let tty = || Some(Arc::new(SpinLock::new(OpenFile { kind: Kind::Tty, pos: 0, flags: 2, at: None })));
-        Self { fds: vec![tty(), tty(), tty()], cloexec: Default::default(), cwd: String::new(), stdin: Vec::new() }
+        Self { fds: vec![tty(), tty(), tty()], reserved: BTreeMap::new(), cloexec: Default::default(), cwd: String::new(), stdin: Vec::new() }
     }
 
     /// fork: the child shares every open file (offsets included), as on Linux.
     pub fn fork(&self) -> Self {
-        Self { fds: self.fds.clone(), cloexec: self.cloexec.clone(), cwd: self.cwd.clone(), stdin: Vec::new() }
+        Self { fds: self.fds.clone(), reserved: BTreeMap::new(), cloexec: self.cloexec.clone(), cwd: self.cwd.clone(), stdin: Vec::new() }
     }
 
     /// execve: close the descriptors marked close-on-exec.
@@ -540,8 +553,30 @@ impl FdTable {
         self.cloexec.remove(&n);
     }
 
+    /// get_unused_fd_flags() for Linux code: the lowest free slot, held until
+    /// [`FdTable::fill_reserved`] or [`FdTable::unreserve`].
+    #[cfg(feature = "linux-drivers")]
+    fn reserve(&mut self, cloexec: bool) -> Option<usize> {
+        let slot = (0..).find(|&i| (i >= self.fds.len() || self.fds[i].is_none()) && !self.reserved.contains_key(&i))?;
+        self.reserved.insert(slot, cloexec);
+        Some(slot)
+    }
+
+    #[cfg(feature = "linux-drivers")]
+    fn unreserve(&mut self, fd: usize) {
+        self.reserved.remove(&fd);
+    }
+
+    /// fd_install() for Linux code.
+    #[cfg(feature = "linux-drivers")]
+    fn fill_reserved(&mut self, fd: usize, f: FileRef) {
+        let cloexec = self.reserved.remove(&fd).unwrap_or(false);
+        self.install(fd, f);
+        self.set_cloexec(fd as i64, cloexec);
+    }
+
     fn add(&mut self, f: FileRef, min: usize) -> i64 {
-        let slot = (min..).find(|&i| i >= self.fds.len() || self.fds[i].is_none()).unwrap();
+        let slot = (min..).find(|&i| (i >= self.fds.len() || self.fds[i].is_none()) && !self.reserved.contains_key(&i)).unwrap();
         if slot >= self.fds.len() {
             self.fds.resize(slot + 1, None);
         }
@@ -708,6 +743,7 @@ fn stat_meta(m: &vfs::Meta) -> Vec<u8> {
     b[16..24].copy_from_slice(&(m.nlink as u64).to_le_bytes());
     b[28..32].copy_from_slice(&m.uid.to_le_bytes());
     b[32..36].copy_from_slice(&m.gid.to_le_bytes());
+    b[40..48].copy_from_slice(&m.rdev.to_le_bytes());
     b
 }
 
@@ -873,7 +909,7 @@ pub fn special_mounts() -> Vec<(&'static str, Arc<dyn vfs::Backend>)> {
 }
 
 fn meta(ty: vfs::Type, perm: u32, size: u64, name: &str) -> vfs::Meta {
-    vfs::Meta { ty, perm, size, mtime: 0, ino: ino_of(name), nlink: if ty == vfs::Type::Dir { 2 } else { 1 }, uid: 0, gid: 0 }
+    vfs::Meta { ty, perm, size, mtime: 0, ino: ino_of(name), nlink: if ty == vfs::Type::Dir { 2 } else { 1 }, uid: 0, gid: 0, rdev: 0 }
 }
 
 /// /proc paths of any process ("<pid>/...", "thread-self/...") as "self/...": every
@@ -959,6 +995,8 @@ fn fd_link(n: i64) -> Option<String> {
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Memfd(_, None) => "/memfd: (deleted)".into(),
         Kind::Inet(_) | Kind::Unix(_) => "socket:[2]".into(),
+        #[cfg(feature = "linux-drivers")]
+        Kind::Linux(l) => lxfile::name(l),
     })
 }
 
@@ -1125,6 +1163,16 @@ impl vfs::Backend for DevFs {
         if matches!(p, "" | "shm" | "pts") {
             return Ok(meta(vfs::Type::Dir, if p == "shm" { 0o1777 } else { 0o755 }, 0, p));
         }
+        // Linux drivers' device nodes: /dev/dri and its card and render nodes.
+        #[cfg(feature = "linux-drivers")]
+        {
+            if p == "dri" && !lxfile::dev_entries("dri").is_empty() {
+                return Ok(meta(vfs::Type::Dir, 0o755, 0, p));
+            }
+            if let Some((major, minor)) = lxfile::dev_node(p) {
+                return Ok(vfs::Meta { rdev: lxfile::encode_dev(major, minor), ..meta(vfs::Type::Chr, 0o666, 0, p) });
+            }
+        }
         if DEV_NODES.contains(&p) {
             return Ok(meta(vfs::Type::Chr, 0o666, 0, p));
         }
@@ -1137,19 +1185,34 @@ impl vfs::Backend for DevFs {
         DEV_LINKS.iter().find(|(n, _)| *n == p).map(|(_, t)| t.to_string())
     }
     fn list(&self, p: &str) -> Result<Vec<(String, vfs::Type, u64)>, i64> {
+        #[cfg(feature = "linux-drivers")]
+        if p == "dri" {
+            return Ok(lxfile::dev_entries("dri").into_iter().map(|(n, _, _)| (n.clone(), vfs::Type::Chr, ino_of(&format!("dri/{n}")))).collect());
+        }
         Ok(match p {
-            "" => DEV_NODES
-                .iter()
-                .map(|n| (n.to_string(), vfs::Type::Chr, ino_of(n)))
-                .chain(DEV_LINKS.iter().map(|(n, _)| (n.to_string(), vfs::Type::Lnk, ino_of(n))))
-                .chain(["shm", "pts"].iter().map(|n| (n.to_string(), vfs::Type::Dir, ino_of(n))))
-                .collect(),
+            "" => {
+                let mut v: Vec<(String, vfs::Type, u64)> = DEV_NODES
+                    .iter()
+                    .map(|n| (n.to_string(), vfs::Type::Chr, ino_of(n)))
+                    .chain(DEV_LINKS.iter().map(|(n, _)| (n.to_string(), vfs::Type::Lnk, ino_of(n))))
+                    .chain(["shm", "pts"].iter().map(|n| (n.to_string(), vfs::Type::Dir, ino_of(n))))
+                    .collect();
+                #[cfg(feature = "linux-drivers")]
+                if !lxfile::dev_entries("dri").is_empty() {
+                    v.push(("dri".into(), vfs::Type::Dir, ino_of("dri")));
+                }
+                v
+            }
             "shm" => SHM.lock().keys().map(|n| (n.clone(), vfs::Type::Reg, ino_of(n))).collect(),
             "pts" => Vec::new(),
             _ => return Err(ENOTDIR),
         })
     }
     fn open(&self, p: &str) -> Result<vfs::Content, i64> {
+        #[cfg(feature = "linux-drivers")]
+        if let Some((major, minor)) = lxfile::dev_node(p) {
+            return Ok(vfs::Content::Linux(major, minor));
+        }
         DEV_NODES.iter().find(|n| **n == p).map(|n| vfs::Content::Device(n)).ok_or(ENOENT)
     }
     fn create(&self, _: &str, _: u32) -> Result<(), i64> {
@@ -1196,17 +1259,34 @@ impl vfs::Backend for SysFs {
         if let Some(t) = proc_file(&format!("sys/{p}")) {
             return Ok(meta(vfs::Type::Reg, 0o444, t.len() as u64, p));
         }
+        // The DRM devices of Linux drivers (/sys/class/drm, /sys/dev/char, their parents).
+        #[cfg(feature = "linux-drivers")]
+        if let Some(n) = lxfile::sys_node(p) {
+            return Ok(match n {
+                lxfile::SysNode::Dir => meta(vfs::Type::Dir, 0o755, 0, p),
+                lxfile::SysNode::File(b) => meta(vfs::Type::Reg, 0o444, b.len() as u64, p),
+                lxfile::SysNode::Link(t) => meta(vfs::Type::Lnk, 0o777, t.len() as u64, p),
+            });
+        }
         if p.is_empty() || SYS_FILES.iter().any(|f| f.starts_with(p) && f.as_bytes().get(p.len()) == Some(&b'/')) {
             return Ok(meta(vfs::Type::Dir, 0o555, 0, p));
         }
         Err(ENOENT)
     }
-    fn link_target(&self, _: &str) -> Option<String> {
+    fn link_target(&self, _p: &str) -> Option<String> {
+        #[cfg(feature = "linux-drivers")]
+        if let Some(lxfile::SysNode::Link(t)) = lxfile::sys_node(_p) {
+            return Some(t);
+        }
         None
     }
     fn list(&self, p: &str) -> Result<Vec<(String, vfs::Type, u64)>, i64> {
         let prefix = if p.is_empty() { String::new() } else { format!("{p}/") };
         let mut names = BTreeMap::new();
+        #[cfg(feature = "linux-drivers")]
+        for (n, t) in lxfile::sys_list(p) {
+            names.insert(n, t);
+        }
         for f in SYS_FILES.iter().filter_map(|f| f.strip_prefix(prefix.as_str())) {
             match f.split_once('/') {
                 Some((d, _)) => names.insert(d.to_string(), vfs::Type::Dir),
@@ -1216,6 +1296,10 @@ impl vfs::Backend for SysFs {
         Ok(names.into_iter().map(|(n, t)| (n.clone(), t, ino_of(&n))).collect())
     }
     fn open(&self, p: &str) -> Result<vfs::Content, i64> {
+        #[cfg(feature = "linux-drivers")]
+        if let Some(lxfile::SysNode::File(b)) = lxfile::sys_node(p) {
+            return Ok(vfs::Content::Copy(b));
+        }
         proc_file(&format!("sys/{p}")).map(|t| vfs::Content::Copy(t.into_bytes())).ok_or(ENOENT)
     }
     fn create(&self, _: &str, _: u32) -> Result<(), i64> {
@@ -1326,6 +1410,10 @@ fn statx(s: &[u8]) -> Vec<u8> {
     }
     put(80, &q(88).to_le_bytes()); // btime = mtime
     put(88, &(q(96) as u32).to_le_bytes());
+    // stx_rdev_major, stx_rdev_minor from st_rdev (Linux's new_encode_dev)
+    let rdev = q(40);
+    put(128, &(((rdev >> 8) & 0xFFF) as u32).to_le_bytes());
+    put(132, &((rdev & 0xFF | (rdev >> 12) & !0xFF) as u32).to_le_bytes());
     b
 }
 
@@ -1358,6 +1446,8 @@ fn stat_file(f: &OpenFile) -> Vec<u8> {
         },
         Kind::Memfd(m, None) => stat_buf(0o100600, m.lock().size, 0, 5),
         Kind::Inet(_) | Kind::Unix(_) => stat_buf(0o140777, 0, 0, 6),
+        #[cfg(feature = "linux-drivers")]
+        Kind::Linux(l) => lxfile::stat(l),
     }
 }
 
@@ -1428,6 +1518,8 @@ fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
                 vfs::Type::Lnk => return Err(ELOOP), // O_NOFOLLOW on a link
                 vfs::Type::Fifo => open_fifo(&m, &rel, acc),
                 vfs::Type::Chr => match m.fs.open(&rel)? {
+                    #[cfg(feature = "linux-drivers")]
+                    vfs::Content::Linux(major, minor) => lxfile::open(major, minor, flags)?,
                     vfs::Content::Device("null") => Kind::Null,
                     vfs::Content::Device("zero" | "full") => Kind::Zero,
                     vfs::Content::Device("random" | "urandom") => Kind::Random,
@@ -1447,6 +1539,8 @@ fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
                             Kind::File { path: name, at, data: FileData::Static(s), writable: false, append: false, dirty: false }
                         }
                         vfs::Content::Device(_) => return Err(EINVAL),
+                        #[cfg(feature = "linux-drivers")]
+                        vfs::Content::Linux(..) => return Err(EINVAL),
                         vfs::Content::Copy(data) => Kind::File {
                             path: name,
                             at,
@@ -1634,6 +1728,15 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     if is_inet(f) {
         return inet_recv(f, len, false, false).map(|(d, _)| d);
     }
+    // A Linux driver's file (DRM events): its read, into a kernel buffer (copy_to_user
+    // takes kernel pointers too).
+    #[cfg(feature = "linux-drivers")]
+    if lxfile::is_linux(f) {
+        let mut buf = vec![0u8; len.min(1 << 20)];
+        let n = lxfile::read(f, buf.as_mut_ptr() as u64, buf.len() as u64).unwrap_or(Err(EINVAL))?;
+        buf.truncate(n as usize);
+        return Ok(buf);
+    }
     let mut f = f.lock();
     let pos = at.unwrap_or(f.pos);
     let out = match &f.kind {
@@ -1651,6 +1754,8 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
         Kind::Epoll(_) | Kind::Inet(_) => return Err(EINVAL),
         Kind::Unix(_) => return Err(ENOTCONN),
         Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::SignalFd(_) => unreachable!(),
+        #[cfg(feature = "linux-drivers")]
+        Kind::Linux(_) => unreachable!(),
     };
     if at.is_none() {
         f.pos = pos + out.len();
@@ -1664,6 +1769,10 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
     }
     if is_inet(f) {
         return inet_send(f, data, None, false);
+    }
+    #[cfg(feature = "linux-drivers")]
+    if let Some(r) = lxfile::write(f, data.as_ptr() as u64, data.len() as u64) {
+        return r.map(|n| n as usize);
     }
     let mut f = f.lock();
     let pos = at.unwrap_or(f.pos);
@@ -1691,6 +1800,8 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
             return Ok(data.len());
         }
         Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
+        #[cfg(feature = "linux-drivers")]
+        Kind::Linux(_) => return Err(EINVAL),
         Kind::Unix(_) => return Err(ENOTCONN),
         Kind::File { data: contents, writable, append, dirty, .. } => {
             if !*writable {
@@ -1813,6 +1924,11 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     thread().syscall_arg2 = a1;
     let r = dispatch(f, nr, a0, a1, a2, a3, a4, a5);
     thread().ns_override = None;
+    // Linux mappings unmapped by this call: their drivers' vm_ops->close, lock-free now.
+    #[cfg(feature = "linux-drivers")]
+    if lxfile::reap_pending() {
+        lxfile::reap();
+    }
     thread().recent.push(nr, [a0, a1, a2], r);
     thread().in_syscall = u64::MAX;
     if trace {
@@ -1849,6 +1965,8 @@ fn kind_name(k: &Kind) -> String {
         Kind::Memfd(_, Some(at)) => format!("file {}", at.rel),
         Kind::Memfd(_, None) => "memfd".into(),
         Kind::Inet(s) => format!("inet {}", if s.udp { "udp" } else { "tcp" }),
+        #[cfg(feature = "linux-drivers")]
+        Kind::Linux(l) => lxfile::kind_name(l),
     }
 }
 
@@ -2444,6 +2562,10 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             8 => {
                 // lseek
                 let file = fds().get(a0 as i64)?;
+                #[cfg(feature = "linux-drivers")]
+                if let Some(r) = lxfile::llseek(&file, a1 as i64, a2) {
+                    return r;
+                }
                 let mut fl = file.lock();
                 let len = match &fl.kind {
                     Kind::File { data, .. } => data.len() as i64,
@@ -2494,6 +2616,12 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     // File mapping. Read-only system files: map their pages directly
                     // (copy on write). Other files: copy the contents in.
                     let file = fds().get(fd)?;
+                    // A Linux driver's file (GPU buffers): the driver maps its pages.
+                    #[cfg(feature = "linux-drivers")]
+                    if let Some(r) = lxfile::mmap(&file, addr, len, a2, flags, a5) {
+                        r?;
+                        return Ok(addr as i64);
+                    }
                     let fl = file.lock();
                     match &fl.kind {
                         Kind::Memfd(m, _) if flags & 3 != 2 => {
@@ -2710,6 +2838,14 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             16 => {
                 // ioctl
                 let file = fds().get(a0 as i64)?;
+                // A Linux driver's file: its unlocked_ioctl, or compat_ioctl for a
+                // 32-bit program (FIONBIO is the VFS's, as on Linux).
+                #[cfg(feature = "linux-drivers")]
+                if a1 != 0x5421
+                    && let Some(r) = lxfile::ioctl(&file, a1, a2, thread().compat)
+                {
+                    return r;
+                }
                 let tty = matches!(file.lock().kind, Kind::Tty);
                 match a1 {
                     0x5401 if tty => {
@@ -2751,6 +2887,12 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         let on = read_u32(a2)? != 0;
                         let mut f = file.lock();
                         f.flags = if on { f.flags | O_NONBLOCK } else { f.flags & !O_NONBLOCK };
+                        #[cfg(feature = "linux-drivers")]
+                        {
+                            let flags = f.flags;
+                            drop(f);
+                            lxfile::set_flags(&file, flags);
+                        }
                         0
                     }
                     _ => return Err(ENOTTY),
@@ -2895,6 +3037,12 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     let file = fds().get(a0 as i64)?;
                     let mut f = file.lock();
                     f.flags = (f.flags & !O_NONBLOCK) | (a2 & O_NONBLOCK);
+                    #[cfg(feature = "linux-drivers")]
+                    {
+                        let flags = f.flags;
+                        drop(f);
+                        lxfile::set_flags(&file, flags);
+                    }
                     0
                 }
                 _ => return Err(EINVAL),

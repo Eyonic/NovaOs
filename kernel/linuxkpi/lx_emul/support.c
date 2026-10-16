@@ -5,6 +5,7 @@
  * parts of the VFS and process model that drivers touch but Nova does not have.
  */
 #include <linux/slab.h>
+#include <linux/uaccess.h>
 #include <linux/rcupdate.h>
 #include <linux/cpuhotplug.h>
 #include <linux/platform_device.h>
@@ -117,7 +118,10 @@ void *memdup_user(const void __user *src, size_t len)
 
 	if (!p)
 		return ERR_PTR(-ENOMEM);
-	memcpy(p, (const void __force *)src, len);
+	if (copy_from_user(p, src, len)) {
+		kfree(p);
+		return ERR_PTR(-EFAULT);
+	}
 	return p;
 }
 
@@ -517,12 +521,6 @@ ssize_t iov_iter_extract_pages(struct iov_iter *i, struct page ***pages, size_t 
 
 void unpin_user_page(struct page *page)
 {
-}
-
-int remap_pfn_range(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn, unsigned long size,
-		    pgprot_t pgprot)
-{
-	return -EINVAL;
 }
 
 int kill_pid_usb_asyncio(int sig, int errno, sigval_t addr, struct pid *pid, const struct cred *cred)

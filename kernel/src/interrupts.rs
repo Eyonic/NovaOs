@@ -380,6 +380,13 @@ extern "C" fn exception_dispatch(frame: &ExceptionFrame) {
         }
     }
 
+    // Linux driver code touching a program's memory that is not present yet
+    // (copy_to_user into a fresh buffer, a driver mapping's pages).
+    #[cfg(feature = "linux-drivers")]
+    if frame.vector == 14 && frame.error_code & 4 == 0 && crate::process::kernel_user_fault(cr2, frame.error_code) {
+        return;
+    }
+
     match DEPTH.fetch_add(1, Ordering::SeqCst) {
         0 => report(frame, info, cr2),
         // The reporter itself faulted. Print one short line and stop.

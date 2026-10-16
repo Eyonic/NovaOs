@@ -201,26 +201,16 @@ void *kmemdup_noprof(const void *src, size_t len, gfp_t gfp)
 	return p;
 }
 
-/* All Linux code in Nova runs in the kernel: "user" pointers are kernel pointers. */
-unsigned long _copy_from_user(void *to, const void __user *from, unsigned long n)
-{
-	memcpy(to, (const void __force *)from, n);
-	return 0;
-}
-
-unsigned long _copy_to_user(void __user *to, const void *from, unsigned long n)
-{
-	memcpy((void __force *)to, from, n);
-	return 0;
-}
-
 void *memdup_user_nul(const void __user *src, size_t len)
 {
 	char *p = lx_kmalloc(len + 1, GFP_KERNEL);
 
 	if (!p)
 		return ERR_PTR(-ENOMEM);
-	memcpy(p, (const void __force *)src, len);
+	if (copy_from_user(p, src, len)) {
+		kfree(p);
+		return ERR_PTR(-EFAULT);
+	}
 	p[len] = '\0';
 	return p;
 }

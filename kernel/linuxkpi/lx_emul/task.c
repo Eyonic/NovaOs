@@ -16,6 +16,7 @@
  */
 #include <linux/sched.h>
 #include <linux/sched/task.h>
+#include <linux/sched/signal.h>
 #include <linux/wait.h>
 #include <linux/swait.h>
 #include <linux/completion.h>
@@ -33,35 +34,61 @@ void nova_wake(u64 task_id);
 
 /* ---------------------------------------------------------------- current */
 
-#define LX_TASK_SLOTS 64
-static struct task_struct lx_tasks[LX_TASK_SLOTS];
-static u64 lx_task_owner[LX_TASK_SLOTS]; /* Nova task id + 1, 0 = free */
+/*
+ * Every Nova task gets its own task_struct when it is created (nova_lx_task_new, from
+ * task.rs) and Nova's scheduler hands it to nova_lx_switch. The boot task and tasks
+ * started before the driver layer share lx_boot_task. A finished task drops its
+ * reference (nova_lx_task_exit); kthread_stop() keeps another one until it is done.
+ */
+/* One signal_struct for every task: Linux code reads current->signal for the thread
+ * group's pid (DRM files record it; NULL here) and resource limits (none). */
+static struct signal_struct lx_signal = {
+	.sigcnt = REFCOUNT_INIT(1),
+	.rlim = { [0 ... RLIM_NLIMITS - 1] = { RLIM_INFINITY, RLIM_INFINITY } },
+};
 
-DEFINE_PER_CPU_CACHE_HOT(struct task_struct *, current_task) = &lx_tasks[0];
+static struct task_struct lx_boot_task = {
+	.__state = TASK_RUNNING,
+	.usage = REFCOUNT_INIT(1),
+	.comm = "nova-0",
+	.signal = &lx_signal,
+	.group_leader = &lx_boot_task,
+};
+
+DEFINE_PER_CPU_CACHE_HOT(struct task_struct *, current_task) = &lx_boot_task;
 /* Linux's linker script provides the const alias; Nova's build is ours. */
 asm(".globl const_current_task\n.set const_current_task, current_task");
 
-static struct task_struct *lx_task_for(u64 id)
-{
-	unsigned int slot = id % LX_TASK_SLOTS;
-	struct task_struct *t = &lx_tasks[slot];
+/* The task_struct of Nova task `id` (Rust, task.rs), or NULL. */
+void *nova_task_lx(u64 id);
 
-	if (lx_task_owner[slot] != id + 1) {
-		/* A new task, or one whose slot a newer task (id + 64k) has taken over. */
-		memset(t, 0, sizeof(*t));
-		t->__state = TASK_RUNNING;
-		refcount_set(&t->usage, 1);
-		t->pid = t->tgid = (pid_t)id;
-		snprintf(t->comm, sizeof(t->comm), "nova-%llu", id);
-		lx_task_owner[slot] = id + 1;
-	}
+void *nova_lx_task_new(u64 id)
+{
+	struct task_struct *t = kzalloc(sizeof(*t), GFP_KERNEL);
+
+	if (!t)
+		return NULL;
+	t->__state = TASK_RUNNING;
+	refcount_set(&t->usage, 1);
+	t->pid = t->tgid = (pid_t)id;
+	t->signal = &lx_signal;
+	/* Each task leads its own group (amdgpu and the GPU scheduler name and compare
+	 * current->group_leader; one per process would be more exact). */
+	t->group_leader = t;
+	snprintf(t->comm, sizeof(t->comm), "nova-%llu", id);
 	return t;
 }
 
-/* Called by Nova's scheduler (task.rs) whenever task `id` starts running. */
-void nova_lx_switch(u64 id)
+void nova_lx_task_exit(void *task)
 {
-	this_cpu_write(current_task, lx_task_for(id));
+	if (task)
+		put_task_struct(task);
+}
+
+/* Called by Nova's scheduler (task.rs) whenever a task starts running. */
+void nova_lx_switch(void *task)
+{
+	this_cpu_write(current_task, task ? (struct task_struct *)task : &lx_boot_task);
 }
 
 static u64 lx_task_id(struct task_struct *p)
@@ -573,9 +600,13 @@ int do_wait_intr(wait_queue_head_t *wq, wait_queue_entry_t *wait)
 
 /* ---------------------------------------------------------------- task identity */
 
-/* task_structs live in lx_tasks and are never freed, so the last put has no work. */
+/* The last reference to a finished task's task_struct (after an RCU grace period). */
 void __put_task_struct_rcu_cb(struct rcu_head *rhp)
 {
+	struct task_struct *t = container_of(rhp, struct task_struct, rcu);
+
+	if (t != &lx_boot_task)
+		kfree(t);
 }
 
 struct task_struct *pid_task(struct pid *pid, enum pid_type type)
@@ -640,7 +671,11 @@ struct task_struct *kthread_create_on_node(int (*threadfn)(void *data), void *da
 	k->threadfn = threadfn;
 	k->data = data;
 	id = nova_task_spawn(name, lx_kthread_entry, k);
-	t = lx_task_for(id);
+	t = nova_task_lx(id);
+	if (WARN_ON(!t))
+		return ERR_PTR(-ENOMEM); /* the task runs threadfn never: k leaks */
+	/* kthread_stop() looks at the task_struct after the thread has exited. */
+	get_task_struct(t);
 	strscpy(t->comm, name, sizeof(t->comm));
 	t->__state = TASK_UNINTERRUPTIBLE;
 	t->worker_private = k;
@@ -675,6 +710,7 @@ int kthread_stop(struct task_struct *t)
 	result = k->ran ? k->result : -EINTR;
 	t->worker_private = NULL;
 	kfree(k);
+	put_task_struct(t);
 	return result;
 }
 

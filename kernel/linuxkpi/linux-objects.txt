@@ -101,7 +101,9 @@ lib/kstrtox.o
 lib/cmdline.o
 lib/bitmap.o
 lib/find_bit.o
-lib/hweight.o
+# x86 population count: callers expect the register-preserving assembly version
+# (arch_hweight.h calls it from inline asm that only clobbers %rax), not lib/hweight.c
+arch/x86/lib/hweight.o
 lib/siphash.o
 lib/uuid.o
 lib/bitrev.o
