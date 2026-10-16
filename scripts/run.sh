@@ -95,12 +95,15 @@ while true; do
         image="$IMAGE"
     fi
     refresh_login   # a fresh token for every boot (they are short-lived)
+    disk_before=$(sfdisk -d "$DISK" 2>/dev/null | md5sum)
     # shellcheck disable=SC2046
     IMAGE="$image" qemu-system-x86_64 $(IMAGE="$image" qemu_base_args) "${drives[@]}" "${fw_cfg[@]}" "${display[@]}" -serial mon:stdio
     # QEMU runs with -no-reboot: a reboot request ends it. After installing, the
-    # system reboots, and this loop starts the installed disk.
-    if (( ! live )) && installed && [[ "$image" == "$IMAGE" ]]; then
+    # system reboots, and this loop starts the installed disk (also after --live: the
+    # user just chose to install).
+    if installed && [[ "$image" == "$IMAGE" ]] && { (( ! live )) || [[ "$(sfdisk -d "$DISK" 2>/dev/null | md5sum)" != "$disk_before" ]]; }; then
         log "Installation finished; restarting from the installed disk"
+        live=0
         continue
     fi
     break
