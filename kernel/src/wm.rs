@@ -105,6 +105,8 @@ pub struct Window {
     pub minimized: bool,
     /// Wants [`Event::RawKey`] and [`Event::Pointer`] (see [`set_raw_input`]).
     pub raw_input: bool,
+    /// The close button asked the program to close (Wayland clients decide themselves).
+    pub close_requested: bool,
 }
 
 pub type WindowRef = Arc<SpinLock<Window>>;
@@ -181,6 +183,7 @@ pub fn open(title: &str, icon: char, accent: u32, w: i32, h: i32, content: Conte
         closed: false,
         minimized: false,
         raw_input: false,
+        close_requested: false,
     }));
     WINDOWS.lock().push(win.clone());
     FOCUS.store(id, Ordering::Relaxed);
@@ -193,6 +196,13 @@ pub fn open(title: &str, icon: char, accent: u32, w: i32, h: i32, content: Conte
 fn close_window(win: &WindowRef) {
     {
         let mut w = win.lock();
+        // A Linux program (Wayland client) may ask about unsaved work first: the window
+        // stays until it destroys it. A second click closes it anyway (a hung program).
+        if w.raw_input && !w.close_requested {
+            w.close_requested = true;
+            w.push(Event::Close);
+            return;
+        }
         w.closed = true;
         w.push(Event::Close);
         if let Content::Terminal(t) = &w.content {
@@ -241,6 +251,8 @@ pub fn size(win: &WindowRef) -> (i32, i32) {
 /// Show `canvas` as the window's content.
 pub fn present(win: &WindowRef, canvas: &Canvas) {
     let mut w = win.lock();
+    // Still drawing, so still responding: a later close click asks it again.
+    w.close_requested = false;
     if let Content::Canvas(c) = &mut w.content {
         c.clone_from(canvas);
     }
