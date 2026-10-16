@@ -268,19 +268,41 @@ copy_with_deps() {
         done
     done
 }
-# NOVA_STEAM=1: the host's OpenGL stacks (libglvnd + Mesa with its software rasterizer,
-# about 200 MB each), for Steam. 32-bit programs (steamui.so) link libGL, and Xwayland
-# offers GLX through Mesa's swrast driver; the graphics driver always comes from the
-# system, not from Steam's runtime.
-if [[ "${NOVA_STEAM:-0}" == 1 && -f /usr/lib/libGL.so.1 ]]; then
+# The host's 64-bit OpenGL stack: libglvnd + Mesa with its software rasterizer (about
+# 280 MB, mostly LLVM for llvmpipe), its EGL for Wayland, and glvnd's vendor files.
+copy_mesa64() {
+    [[ -f /usr/lib/libGL.so.1 ]] || return 0
+    [[ -e "$SYSROOT/usr/lib/libEGL_mesa.so.0" ]] && return 0
     copy_with_deps /usr/lib/libGL.so.1 /usr/lib/libGLX.so.0 /usr/lib/libGLdispatch.so.0 /usr/lib/libGLX_mesa.so.0 \
-        /usr/lib/libEGL.so.1 /usr/lib/libEGL_mesa.so.0 /usr/lib/libgbm.so.1 /usr/lib/dri/swrast_dri.so /usr/lib/dri/kms_swrast_dri.so
-fi
+        /usr/lib/libEGL.so.1 /usr/lib/libEGL_mesa.so.0 /usr/lib/libgbm.so.1 /usr/lib/libwayland-egl.so.1 \
+        /usr/lib/dri/swrast_dri.so /usr/lib/dri/kms_swrast_dri.so
+    [[ -d /usr/share/glvnd ]] && { mkdir -p "$SYSROOT/usr/share"; cp -r /usr/share/glvnd "$SYSROOT/usr/share/"; }
+    return 0
+}
+# Fonts for web pages and Linux programs (Liberation and Noto, SIL Open Font License) and
+# fontconfig's configuration: Latin, Greek, Cyrillic, Arabic, Hebrew, Indic, Thai, CJK,
+# symbols, emoji.
+copy_fonts() {
+    for d in /usr/share/fonts/liberation /etc/fonts; do
+        [[ -d "$d" ]] && { mkdir -p "$SYSROOT$(dirname "$d")"; cp -rL "$d" "$SYSROOT$d"; }
+    done
+    for f in noto/NotoSans-Regular.ttf noto/NotoSans-Bold.ttf noto/NotoSansArabic-Regular.ttf noto/NotoSansArmenian-Regular.ttf \
+             noto/NotoSansBengali-Regular.ttf noto/NotoSansDevanagari-Regular.ttf noto/NotoSansEthiopic-Regular.ttf \
+             noto/NotoSansGeorgian-Regular.ttf noto/NotoSansHebrew-Regular.ttf noto/NotoSansTamil-Regular.ttf \
+             noto/NotoSansThai-Regular.ttf noto/NotoSansSymbols-Regular.ttf noto/NotoSansSymbols2-Regular.ttf \
+             noto/NotoColorEmoji.ttf noto-cjk/NotoSansCJK-Regular.ttc; do
+        [[ -f "/usr/share/fonts/$f" ]] && { mkdir -p "$SYSROOT/usr/share/fonts/$(dirname "$f")"; cp -L "/usr/share/fonts/$f" "$SYSROOT/usr/share/fonts/$f"; }
+    done
+    return 0
+}
+# NOVA_STEAM=1: the host's OpenGL stacks (64- and 32-bit, about 200 MB each), for Steam.
+# 32-bit programs (steamui.so) link libGL, and Xwayland offers GLX through Mesa's swrast
+# driver; the graphics driver always comes from the system, not from Steam's runtime.
+[[ "${NOVA_STEAM:-0}" == 1 ]] && copy_mesa64
 if [[ "${NOVA_STEAM:-0}" == 1 && -f /usr/lib32/libGL.so.1 ]]; then
     copy_with_deps /usr/lib32/libGL.so.1 /usr/lib32/libGLX.so.0 /usr/lib32/libGLdispatch.so.0 /usr/lib32/libGLX_mesa.so.0 \
         /usr/lib32/libEGL.so.1 /usr/lib32/libEGL_mesa.so.0 /usr/lib32/libva.so.2 /usr/lib32/libdrm.so.2 \
         /usr/lib32/dri/swrast_dri.so /usr/lib32/dri/kms_swrast_dri.so
-    [[ -d /usr/share/glvnd ]] && { mkdir -p "$SYSROOT/usr/share"; cp -r /usr/share/glvnd "$SYSROOT/usr/share/"; }
 fi
 # Steam's launcher and bootstrap (Valve's proprietary redistributable), if the host has the
 # steam package: only into this local image, never into the repository.
@@ -289,6 +311,84 @@ if [[ -f /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz && -f /usr/lib/steam/b
     cp /usr/lib/steam/bin_steam.sh /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz "$SYSROOT/usr/lib/steam/"
     ln -sf bin_steam.sh "$SYSROOT/usr/lib/steam/steam"
     ln -sf ../lib/steam/bin_steam.sh "$SYSROOT/usr/bin/steam"
+fi
+# NOVA_CRAFT=1 (or a list: NOVA_CRAFT=wordcraft,pdfcraft; NOVA_CRAFT=all): the Craft App
+# Suite (scripts/fetch-craft.sh downloads and checks the release tarballs into
+# $NOVA_CRAFT_CACHE, never into the repository or build/). Each app goes to /opt/<app>/
+# (its GUI binary and share/; the -cli tools are left out), with a launcher /usr/bin/<app>
+# and a desktop entry in /usr/share/applications/ that Home and Files read
+# (kernel/src/desktop.rs). The apps are self-contained Rust (egui) programs that load the
+# windowing and graphics libraries at run time: Wayland, xkbcommon, EGL/Mesa (software
+# rendering), X11 for Xwayland, and libdbus for the file dialogs' portal.
+if [[ -n "${NOVA_CRAFT:-}" && "${NOVA_CRAFT}" != 0 ]]; then
+    CRAFT_CACHE="${NOVA_CRAFT_CACHE:-/tmp/nova-craft-cache}"
+    case "$NOVA_CRAFT" in
+        1) craft_apps=(wordcraft gridcraft deckcraft pdfcraft photocraft) ;;
+        all) craft_apps=(wordcraft gridcraft deckcraft pdfcraft photocraft lightcraft filmcraft soundcraft vectorcraft designcraft figcraft cadcraft effectcraft craft-launcher) ;;
+        *) IFS=', ' read -r -a craft_apps <<<"$NOVA_CRAFT" ;;
+    esac
+    NOVA_CRAFT_CACHE="$CRAFT_CACHE" "$ROOT/scripts/fetch-craft.sh" "${craft_apps[@]}" || fail "fetching the Craft apps failed"
+    copy_mesa64
+    copy_fonts
+    copy_with_deps /usr/lib/libwayland-client.so.0 /usr/lib/libwayland-cursor.so.0 /usr/lib/libwayland-egl.so.1 \
+        /usr/lib/libxkbcommon.so.0 /usr/lib/libxkbcommon-x11.so.0 /usr/lib/libX11.so.6 /usr/lib/libX11-xcb.so.1 \
+        /usr/lib/libxcb.so.1 /usr/lib/libXcursor.so.1 /usr/lib/libXi.so.6 /usr/lib/libXrandr.so.2 \
+        /usr/lib/libdbus-1.so.3 /usr/lib/libfontconfig.so.1
+    # Keyboard layouts for xkbcommon (the X11 path; on Wayland the compositor sends one),
+    # and its Compose tables (dead keys and compose sequences; 2 MB).
+    mkdir -p "$SYSROOT/usr/share/X11"
+    [[ -d /usr/share/X11/xkb && ! -d "$SYSROOT/usr/share/X11/xkb" ]] && cp -rL /usr/share/X11/xkb "$SYSROOT/usr/share/X11/"
+    [[ -d /usr/share/X11/locale ]] && cp -rL /usr/share/X11/locale "$SYSROOT/usr/share/X11/"
+    mkdir -p "$SYSROOT/usr/bin" "$SYSROOT/usr/share/applications" "$SYSROOT/usr/share/nova/craft"
+    craft_mb=0
+    for app in "${craft_apps[@]}"; do
+        src="$CRAFT_CACHE/$app"
+        bin="$(find "$src/bin" -maxdepth 1 -type f -perm -u+x ! -name '*-cli' ! -name '*-server' | head -1)"
+        [[ -n "$bin" ]] || fail "$app: no program in $src/bin"
+        exe="$(basename "$bin")"
+        dest="$SYSROOT/opt/$app"
+        rm -rf "$dest"
+        mkdir -p "$dest/bin"
+        # The binaries (up to 100 MB each) are linked, not copied: mkpak.py reads them
+        # from the cache straight into the pak.
+        ln -s "$bin" "$dest/bin/$exe"
+        cp -r "$src/share" "$dest/share"
+        rm -rf "$dest/share/applications"
+        # The launcher: Nova's compositor speaks Wayland, Mesa renders in software (no
+        # Vulkan in a VM), and wgpu uses its OpenGL backend.
+        cat >"$SYSROOT/usr/bin/$exe" <<LAUNCHER
+#!/bin/sh
+# $app ($(cat "$src/VERSION")), from https://github.com/storytold/$app (MIT OR Apache-2.0).
+# Generated by Nova's scripts/build.sh.
+export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/1000}" WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-wayland-0}"
+export XDG_DATA_DIRS="/opt/$app/share:/usr/share" EGL_PLATFORM=wayland
+export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER="\${GALLIUM_DRIVER:-llvmpipe}" WGPU_BACKEND="\${WGPU_BACKEND:-gl}"
+export PDFCRAFT_RENDERER="\${PDFCRAFT_RENDERER:-gl}" PHOTOCRAFT_NATIVE_WAYLAND=1
+[ "\$HOME" = / ] && export HOME=/home/nova
+mkdir -p "\$HOME"
+exec /opt/$app/bin/$exe "\$@"
+LAUNCHER
+        chmod +x "$SYSROOT/usr/bin/$exe"
+        # Its desktop entry, running the launcher, with Nova's icon and Home poster
+        # (assets/icons/craft_<app>.png, assets/home/craft_<app>.png: scripts/make-craft-art.py).
+        for d in "$src"/share/applications/*.desktop; do
+            [[ -f "$d" ]] || continue
+            {
+                sed -e "s|^Exec=$exe |Exec=/usr/bin/$exe |" -e "s|^TryExec=.*|TryExec=/usr/bin/$exe|" "$d"
+                [[ -f "$ROOT/assets/icons/craft_$app.png" ]] && echo "X-Nova-Icon=craft_$app"
+                [[ -f "$ROOT/assets/home/craft_$app.png" ]] && echo "X-Nova-Poster=craft_$app"
+            } >"$SYSROOT/usr/share/applications/$(basename "$d")"
+        done
+        if [[ -d "$src/share/icons/hicolor/128x128/apps" ]]; then
+            mkdir -p "$SYSROOT/usr/share/icons/hicolor/128x128/apps"
+            cp "$src"/share/icons/hicolor/128x128/apps/*.png "$SYSROOT/usr/share/icons/hicolor/128x128/apps/"
+        fi
+        craft_mb=$(( craft_mb + ( $(stat -Lc %s "$bin") + $(du -sb "$dest/share" | cut -f1) ) / 1048576 ))
+        log "Including $app $(cat "$src/VERSION") ($(( $(stat -Lc %s "$bin") / 1048576 )) MB)"
+    done
+    # Sample documents to open (made by a script, so nothing copyrighted ships).
+    python3 "$ROOT/scripts/make-craft-samples.py" "$SYSROOT/usr/share/nova/craft/samples" || fail "making the Craft samples failed"
+    log "Craft apps: ${craft_mb} MB (${craft_apps[*]})"
 fi
 # The Chromium engine (scripts/fetch-chromium.sh), if downloaded: its libraries too.
 CHROMIUM="$BUILD/chromium/chrome-headless-shell-linux64"
@@ -303,18 +403,7 @@ if [[ -x "$CHROMIUM/chrome-headless-shell" ]]; then
     done
     mkdir -p "$SYSROOT/opt"
     cp -r "$CHROMIUM" "$SYSROOT/opt/chromium"
-    # Fonts for web pages (Liberation and Noto, SIL Open Font License) and fontconfig's
-    # configuration: Latin, Greek, Cyrillic, Arabic, Hebrew, Indic, Thai, CJK, symbols, emoji.
-    for d in /usr/share/fonts/liberation /etc/fonts; do
-        [[ -d "$d" ]] && { mkdir -p "$SYSROOT$(dirname "$d")"; cp -rL "$d" "$SYSROOT$d"; }
-    done
-    for f in noto/NotoSans-Regular.ttf noto/NotoSans-Bold.ttf noto/NotoSansArabic-Regular.ttf noto/NotoSansArmenian-Regular.ttf \
-             noto/NotoSansBengali-Regular.ttf noto/NotoSansDevanagari-Regular.ttf noto/NotoSansEthiopic-Regular.ttf \
-             noto/NotoSansGeorgian-Regular.ttf noto/NotoSansHebrew-Regular.ttf noto/NotoSansTamil-Regular.ttf \
-             noto/NotoSansThai-Regular.ttf noto/NotoSansSymbols-Regular.ttf noto/NotoSansSymbols2-Regular.ttf \
-             noto/NotoColorEmoji.ttf noto-cjk/NotoSansCJK-Regular.ttc; do
-        [[ -f "/usr/share/fonts/$f" ]] && { mkdir -p "$SYSROOT/usr/share/fonts/$(dirname "$f")"; cp -L "/usr/share/fonts/$f" "$SYSROOT/usr/share/fonts/$f"; }
-    done
+    copy_fonts
 fi
 # GNU readlink, realpath, tar, xz and gzip (scripts use options BusyBox lacks, e.g. readlink
 # -e or tar --checkpoint, as Steam's runtime setup does), from the
