@@ -16,7 +16,10 @@ into the cache. For each app this writes:
 The posters are deliberately plain and kept in their own files so Home's art direction can
 replace them. Needs Pillow.
 
-Usage: make-craft-art.py [app ...]      (default: every Craft app)
+The five default apps (KEY_ART) have generated key art instead (assets/README.md); for
+them only the icon is written, unless --placeholders.
+
+Usage: make-craft-art.py [--placeholders] [app ...]      (default: every Craft app)
 """
 import os
 import sys
@@ -26,6 +29,9 @@ from PIL import Image, ImageDraw, ImageFilter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CACHE = os.path.join(os.environ.get("NOVA_CRAFT_CACHE", "/tmp/nova-craft-cache"), "icons")
+# Apps with generated key art in Home's series (assets/README.md): only their icons are
+# made here, unless --placeholders is given.
+KEY_ART = {"wordcraft", "gridcraft", "deckcraft", "pdfcraft", "photocraft"}
 APPS = ["wordcraft", "gridcraft", "deckcraft", "pdfcraft", "photocraft", "lightcraft", "filmcraft", "soundcraft",
         "vectorcraft", "designcraft", "figcraft", "cadcraft", "effectcraft", "craft-launcher"]
 
@@ -101,11 +107,16 @@ def hero(im, colour):
 
 
 def main():
-    apps = sys.argv[1:] or APPS
+    args = [a for a in sys.argv[1:] if a != "--placeholders"]
+    placeholders = "--placeholders" in sys.argv[1:]
+    apps = args or APPS
     for app in apps:
         im = fetch(app)
         colour = edge_colour(im)
         icon(im, colour).save(os.path.join(ROOT, "assets/icons", f"craft_{app}.png"), optimize=True)
+        if app in KEY_ART and not placeholders:
+            print(f"{app}: colour #{colour[0]:02X}{colour[1]:02X}{colour[2]:02X} (icon only; it has key art)")
+            continue
         for name, art in ((f"craft_{app}", capsule), (f"hero_craft_{app}", hero)):
             art(im, colour).quantize(colors=192, method=Image.MEDIANCUT, dither=Image.FLOYDSTEINBERG).convert("RGB").save(
                 os.path.join(ROOT, "assets/home", f"{name}.png"), optimize=True)
