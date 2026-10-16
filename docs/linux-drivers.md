@@ -21,7 +21,10 @@ with hubs, HID and the input core, bridged to Nova's keyboard and mouse
 (`--case usbinput`, on a machine with no PS/2 controller). The GPU stack (DRM core, TTM,
 `amdgpu` with its display core) is built in and linked (milestone 7a); it registers its
 PCI driver at every boot but has only been run where no AMD GPU is present (QEMU), so
-its probe is untested.
+its probe is untested. Linux programs reach the DRM drivers through `/dev/dri` (milestone
+8): libdrm's tools and Mesa (GBM, EGL, llvmpipe through `kms_swrast`) run on Linux's
+software drivers vkms and vgem (`--case drm`), through the same code path amdgpu's nodes
+take.
 
 ## Building
 
@@ -36,6 +39,12 @@ NOVA_CMDLINE="amdgpu.dc=0" FEATURES=linux-drivers scripts/build.sh
                                              # Linux module parameters, as on Linux's command line
 NOVA_CMDLINE="nova.disable_driver=amdgpu" FEATURES=linux-drivers scripts/build.sh
                                              # keep a Linux driver from probing
+FEATURES=linux-drivers scripts/test.sh --case drm
+                                             # DRM from Linux programs on vkms and vgem
+NOVA_DRM_TOOLS=1 NOVA_CMDLINE="nova.mode=shell nova.vkms=1 nova.vgem=1" \
+    FEATURES=linux-drivers scripts/build.sh  # with the host's modetest, vbltest, eglinfo,
+                                             # Mesa (GBM/EGL/GLES, radeonsi, RADV) and,
+                                             # with NOVA_KMSCUBE=<path>, a kmscube build
 ```
 
 `scripts/build-linux.sh` (called by `build.sh`) does the Linux side:
@@ -131,17 +140,18 @@ repository plus the pinned Linux release). Kernels built without the feature are
 * **Files** (`fs.c`): DRM and dma-buf hand out file descriptors (PRIME buffers, sync files,
   leases). They are real `struct file`s with Linux's reference counting and release order
   (`f_op->release`, the dentry's `d_release`, the inode), on anonymous inodes and pseudo
-  file systems (`kern_mount`, `init_pseudo`), so Nova's Linux-program fd layer can wrap
-  them later. The descriptor table is kernel-internal for now. mmap of these files
-  (`vmf_insert_pfn_prot`, `unmap_mapping_range`) waits for milestone 8.
+  file systems (`kern_mount`, `init_pseudo`). Linux programs use them as their own
+  descriptors (`user.c`, `kernel/src/linux/lxfile.rs`; see milestone 8 below).
 * **Kernel FPU sections** (`fpu.c`): Nova's kernel never uses FPU/SSE/AVX registers (soft-float
   Rust, `-mgeneral-regs-only` C), so their live contents belong to a user program.
   `kernel_fpu_begin()` saves them (XSAVE of every enabled component, else FXSAVE) and loads
   clean x87/MXCSR state; `kernel_fpu_end()` restores them. Sections nest (an interrupt
   handler inside a task's section) with one save area per level. amdgpu's display core
   computes clocks and bandwidth this way. One section runs at every boot as a self-check.
-* **Tasks and sleeping** (`task.c`): every Nova task running Linux code has a
-  `task_struct`, and Nova's scheduler points Linux's `current` at it on every switch.
+* **Tasks and sleeping** (`task.c`): every Nova task gets a `task_struct` when it is
+  created (freed after it ends, past an RCU grace period), and Nova's scheduler points
+  Linux's `current` at it on every switch. All share one `signal_struct` (no resource
+  limits, no pids) and lead their own thread group.
   `schedule()`, `wake_up_process()`, wait queues, completions, semaphores and rwsems follow
   Linux's protocol on top of Nova's park/wake. Work items run on a pool of four worker
   tasks, so one that sleeps (a USB control transfer waiting for its completion, delivered
@@ -198,7 +208,7 @@ generation), and Steam.
 | 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core, input core (done) | task/wait model, driver core, input bridge (done) |
 | 6 | The board's network | `r8169` (RTL8168/8125), phylib, Realtek PHY driver, ethtool link-mode tables | built in and linked; `request_firmware` reads `/lib/firmware` from Nova's disk (the image gets the host's `rtl_nic` files). QEMU has no RTL8168 model, so the first real test is on the reference machine |
 | 7 | GPU | DRM core, TTM, `amdgpu` (incl. display core), linked (7a) | `struct page` backing and page allocation, kernel FPU sections, firmware, KMS to Nova's compositor |
-| 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |
+| 8 | Userspace for games | `vgem`, `vkms` (testing) | DRM nodes, ioctls, poll, dma-buf/sync-file descriptors and mmap of GPU buffers for Linux programs (done in QEMU); first run on the RX 6800 |
 | 9 | Steam | Mesa RADV, Steam runtime, Proton (userspace) | a Wayland compositor or Xwayland path, audio (HDA via ALSA), namespaces for the Steam runtime |
 
 ### Milestone 7 status: amdgpu links (7a)
@@ -246,6 +256,100 @@ happen on the reference machine. What to expect there, most likely problems firs
 - **Execution**: kthreads, hrtimers (1 ms resolution), irq_work and wound/wait mutexes are
   new and only exercised by the boot path so far; a kernel FPU section that sleeps would
   corrupt user FPU state (Linux forbids it too).
+
+### Milestone 8 status: programs use the GPU
+
+The files Linux drivers create are ordinary descriptors of Nova's Linux programs, and
+everything libdrm, Mesa and the Vulkan drivers do with them reaches the drivers:
+
+- **Device nodes.** `register_chrdev()`/`cdev_add()` keep their file operations and every
+  device added with a device number is listed (`user.c`). DRM's minors appear as
+  `/dev/dri/card*` and `/dev/dri/renderD*` (character devices, `st_rdev` 226:N), and in
+  `/sys` as `drmGetDevices2()` reads them: `/sys/dev/char/226:N` and `/sys/class/drm/*`
+  (links to the minor under its parent), the minor's `uevent` (`DEVNAME=dri/...`) and
+  `dev`, the parent's `subsystem` link, `uevent` and `drm/` directory, and for a PCI
+  parent its `vendor`, `device`, `subsystem_vendor`, `subsystem_device`, `revision`,
+  `class`, `config` and `boot_vga` from the real function. amdgpu's card and render nodes
+  come out of this code path like vkms's and vgem's: on the RX 6800 radeonsi and RADV see
+  `/dev/dri/renderD128` with vendor 0x1002 and Navi 21's device id.
+- **Open files.** A descriptor (`Kind::Linux`) holds a `struct lx_ufile`, which owns one
+  reference to the driver's `struct file`: dup, fork and SCM_RIGHTS share one open file,
+  and the driver's release runs with the last close. Open runs `f_op->open` on the
+  node's inode (as `chrdev_open`), ioctl `unlocked_ioctl`, and for 32-bit programs
+  `compat_ioctl` with `TS_COMPAT` set (`CONFIG_IA32_EMULATION`: DRM's `drm_ioc32.c`
+  converts `VERSION`, `WAIT_VBLANK` and the other ioctls whose layouts differ). read
+  (DRM events), write, llseek (a dma-buf's size at `SEEK_END`), `F_SETFL`/`FIONBIO`
+  (`O_NONBLOCK` in `f_flags`) and fstat work. poll, select and epoll call `f_op->poll`;
+  the file stays on the wait queues the driver names with `poll_wait()` until it closes,
+  and their wakeups, from interrupts too, wake Nova's waiters and count for epoll's
+  edge-triggered mode.
+- **Descriptors made by Linux code.** `get_unused_fd_flags()` reserves a slot in the
+  calling program's table, `fd_install()` fills it (dma-buf and sync-file exports, with
+  `O_CLOEXEC` honoured); `fget()`/`fdget()` find the struct file behind a descriptor a
+  program passes in (PRIME import, syncobj import, `DMA_BUF_IOCTL_*`).
+- **Mappings.** mmap makes a `vm_area_struct` for the Nova mapping (the process's
+  `Memory` keeps it with the range) and runs `f_op->mmap`. A fault in it (the program's,
+  or Linux code's touching user memory, which Nova's kernel fault handler now serves)
+  calls `vm_ops->fault` without the address-space lock; `vmf_insert_pfn(_prot)`,
+  `vmf_insert_mixed`, `vm_insert_page`, `remap_pfn_range` (also `io_remap_pfn_range`)
+  and handlers that return a page map frames with the caching bits the driver asks for.
+  `unmap_mapping_range()` zaps a file range in every address space that maps it (TTM
+  moving or evicting a buffer, shmem purges); the next access faults again. munmap, exit
+  and exec retire the vma, and `vm_ops->close` runs once no fault is in flight, on a task
+  of its own ("linux-files": a close can drop the last reference to a DRM file and wait
+  for a vblank that the "linux" task delivers). fork gives the child its own vma
+  (`vm_ops->open`); its pages fault in again there. munmap of a mapping's front or back
+  trims the vma.
+- **User memory.** `copy_from_user()`, `copy_to_user()`, `get_user()` and `put_user()`
+  check the range against the program's mappings (kernel pointers still pass) and return
+  `-EFAULT` instead of trusting it; pages not present yet are filled on first touch.
+
+**Testing without a GPU.** Linux's vkms (a virtual display with vblank, atomic KMS) and
+vgem (GEM buffers, PRIME, fences) are built in; they sit on faux devices, which are only
+created with `nova.vkms=1` / `nova.vgem=1` on the command line, so real machines never
+see a fake GPU (`--case linuxnet` checks that none appears). `--case drm` runs
+`userland/drmtest.c` (KMS enumeration, dumb buffers drawn through mmap, an atomic modeset
+and ten page flips paced at 16.7 ms by vblank with events read after poll, legacy flips,
+vblank waits with events, PRIME both ways between vkms and vgem, dma-buf mmap and sync,
+a vgem fence seen through a sync file and dma-buf poll and signalled by another
+process, a dma-buf passed over SCM_RIGHTS, a mapping inherited by fork) and
+`userland/compat32/drmtest32.c` (the converted ioctls, a GEM offset above 4 GiB mapped
+through mmap2) from a 32-bit program.
+
+With the host's tools in the image (`NOVA_DRM_TOOLS=1`), unmodified programs run on vkms:
+`modetest -M vkms` lists connectors, modes, planes and properties and sets modes;
+`vbltest -M vkms` counts 60 Hz vblanks (while a mode is set; with every CRTC off it fails,
+as on Linux); `eglinfo` brings up Mesa's GBM platform on the vkms node through
+`kms_swrast` with llvmpipe (OpenGL 4.6, GLES 3.2); kmscube renders through GBM and EGL at
+60 frames per second with page flips on vkms. What does not work there is not Nova's:
+`kmscube -A` needs `EGL_ANDROID_native_fence_sync`, which llvmpipe lacks; offscreen
+rendering on vgem's render node fails because dumb buffers are not allowed on render
+nodes; `vulkaninfo` finds no GPU (there is none, and lavapipe is not in the image).
+
+**What remains for radeonsi and RADV on the RX 6800**, beyond amdgpu's own first probe
+(milestone 7), and what QEMU cannot show:
+
+- *VRAM through the BAR.* CPU mappings of VRAM buffers are TTM faults that insert BAR
+  page frames with `vmf_insert_pfn_prot()`; Nova maps them with the driver's PWT/PCD/PAT
+  bits, which without `CONFIG_X86_PAT` means uncached (UC-) rather than write-combined:
+  correct but slow for uploads. The visible-VRAM window and resizable BAR set its size.
+- *Fences and waits.* `AMDGPU_WAIT_CS`, `DRM_IOCTL_SYNCOBJ_WAIT` and timeline syncobjs
+  are DRM core and amdgpu code driven by the GPU's interrupts and the GPU scheduler's
+  kthreads, so they should work as fence waits do on vgem, but only real interrupts will
+  show it. Waits are not interruptible by signals (lx_emul's tasks never have one
+  pending), so a program killed during a GPU hang stays until the wait times out.
+  `DRM_IOCTL_SYNCOBJ_EVENTFD` fails (no eventfd behind Linux code; Mesa falls back).
+- *userptr/HMM* (`AMDGPU_GEM_USERPTR`, used for `VK_EXT_external_memory_host` and some
+  OpenCL paths) stays off: it needs MMU notifiers on Nova's address spaces. RADV and
+  radeonsi check for it and do without.
+- *Process identity.* Each thread is its own Linux thread group: per-process accounting
+  in amdgpu (fdinfo, the scheduler entity's last user) sees threads, not processes, and
+  DRM files record no pid.
+- *Huge mappings.* Only 4 KiB pages are inserted (`CONFIG_ARCH_SUPPORTS_PMD_PFNMAP` is
+  off; `get_unmapped_area` alignment is Nova's own), so large buffers fault in 4 KiB
+  steps (TTM prefaults 16 at a time).
+- *Mesa's view.* The image needs Mesa's radeonsi and RADV with the Vulkan loader
+  (`NOVA_DRM_TOOLS=1` copies the host's) and the firmware that `build.sh` already ships.
 
 NVMe is the one family on the roadmap that Nova drives natively instead of through Linux:
 it is a single standard interface for every NVMe SSD, while Linux's driver sits on blk-mq and
