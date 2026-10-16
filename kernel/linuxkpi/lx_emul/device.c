@@ -26,6 +26,7 @@
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/sysfs.h>
+#include <linux/hwmon.h>
 #include "nova.h"
 
 struct device_private {
@@ -108,12 +109,96 @@ struct kobject *kobject_get(struct kobject *kobj)
 	return kobj;
 }
 
+/* Devices' kobjects carry this type; their release goes through put_device(). */
+static const struct kobj_type lx_device_ktype;
+
+static void lx_kobject_release(struct kref *kref)
+{
+	struct kobject *kobj = container_of(kref, struct kobject, kref);
+	const char *name = kobj->name;
+
+	kobj->name = NULL;
+	if (kobj->ktype && kobj->ktype->release)
+		kobj->ktype->release(kobj);
+	kfree_const(name);
+}
+
 void kobject_put(struct kobject *kobj)
 {
-	/* Only device kobjects are created by lx_emul code paths. */
-	if (kobj)
+	if (!kobj)
+		return;
+	if (kobj->ktype == &lx_device_ktype)
 		put_device(container_of(kobj, struct device, kobj));
+	else
+		kref_put(&kobj->kref, lx_kobject_release);
 }
+
+/* Free-standing kobjects (amdgpu's IP discovery tree, power attributes): reference
+ * counting and names only, as sysfs does not exist. */
+void kobject_init(struct kobject *kobj, const struct kobj_type *ktype)
+{
+	kref_init(&kobj->kref);
+	INIT_LIST_HEAD(&kobj->entry);
+	kobj->ktype = ktype;
+	kobj->state_initialized = 1;
+}
+
+int kobject_set_name(struct kobject *kobj, const char *fmt, ...)
+{
+	va_list vargs;
+	int err;
+
+	va_start(vargs, fmt);
+	err = kobject_set_name_vargs(kobj, fmt, vargs);
+	va_end(vargs);
+	return err;
+}
+
+static int lx_kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt, va_list vargs)
+{
+	int err = kobject_set_name_vargs(kobj, fmt, vargs);
+
+	if (err)
+		return err;
+	kobj->parent = parent ?: (kobj->kset ? &kobj->kset->kobj : NULL);
+	kobj->state_in_sysfs = 1;
+	return 0;
+}
+
+int kobject_add(struct kobject *kobj, struct kobject *parent, const char *fmt, ...)
+{
+	va_list vargs;
+	int err;
+
+	va_start(vargs, fmt);
+	err = lx_kobject_add(kobj, parent, fmt, vargs);
+	va_end(vargs);
+	return err;
+}
+
+int kobject_init_and_add(struct kobject *kobj, const struct kobj_type *ktype, struct kobject *parent,
+			 const char *fmt, ...)
+{
+	va_list vargs;
+	int err;
+
+	kobject_init(kobj, ktype);
+	va_start(vargs, fmt);
+	err = lx_kobject_add(kobj, parent, fmt, vargs);
+	va_end(vargs);
+	return err;
+}
+
+int kset_register(struct kset *kset)
+{
+	kobject_init(&kset->kobj, kset->kobj.ktype);
+	INIT_LIST_HEAD(&kset->list);
+	spin_lock_init(&kset->list_lock);
+	return 0;
+}
+
+/* sysfs attribute I/O for kobjects: never called without sysfs. */
+const struct sysfs_ops kobj_sysfs_ops;
 
 int kobject_set_name_vargs(struct kobject *kobj, const char *fmt, va_list vargs)
 {
@@ -393,11 +478,27 @@ int __devm_add_action(struct device *dev, void (*action)(void *), void *data, co
 	return 0;
 }
 
+static int lx_action_match(struct device *dev, void *res, void *p)
+{
+	struct lx_action *a = res, *target = p;
+
+	return a->action == target->action && a->data == target->data;
+}
+
+/* Run a devm action now and forget it. */
+void devm_release_action(struct device *dev, void (*action)(void *), void *data)
+{
+	struct lx_action target = { .action = action, .data = data };
+
+	WARN_ON(devres_release(dev, lx_action_release, lx_action_match, &target));
+}
+
 /* ---------------------------------------------------------------- devices */
 
 void device_initialize(struct device *dev)
 {
 	kref_init(&dev->kobj.kref);
+	dev->kobj.ktype = &lx_device_ktype;
 	INIT_LIST_HEAD(&dev->dma_pools);
 	mutex_init(&dev->mutex);
 	spin_lock_init(&dev->devres_lock);
@@ -807,4 +908,156 @@ void sysfs_remove_file_ns(struct kobject *kobj, const struct attribute *attr, co
 int sysfs_create_link_nowarn(struct kobject *kobj, struct kobject *target, const char *name)
 {
 	return 0;
+}
+
+int sysfs_create_files(struct kobject *kobj, const struct attribute * const *attr)
+{
+	return 0;
+}
+
+void sysfs_remove_files(struct kobject *kobj, const struct attribute * const *attr)
+{
+}
+
+int sysfs_create_bin_file(struct kobject *kobj, const struct bin_attribute *attr)
+{
+	return 0;
+}
+
+void sysfs_remove_bin_file(struct kobject *kobj, const struct bin_attribute *attr)
+{
+}
+
+int sysfs_add_file_to_group(struct kobject *kobj, const struct attribute *attr, const char *group)
+{
+	return 0;
+}
+
+void sysfs_remove_file_from_group(struct kobject *kobj, const struct attribute *attr, const char *group)
+{
+}
+
+int devm_device_add_group(struct device *dev, const struct attribute_group *grp)
+{
+	return 0;
+}
+
+/* Classes made at run time (DRM's "drm" class): a name, and attribute files ignored. */
+struct class *class_create(const char *name)
+{
+	struct class *cls = kzalloc(sizeof(*cls), GFP_KERNEL);
+
+	if (!cls)
+		return ERR_PTR(-ENOMEM);
+	cls->name = name;
+	return cls;
+}
+
+void class_destroy(const struct class *cls)
+{
+	kfree(cls);
+}
+
+int class_create_file_ns(const struct class *class, const struct class_attribute *attr,
+			 const struct ns_common *ns)
+{
+	return 0;
+}
+
+void class_remove_file_ns(const struct class *class, const struct class_attribute *attr,
+			  const struct ns_common *ns)
+{
+}
+
+ssize_t show_class_attr_string(const struct class *class, const struct class_attribute *attr, char *buf)
+{
+	struct class_attribute_string *cs = container_of(attr, struct class_attribute_string, attr);
+
+	return sysfs_emit(buf, "%s\n", cs->str);
+}
+
+/* Children are not linked to their parents here; bus devices are found on their bus. */
+int device_for_each_child(struct device *parent, void *data, device_iter_t fn)
+{
+	unsigned int i;
+	int err;
+
+	for (i = 0; i < ARRAY_SIZE(lx_buses); i++) {
+		struct device_private *p, *next;
+
+		if (!lx_buses[i].bus)
+			continue;
+		list_for_each_entry_safe(p, next, &lx_buses[i].devices, bus_node) {
+			if (p->device->parent != parent)
+				continue;
+			err = fn(p->device, data);
+			if (err)
+				return err;
+		}
+	}
+	return 0;
+}
+
+/* ---------------------------------------------------------------- hwmon */
+
+/* Sensors are read through sysfs, which Nova lacks; the device exists so drivers can
+ * keep and unregister it. */
+static void lx_hwmon_release(struct device *dev)
+{
+	kfree(dev);
+}
+
+struct device *hwmon_device_register_with_groups(struct device *dev, const char *name, void *drvdata,
+						 const struct attribute_group **groups)
+{
+	struct device *hwdev = kzalloc(sizeof(*hwdev), GFP_KERNEL);
+
+	if (!hwdev)
+		return ERR_PTR(-ENOMEM);
+	device_initialize(hwdev);
+	hwdev->parent = dev;
+	hwdev->groups = groups;
+	hwdev->release = lx_hwmon_release;
+	dev_set_drvdata(hwdev, drvdata);
+	dev_set_name(hwdev, "%s", name);
+	return hwdev;
+}
+
+void hwmon_device_unregister(struct device *dev)
+{
+	put_device(dev);
+}
+
+/* ---------------------------------------------------------------- software nodes, properties */
+
+/* Software nodes describe properties of devices without firmware nodes (I2C clients
+ * here); nothing reads them back, so they are not kept. */
+int device_add_software_node(struct device *dev, const struct software_node *node)
+{
+	return 0;
+}
+
+void device_remove_software_node(struct device *dev)
+{
+}
+
+bool is_software_node(const struct fwnode_handle *fwnode)
+{
+	return false;
+}
+
+/* No device tree or ACPI match tables are consulted, so there is no match data. */
+const void *device_get_match_data(const struct device *dev)
+{
+	return NULL;
+}
+
+bool device_property_present(const struct device *dev, const char *propname)
+{
+	return false;
+}
+
+bool fwnode_device_is_available(const struct fwnode_handle *fwnode)
+{
+	return !IS_ERR_OR_NULL(fwnode);
 }

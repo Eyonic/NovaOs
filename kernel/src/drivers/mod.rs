@@ -91,7 +91,7 @@ pub fn probe_all(mut progress: impl FnMut(&Record)) -> Probed {
     for device in pci::scan() {
         let status = bind(&device, &mut probed);
         #[cfg(feature = "linux-drivers")]
-        if matches!(status, Status::Missing) {
+        if matches!(status, Status::Missing) || linux_may_take(&device, &status) {
             crate::linuxkpi::add_pci(&device);
         }
         records.push(Record { device, status });
@@ -112,7 +112,7 @@ pub fn probe_all(mut progress: impl FnMut(&Record)) -> Probed {
 fn bind_linux(records: &mut [Record], probed: &mut Probed) {
     crate::linuxkpi::spawn_poller();
     crate::linuxkpi::start();
-    for r in records.iter_mut().filter(|r| matches!(r.status, Status::Missing)) {
+    for r in records.iter_mut().filter(|r| matches!(r.status, Status::Missing) || linux_may_take(&r.device, &r.status)) {
         if let Some(name) = crate::linuxkpi::driver_for(&r.device) {
             let driver: &'static str = alloc::boxed::Box::leak(format!("linux/{name}").into_boxed_str());
             let detail = format!("Linux {} driver, built from unmodified source", env!("NOVA_LINUX_VERSION"));
@@ -124,9 +124,17 @@ fn bind_linux(records: &mut [Record], probed: &mut Probed) {
     }
 }
 
+/// A display controller that only has the firmware framebuffer: a Linux GPU driver
+/// (amdgpu) may still take it; without one it stays the framebuffer.
+#[cfg(feature = "linux-drivers")]
+fn linux_may_take(dev: &Device, status: &Status) -> bool {
+    dev.class == 0x03 && matches!(status, Status::Bound { driver: "framebuffer", .. })
+}
+
 /// Nova drivers switched off with `nova.disable_driver=name[,name...]` on the kernel
-/// command line (their devices then go to the Linux drivers, if built in).
-fn disabled(driver: &str) -> bool {
+/// command line (their devices then go to the Linux drivers, if built in). Linux drivers
+/// are switched off the same way (lx_emul asks before probing).
+pub fn disabled(driver: &str) -> bool {
     crate::limine::EXECUTABLE_CMDLINE
         .get()
         .and_then(|c| c.split_whitespace().find_map(|a| a.strip_prefix("nova.disable_driver=")))

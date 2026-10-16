@@ -1576,23 +1576,35 @@ fn register_pak(pak: &'static [u8]) -> Vec<String> {
         crate::log::warn("system pak: bad header");
         return names;
     }
-    let count = le64(pak, 8) as usize;
-    let mut p = 16;
-    for _ in 0..count {
-        if p + 18 > pak.len() {
-            break;
-        }
-        let (off, size, len) = (le64(pak, p) as usize, le64(pak, p + 8) as usize, le16(pak, p + 16) as usize);
-        let Some(path) = pak.get(p + 18..p + 18 + len).and_then(|b| core::str::from_utf8(b).ok()) else { break };
-        p += 18 + len;
-        if let Some(data) = pak.get(off..off + size)
-            && !path.contains("..")
-        {
-            crate::fs::add_system_file(path, data);
-            names.push(String::from(path));
-        }
+    for (path, data) in pak_entries(pak) {
+        crate::fs::add_system_file(path, data);
+        names.push(String::from(path));
     }
     names
+}
+
+/// The (path, contents) entries of a NOVAPAK1 archive.
+fn pak_entries(pak: &'static [u8]) -> impl Iterator<Item = (&'static str, &'static [u8])> {
+    let count = if pak.len() >= 16 && &pak[0..8] == b"NOVAPAK1" { le64(pak, 8) as usize } else { 0 };
+    let mut p = 16;
+    (0..count).map_while(move |_| {
+        if p + 18 > pak.len() {
+            return None;
+        }
+        let (off, size, len) = (le64(pak, p) as usize, le64(pak, p + 8) as usize, le16(pak, p + 16) as usize);
+        let path = pak.get(p + 18..p + 18 + len).and_then(|b| core::str::from_utf8(b).ok())?;
+        p += 18 + len;
+        Some((path, pak.get(off..off + size)))
+    })
+    .filter_map(|(path, data)| Some((path, data?)))
+    .filter(|(path, _)| !path.contains(".."))
+}
+
+/// A file of the system pak, straight from the Limine module: for code that runs before
+/// the system files are registered (Linux drivers loading firmware while they probe).
+#[cfg(feature = "linux-drivers")]
+pub fn system_file(path: &str) -> Option<&'static [u8]> {
+    crate::limine::MODULES.modules().filter(|m| m.string() == "@pak").find_map(|m| pak_entries(m.data()).find(|(p, _)| *p == path).map(|(_, data)| data))
 }
 
 // ---------------------------------------------------------------------------

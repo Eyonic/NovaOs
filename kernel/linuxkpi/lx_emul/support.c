@@ -255,6 +255,29 @@ void platform_device_unregister(struct platform_device *pdev)
 	platform_device_put(pdev);
 }
 
+struct platform_device *platform_device_register_full(const struct platform_device_info *pdevinfo)
+{
+	struct platform_device *pdev = platform_device_alloc(pdevinfo->name, pdevinfo->id);
+	int err;
+
+	if (!pdev)
+		return ERR_PTR(-ENOMEM);
+	pdev->dev.parent = pdevinfo->parent;
+	err = platform_device_add_resources(pdev, pdevinfo->res, pdevinfo->num_res);
+	if (!err && pdevinfo->data) {
+		pdev->dev.platform_data = kmemdup(pdevinfo->data, pdevinfo->size_data, GFP_KERNEL);
+		if (!pdev->dev.platform_data)
+			err = -ENOMEM;
+	}
+	if (!err)
+		err = platform_device_add(pdev);
+	if (err) {
+		platform_device_put(pdev);
+		return ERR_PTR(err);
+	}
+	return pdev;
+}
+
 /* ---------------------------------------------------------------- firmware nodes */
 
 /* Nova has no device tree and no ACPI device properties for drivers yet. */
@@ -567,17 +590,138 @@ struct uts_namespace init_uts_ns = {
 	},
 };
 
-/* Module parameters (string flavours): built-in drivers keep their defaults. */
-const struct kernel_param_ops param_ops_ullong;
+/* ---------------------------------------------------------------- module parameters */
+
+/*
+ * Built-in drivers' module parameters, set from Nova's kernel command line the way Linux
+ * does it: "amdgpu.dc=0" sets parameter "dc" of the built-in amdgpu. The parameters are
+ * in the __param section (kept by kernel/linker.ld); nova_lx_params() applies the
+ * command line before the initcalls. Values are not readable back (no sysfs).
+ */
+#define LX_PARAM_SET(name, type, parse)						\
+	int param_set_##name(const char *val, const struct kernel_param *kp)		\
+	{										\
+		type v;									\
+		int err = parse(val, 0, &v);						\
+											\
+		if (!err)								\
+			*(type *)kp->arg = v;						\
+		return err;								\
+	}										\
+	const struct kernel_param_ops param_ops_##name = { .set = param_set_##name }
+
+LX_PARAM_SET(int, int, kstrtoint);
+LX_PARAM_SET(uint, unsigned int, kstrtouint);
+LX_PARAM_SET(hexint, unsigned int, kstrtouint);
+LX_PARAM_SET(ulong, unsigned long, kstrtoul);
+LX_PARAM_SET(ullong, unsigned long long, kstrtoull);
+
+static int lx_param_bool(const char *val, bool *v)
+{
+	/* A bare "name" means true, as on Linux. */
+	return val ? kstrtobool(val, v) : (*v = true, 0);
+}
+
+int param_set_bool(const char *val, const struct kernel_param *kp)
+{
+	return lx_param_bool(val, kp->arg);
+}
+
+int param_set_bint(const char *val, const struct kernel_param *kp)
+{
+	bool v;
+	int err = lx_param_bool(val, &v);
+
+	if (!err)
+		*(int *)kp->arg = v;
+	return err;
+}
+
+int param_set_charp(const char *val, const struct kernel_param *kp)
+{
+	char *copy = kstrdup(val ?: "", GFP_KERNEL);
+
+	if (!copy)
+		return -ENOMEM;
+	*(char **)kp->arg = copy;
+	return 0;
+}
 
 int param_set_copystring(const char *val, const struct kernel_param *kp)
 {
+	const struct kparam_string *kps = kp->str;
+
+	if (!val || strlen(val) + 1 > kps->maxlen)
+		return -ENOSPC;
+	strcpy(kps->string, val);
 	return 0;
 }
 
 int param_get_string(char *buffer, const struct kernel_param *kp)
 {
-	return 0;
+	return sysfs_emit(buffer, "%s\n", kp->str->string);
+}
+
+const struct kernel_param_ops param_ops_bool = { .flags = KERNEL_PARAM_OPS_FL_NOARG, .set = param_set_bool };
+const struct kernel_param_ops param_ops_bint = { .flags = KERNEL_PARAM_OPS_FL_NOARG, .set = param_set_bint };
+const struct kernel_param_ops param_ops_charp = { .set = param_set_charp };
+const struct kernel_param_ops param_ops_string = { .set = param_set_copystring, .get = param_get_string };
+/* Array parameters ("a,b,c") are rare in drivers Nova runs; they keep their defaults. */
+const struct kernel_param_ops param_array_ops;
+
+static bool lx_param_name_eq(const char *a, const char *b, size_t n)
+{
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		char x = a[i] == '-' ? '_' : a[i], y = b[i] == '-' ? '_' : b[i];
+
+		if (x != y)
+			return false;
+	}
+	return b[n] == '\0';
+}
+
+void nova_lx_params(void)
+{
+	const struct kernel_param *kp;
+	size_t len, i = 0;
+	const char *cmdline = nova_cmdline(&len);
+
+	while (i < len) {
+		size_t start, end, eq;
+		char *val = NULL;
+
+		while (i < len && cmdline[i] == ' ')
+			i++;
+		start = i;
+		while (i < len && cmdline[i] != ' ')
+			i++;
+		end = i;
+		for (eq = start; eq < end && cmdline[eq] != '='; eq++)
+			;
+		/* Only "driver.parameter[=value]" words concern Linux drivers. */
+		if (!memchr(cmdline + start, '.', eq - start) || !strncmp(cmdline + start, "nova.", 5))
+			continue;
+		for (kp = __start___param; kp < __stop___param; kp++) {
+			int err;
+
+			if (!lx_param_name_eq(cmdline + start, kp->name, eq - start))
+				continue;
+			if (eq < end)
+				val = kstrndup(cmdline + eq + 1, end - eq - 1, GFP_KERNEL);
+			if (!val && !(kp->ops->flags & KERNEL_PARAM_OPS_FL_NOARG))
+				err = -EINVAL;
+			else
+				err = kp->ops->set ? kp->ops->set(val, kp) : -EOPNOTSUPP;
+			if (err)
+				pr_warn("parameter %s: invalid value %s (%d)\n", kp->name, val ?: "", err);
+			else
+				pr_info("parameter %s=%s\n", kp->name, val ?: "1");
+			kfree(val);
+			break;
+		}
+	}
 }
 
 /* ---------------------------------------------------------------- sysfs */

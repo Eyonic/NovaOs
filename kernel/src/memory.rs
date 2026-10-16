@@ -114,11 +114,12 @@ pub fn init() -> Result<(u64, usize), &'static str> {
             entry.write_volatile(new_table() | PRESENT | WRITABLE);
         }
     }
-    // The same for Linux's struct page array (filled on demand by `populate`).
+    // The same for Linux's struct page array (filled on demand by `populate`) and the
+    // window for its vmap() mappings.
     #[cfg(feature = "linux-drivers")]
-    {
-        let entry = (phys_to_virt(read_cr3()) as *mut u64).wrapping_add(((VMEMMAP_BASE >> 39) & 511) as usize);
-        // SAFETY: as above; slot 468 is unused by Limine.
+    for base in [VMEMMAP_BASE, VMAP_BASE] {
+        let entry = (phys_to_virt(read_cr3()) as *mut u64).wrapping_add(((base >> 39) & 511) as usize);
+        // SAFETY: as above; slots 468 and 402 are unused by Limine.
         unsafe {
             if entry.read_volatile() & PRESENT == 0 {
                 entry.write_volatile(new_table() | PRESENT | WRITABLE);
@@ -303,6 +304,105 @@ pub unsafe fn map_page_in(root: u64, virt: u64, phys: u64, flags: u64, table_fla
 /// VMEMMAP_START, PML4 slot 468); lx_emul sets `vmemmap_base` to it.
 #[cfg(feature = "linux-drivers")]
 pub const VMEMMAP_BASE: u64 = 0xFFFF_EA00_0000_0000;
+
+/// The Linux driver layer's vmap() window (Linux's default VMALLOC_START, PML4 slot 402):
+/// page runs that are not contiguous in physical memory, mapped contiguously for TTM's
+/// kernel mappings of GPU buffers. lx_emul sets `vmalloc_base` to it.
+#[cfg(feature = "linux-drivers")]
+pub const VMAP_BASE: u64 = 0xFFFF_C900_0000_0000;
+#[cfg(feature = "linux-drivers")]
+const VMAP_PAGES: u64 = (1 << 39) / PAGE_SIZE;
+
+/// The vmap window's free ranges and live mappings (start -> pages), as page numbers
+/// from VMAP_BASE.
+#[cfg(feature = "linux-drivers")]
+struct Vmap {
+    free: alloc::collections::BTreeMap<u64, u64>,
+    used: alloc::collections::BTreeMap<u64, u64>,
+}
+
+#[cfg(feature = "linux-drivers")]
+static VMAP: SpinLock<Option<Vmap>> = SpinLock::new(None);
+
+/// Map the pages at `frames` (physical addresses) contiguously, with `cache` flags
+/// (write-through / cache-disable bits) added; returns the virtual address.
+#[cfg(feature = "linux-drivers")]
+pub fn vmap(frames: &[u64], cache: u64) -> Option<u64> {
+    let pages = frames.len() as u64;
+    let start = {
+        let mut guard = VMAP.lock();
+        let vm = guard.get_or_insert_with(|| Vmap { free: [(0, VMAP_PAGES)].into_iter().collect(), used: Default::default() });
+        // First fit, plus an unmapped guard page after each mapping.
+        let (&start, &len) = vm.free.iter().find(|&(_, &len)| len > pages)?;
+        vm.free.remove(&start);
+        vm.free.insert(start + pages + 1, len - pages - 1);
+        vm.used.insert(start, pages);
+        start
+    };
+    let flags = PRESENT | WRITABLE | (cache & (WRITE_THROUGH | CACHE_DISABLE));
+    for (i, &frame) in frames.iter().enumerate() {
+        // SAFETY: a fresh range of the vmap window; the frames are RAM or device memory
+        // the Linux driver layer owns.
+        unsafe { map_page(VMAP_BASE + (start + i as u64) * PAGE_SIZE, frame & ADDR_MASK, flags) };
+    }
+    Some(VMAP_BASE + start * PAGE_SIZE)
+}
+
+/// Remove a mapping made by [`vmap`] and give its range back.
+#[cfg(feature = "linux-drivers")]
+pub fn vunmap(virt: u64) {
+    let start = (virt - VMAP_BASE) / PAGE_SIZE;
+    let Some(pages) = VMAP.lock().as_mut().and_then(|vm| vm.used.remove(&start)) else {
+        crate::log::warn(&alloc::format!("linux: vunmap of unknown address {virt:#x}"));
+        return;
+    };
+    for i in 0..pages {
+        unmap_page(VMAP_BASE + (start + i) * PAGE_SIZE);
+    }
+    let mut guard = VMAP.lock();
+    let free = &mut guard.as_mut().unwrap().free;
+    // Give back the range with its guard page, merged with free neighbours.
+    let (mut start, mut len) = (start, pages + 1);
+    if let Some(next) = free.remove(&(start + len)) {
+        len += next;
+    }
+    if let Some((&prev, &prev_len)) = free.range(..start).next_back()
+        && prev + prev_len == start
+    {
+        free.remove(&prev);
+        start = prev;
+        len += prev_len;
+    }
+    free.insert(start, len);
+}
+
+/// Clear the kernel page-table entry for the 4 KiB page `virt`, if mapped.
+#[cfg(feature = "linux-drivers")]
+fn unmap_page(virt: u64) {
+    let mut table = read_cr3();
+    for level in [39u64, 30, 21] {
+        let entry = (phys_to_virt(table) as *const u64).wrapping_add(((virt >> level) & 511) as usize);
+        // SAFETY: page tables are in RAM covered by the direct map.
+        let value = unsafe { entry.read_volatile() };
+        if value & PRESENT == 0 || value & HUGE != 0 {
+            return;
+        }
+        table = value & ADDR_MASK;
+    }
+    let entry = (phys_to_virt(table) as *mut u64).wrapping_add(((virt >> 12) & 511) as usize);
+    // SAFETY: a 4 KiB mapping of the vmap window, no longer used by its owner.
+    unsafe {
+        entry.write_volatile(0);
+        asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags));
+    }
+}
+
+/// Whether physical address `phys` is RAM according to the firmware's memory map
+/// (usable, bootloader, kernel, or ACPI-reclaimable memory).
+#[cfg(feature = "linux-drivers")]
+pub fn is_ram(phys: u64) -> bool {
+    limine::MEMMAP.entries().any(|e| matches!(e.kind, 0 | 2 | 5 | 6) && phys >= e.base && phys < e.base + e.length)
+}
 
 /// Physical address `virt` maps to in the kernel's page tables, if any.
 pub fn translate(virt: u64) -> Option<u64> {

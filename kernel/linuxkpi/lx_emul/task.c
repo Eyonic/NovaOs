@@ -23,6 +23,9 @@
 #include <linux/rwsem.h>
 #include <linux/jiffies.h>
 #include <linux/string.h>
+#include <linux/kthread.h>
+#include <linux/slab.h>
+#include <linux/pid.h>
 #include "nova.h"
 
 void nova_park(void);
@@ -47,6 +50,7 @@ static struct task_struct *lx_task_for(u64 id)
 		/* A new task, or one whose slot a newer task (id + 64k) has taken over. */
 		memset(t, 0, sizeof(*t));
 		t->__state = TASK_RUNNING;
+		refcount_set(&t->usage, 1);
 		t->pid = t->tgid = (pid_t)id;
 		snprintf(t->comm, sizeof(t->comm), "nova-%llu", id);
 		lx_task_owner[slot] = id + 1;
@@ -553,4 +557,243 @@ void up_write(struct rw_semaphore *sem)
 void downgrade_write(struct rw_semaphore *sem)
 {
 	atomic_long_set(&sem->count, 1);
+}
+
+/* wait_event_interruptible_locked(): called and returning with wq->lock held. */
+int do_wait_intr(wait_queue_head_t *wq, wait_queue_entry_t *wait)
+{
+	if (list_empty(&wait->entry))
+		__add_wait_queue_entry_tail(wq, wait);
+	set_current_state(TASK_INTERRUPTIBLE);
+	spin_unlock(&wq->lock);
+	schedule();
+	spin_lock(&wq->lock);
+	return 0;
+}
+
+/* ---------------------------------------------------------------- task identity */
+
+/* task_structs live in lx_tasks and are never freed, so the last put has no work. */
+void __put_task_struct_rcu_cb(struct rcu_head *rhp)
+{
+}
+
+struct task_struct *pid_task(struct pid *pid, enum pid_type type)
+{
+	return NULL;
+}
+
+pid_t __task_pid_nr_ns(struct task_struct *task, enum pid_type type, struct pid_namespace *ns)
+{
+	return task ? task->pid : 0;
+}
+
+/* Scheduling classes and priorities do not exist in Nova's round-robin scheduler. */
+void sched_set_fifo(struct task_struct *p)
+{
+}
+
+/* ---------------------------------------------------------------- kernel threads */
+
+/*
+ * A kthread is a Nova kernel task (nova_task_spawn) with its own task_struct. As on
+ * Linux it starts stopped: it runs threadfn once wake_up_process() is called on it.
+ * kthread_stop() sets the stop flag, wakes the thread and waits for threadfn to return.
+ */
+struct lx_kthread {
+	int (*threadfn)(void *data);
+	void *data;
+	struct task_struct *task;
+	bool should_stop;
+	bool ran, exited;
+	int result;
+	u64 stopper;		/* Nova task waiting in kthread_stop, + 1 */
+};
+
+static void lx_kthread_entry(void *arg)
+{
+	struct lx_kthread *k = arg;
+
+	/* Created stopped: wait for the first wake_up_process(). */
+	schedule();
+	if (!READ_ONCE(k->should_stop))
+		k->ran = true, k->result = k->threadfn(k->data);
+	WRITE_ONCE(k->exited, true);
+	if (k->stopper)
+		nova_wake(k->stopper - 1);
+}
+
+struct task_struct *kthread_create_on_node(int (*threadfn)(void *data), void *data, int node,
+					   const char namefmt[], ...)
+{
+	struct lx_kthread *k = kzalloc(sizeof(*k), GFP_KERNEL);
+	struct task_struct *t;
+	char name[TASK_COMM_LEN];
+	va_list args;
+	u64 id;
+
+	if (!k)
+		return ERR_PTR(-ENOMEM);
+	va_start(args, namefmt);
+	vsnprintf(name, sizeof(name), namefmt, args);
+	va_end(args);
+	k->threadfn = threadfn;
+	k->data = data;
+	id = nova_task_spawn(name, lx_kthread_entry, k);
+	t = lx_task_for(id);
+	strscpy(t->comm, name, sizeof(t->comm));
+	t->__state = TASK_UNINTERRUPTIBLE;
+	t->worker_private = k;
+	k->task = t;
+	return t;
+}
+
+static struct lx_kthread *lx_kthread(struct task_struct *t)
+{
+	return t->worker_private;
+}
+
+bool kthread_should_stop(void)
+{
+	struct lx_kthread *k = lx_kthread(current);
+
+	return k && READ_ONCE(k->should_stop);
+}
+
+int kthread_stop(struct task_struct *t)
+{
+	struct lx_kthread *k = lx_kthread(t);
+	int result;
+
+	if (WARN_ON(!k))
+		return -EINVAL;
+	k->stopper = nova_task_id() + 1;
+	WRITE_ONCE(k->should_stop, true);
+	wake_up_process(t);
+	while (!READ_ONCE(k->exited))
+		nova_park();
+	result = k->ran ? k->result : -EINTR;
+	t->worker_private = NULL;
+	kfree(k);
+	return result;
+}
+
+/* ---------------------------------------------------------------- kthread workers */
+
+static int lx_kthread_worker_fn(void *data)
+{
+	struct kthread_worker *worker = data;
+
+	for (;;) {
+		struct kthread_work *work = NULL;
+		unsigned long flags;
+
+		set_current_state(TASK_INTERRUPTIBLE);
+		raw_spin_lock_irqsave(&worker->lock, flags);
+		if (!list_empty(&worker->work_list)) {
+			work = list_first_entry(&worker->work_list, struct kthread_work, node);
+			list_del_init(&work->node);
+		}
+		worker->current_work = work;
+		raw_spin_unlock_irqrestore(&worker->lock, flags);
+		if (work) {
+			__set_current_state(TASK_RUNNING);
+			work->func(work);
+			continue;
+		}
+		if (kthread_should_stop()) {
+			__set_current_state(TASK_RUNNING);
+			return 0;
+		}
+		schedule();
+	}
+}
+
+struct kthread_worker *kthread_create_worker_on_node(unsigned int flags, int node, const char namefmt[], ...)
+{
+	struct kthread_worker *worker = kzalloc(sizeof(*worker), GFP_KERNEL);
+	struct task_struct *task;
+	char name[TASK_COMM_LEN];
+	va_list args;
+
+	if (!worker)
+		return ERR_PTR(-ENOMEM);
+	va_start(args, namefmt);
+	vsnprintf(name, sizeof(name), namefmt, args);
+	va_end(args);
+	worker->flags = flags;
+	raw_spin_lock_init(&worker->lock);
+	INIT_LIST_HEAD(&worker->work_list);
+	INIT_LIST_HEAD(&worker->delayed_work_list);
+	task = kthread_create_on_node(lx_kthread_worker_fn, worker, node, "%s", name);
+	worker->task = task;
+	wake_up_process(task);
+	return worker;
+}
+
+bool kthread_queue_work(struct kthread_worker *worker, struct kthread_work *work)
+{
+	unsigned long flags;
+	bool queued = false;
+
+	raw_spin_lock_irqsave(&worker->lock, flags);
+	if (list_empty(&work->node) && !work->canceling) {
+		work->worker = worker;
+		list_add_tail(&work->node, &worker->work_list);
+		queued = true;
+	}
+	raw_spin_unlock_irqrestore(&worker->lock, flags);
+	if (queued)
+		wake_up_process(worker->task);
+	return queued;
+}
+
+static bool lx_kthread_work_busy(struct kthread_work *work)
+{
+	struct kthread_worker *worker = work->worker;
+
+	return worker && (!list_empty(&work->node) || READ_ONCE(worker->current_work) == work);
+}
+
+void kthread_flush_work(struct kthread_work *work)
+{
+	if (work->worker && work->worker->task == current)
+		return;
+	while (lx_kthread_work_busy(work))
+		nova_park();
+}
+
+void kthread_flush_worker(struct kthread_worker *worker)
+{
+	if (worker->task == current)
+		return;
+	while (!list_empty(&worker->work_list) || READ_ONCE(worker->current_work))
+		nova_park();
+}
+
+bool kthread_cancel_work_sync(struct kthread_work *work)
+{
+	struct kthread_worker *worker = work->worker;
+	unsigned long flags;
+	bool was_pending = false;
+
+	if (!worker)
+		return false;
+	raw_spin_lock_irqsave(&worker->lock, flags);
+	if (!list_empty(&work->node)) {
+		list_del_init(&work->node);
+		was_pending = true;
+	}
+	raw_spin_unlock_irqrestore(&worker->lock, flags);
+	work->canceling++;
+	kthread_flush_work(work);
+	work->canceling--;
+	return was_pending;
+}
+
+void kthread_destroy_worker(struct kthread_worker *worker)
+{
+	kthread_flush_worker(worker);
+	kthread_stop(worker->task);
+	kfree(worker);
 }

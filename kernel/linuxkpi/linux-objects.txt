@@ -1,6 +1,7 @@
 # Objects compiled from the Linux source (build/linux, scripts/fetch-linux.sh) and linked
 # into Nova with FEATURES=linux-drivers. Paths are relative to the Linux tree; Kbuild
 # builds them with the configuration from nova.config. lx_emul (nova/) provides the rest.
+# An entry ending in / is a directory: every object of its Kbuild built-in.a is linked.
 
 # Drivers
 drivers/net/ethernet/realtek/8139cp.o
@@ -75,6 +76,14 @@ drivers/input/input-mt.o
 drivers/input/input-poller.o
 drivers/input/ff-core.o
 
+# GPU: the DRM core, TTM, the display helpers, the GPU scheduler and buddy allocator,
+# amdgpu with its display core (drivers/gpu/), dma-buf and fences, the I2C core (DDC and
+# display AUX channels), HDMI infoframes and the backlight class (drivers/video/)
+drivers/gpu/
+drivers/dma-buf/
+drivers/i2c/
+drivers/video/
+
 # Subsystem code used as is
 net/ethernet/eth.o
 net/ethtool/common.o
@@ -114,3 +123,13 @@ fs/nls/nls_base.o
 kernel/time/timeconv.o
 kernel/time/timecounter.o
 arch/x86/lib/csum-partial_64.o
+arch/x86/lib/memmove_64.o
+arch/x86/lib/copy_page_64.o
+arch/x86/lib/clear_page_64.o
+lib/rbtree.o
+lib/sort.o
+lib/list_sort.o
+lib/math/gcd.o
+lib/kfifo.o
+mm/mempool.o
+lib/llist.o

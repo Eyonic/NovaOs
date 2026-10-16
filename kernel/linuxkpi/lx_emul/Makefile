@@ -12,3 +12,7 @@ obj-y += device.o
 obj-y += support.o
 obj-y += input.o
 obj-y += firmware.o
+obj-y += fs.o
+obj-y += irq.o
+obj-y += fpu.o
+obj-y += gpu.o

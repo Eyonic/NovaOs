@@ -16,6 +16,8 @@
 #include <linux/list.h>
 #include <linux/bitfield.h>
 #include <linux/radix-tree.h>
+#include <linux/vgaarb.h>
+#include <asm/fpu/api.h>
 #include "nova.h"
 
 const struct bus_type pci_bus_type = { .name = "pci" };
@@ -557,6 +559,49 @@ void dma_unmap_phys(struct device *dev, dma_addr_t addr, size_t size, enum dma_d
 {
 }
 
+/* Scatter-gather tables (TTM's page arrays, PRIME imports): each entry maps to its
+ * physical address, which must be within the device's mask. */
+int dma_map_sgtable(struct device *dev, struct sg_table *sgt, enum dma_data_direction dir,
+		    unsigned long attrs)
+{
+	u64 mask = dev && dev->dma_mask ? *dev->dma_mask : DMA_BIT_MASK(32);
+	struct scatterlist *s;
+	int i;
+
+	for_each_sgtable_sg(sgt, s, i) {
+		s->dma_address = sg_phys(s);
+		sg_dma_len(s) = s->length;
+		if (s->dma_address + s->length - 1 > mask)
+			return -EIO;
+	}
+	sgt->nents = sgt->orig_nents;
+	return 0;
+}
+
+/* Device memory (another device's BAR, for peer-to-peer) is addressed physically too. */
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
+			    enum dma_data_direction dir, unsigned long attrs)
+{
+	return phys_addr;
+}
+
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size, enum dma_data_direction dir,
+			unsigned long attrs)
+{
+}
+
+size_t dma_max_mapping_size(struct device *dev)
+{
+	return SIZE_MAX;
+}
+
+/* A device is limited when its memory comes from the DMA32 pool (see lx_dma32), so
+ * TTM then allocates with GFP_DMA32 too. */
+bool dma_addressing_limited(struct device *dev)
+{
+	return lx_dma32(dev, dma_get_mask(dev));
+}
+
 /* ---------------------------------------------------------------- MSI and MSI-X */
 
 /* Provided by Nova (linuxkpi.rs / apic.rs). */
@@ -794,8 +839,20 @@ static void lx_pci_probe(struct pci_driver *drv, struct pci_dev *dev)
 	const struct pci_device_id *id = lx_pci_match(drv->id_table, dev);
 	int err;
 
+	bool display = (dev->class >> 16) == PCI_BASE_CLASS_DISPLAY;
+
 	if (!id || dev->driver)
 		return;
+	if (nova_driver_disabled(drv->name, strlen(drv->name))) {
+		pr_info("%s %s: skipped (nova.disable_driver)\n", drv->name, pci_name(dev));
+		return;
+	}
+	/* Display drivers take over the screen Nova draws on, and a GPU's bring-up is the
+	 * longest and least tested probe: say on screen what is starting, and how to boot
+	 * without it. */
+	if (display)
+		nova_console_notice("linux/%s: starting %s (%04x:%04x); if the screen stays dark, boot with nova.disable_driver=%s",
+				    drv->name, pci_name(dev), dev->vendor, dev->device, drv->name);
 	dev->dev.driver = &drv->driver;
 	err = drv->probe(dev, id);
 	if (err) {
@@ -804,6 +861,8 @@ static void lx_pci_probe(struct pci_driver *drv, struct pci_dev *dev)
 			pr_warn("%s %s: probe failed (%d)\n", drv->name, pci_name(dev), err);
 		return;
 	}
+	if (display)
+		pr_info("%s %s: probe finished\n", drv->name, pci_name(dev));
 	dev->driver = drv;
 }
 
@@ -916,6 +975,11 @@ void nova_lx_start(void)
 
 	/* What start_kernel() sets up before any initcall runs. */
 	radix_tree_init();
+	nova_lx_params();
+	/* One kernel FPU section at boot: a broken save path then shows up in every test,
+	 * not first on a machine with an AMD GPU (whose display code is its main user). */
+	kernel_fpu_begin();
+	kernel_fpu_end();
 
 	for (entry = __nova_initcall_start; entry < __nova_initcall_end; entry++) {
 		initcall_t fn = (initcall_t)offset_to_ptr(entry);
@@ -971,4 +1035,272 @@ void __iomem *pcim_iomap_region(struct pci_dev *pdev, int bar, const char *name)
 int pci_reset_bus(struct pci_dev *dev)
 {
 	return -ENOTTY;
+}
+
+/* Function-level reset is not offered; amdgpu resets the GPU through its own methods. */
+int pci_reset_function(struct pci_dev *dev)
+{
+	return -ENOTTY;
+}
+
+int pci_wait_for_pending_transaction(struct pci_dev *dev)
+{
+	return 1;
+}
+
+int pci_wake_from_d3(struct pci_dev *dev, bool enable)
+{
+	return 0;
+}
+
+/* MSI programming survives resets that keep config space (Nova never powers devices
+ * down), so there is nothing to restore. */
+void pci_restore_msi_state(struct pci_dev *dev)
+{
+}
+
+/* A saved configuration header, kept by the driver across a reset. */
+struct pci_saved_state {
+	u32 dwords[16];
+};
+
+struct pci_saved_state *pci_store_saved_state(struct pci_dev *dev)
+{
+	struct pci_saved_state *state;
+	int i;
+
+	if (!dev->state_saved)
+		return NULL;
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	if (!state)
+		return NULL;
+	for (i = 0; i < ARRAY_SIZE(lx_saved); i++)
+		if (lx_saved[i].dev == dev)
+			memcpy(state->dwords, lx_saved[i].dwords, sizeof(state->dwords));
+	return state;
+}
+
+int pci_load_saved_state(struct pci_dev *dev, struct pci_saved_state *state)
+{
+	int i;
+
+	dev->state_saved = false;
+	if (!state)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(lx_saved); i++) {
+		if (lx_saved[i].dev == dev || !lx_saved[i].dev) {
+			lx_saved[i].dev = dev;
+			memcpy(lx_saved[i].dwords, state->dwords, sizeof(state->dwords));
+			dev->state_saved = true;
+			return 0;
+		}
+	}
+	return -ENOMEM;
+}
+
+/* ---------------------------------------------------------------- lookup */
+
+/* Only the functions handed to Linux exist here (not bridges, not Nova's own devices). */
+struct pci_dev *pci_get_domain_bus_and_slot(int domain, unsigned int bus, unsigned int devfn)
+{
+	struct lx_pci_dev *d;
+
+	if (domain)
+		return NULL;
+	for_each_lx_pci_dev(d)
+		if (d->pdev.bus->number == bus && d->pdev.devfn == devfn)
+			return pci_dev_get(&d->pdev);
+	return NULL;
+}
+
+static struct pci_dev *lx_pci_get_class(unsigned int class, unsigned int shift, struct pci_dev *from)
+{
+	struct lx_pci_dev *d = from ? list_next_entry(to_lx_pci_dev(from), node)
+				    : list_first_entry(&lx_pci_devices, struct lx_pci_dev, node);
+
+	for (; !list_entry_is_head(d, &lx_pci_devices, node); d = list_next_entry(d, node))
+		if ((d->pdev.class >> shift) == class)
+			return &d->pdev;
+	return NULL;
+}
+
+struct pci_dev *pci_get_class(unsigned int class, struct pci_dev *from)
+{
+	return lx_pci_get_class(class, 0, from);
+}
+
+struct pci_dev *pci_get_base_class(unsigned int class, struct pci_dev *from)
+{
+	return lx_pci_get_class(class, 16, from);
+}
+
+struct resource *pci_find_resource(struct pci_dev *dev, struct resource *res)
+{
+	int i;
+
+	for (i = 0; i < PCI_STD_NUM_BARS; i++) {
+		struct resource *r = &dev->resource[i];
+
+		if (r->start && resource_contains(r, res))
+			return r;
+	}
+	return NULL;
+}
+
+/* Bus addresses are CPU physical addresses on x86. */
+void pcibios_bus_to_resource(struct pci_bus *bus, struct resource *res, struct pci_bus_region *region)
+{
+	res->start = region->start;
+	res->end = region->end;
+}
+
+/* Root bus windows are not known here; callers treat that as "no window above 4 GiB". */
+struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n)
+{
+	return NULL;
+}
+
+/* ---------------------------------------------------------------- resizable BARs */
+
+int pci_rebar_bytes_to_size(u64 bytes)
+{
+	bytes = roundup_pow_of_two(bytes);
+	return max(ilog2(bytes), 20) - 20;
+}
+
+/* BARs keep the size the firmware gave them (with Resizable BAR enabled in the
+ * firmware setup, that is the whole VRAM already). */
+int pci_rebar_get_max_size(struct pci_dev *pdev, int bar)
+{
+	return -EOPNOTSUPP;
+}
+
+int pci_resize_resource(struct pci_dev *dev, int i, int size, int exclude_bars)
+{
+	return -EOPNOTSUPP;
+}
+
+/* ---------------------------------------------------------------- PCI Express link */
+
+static enum pci_bus_speed lx_pcie_speed(unsigned int code)
+{
+	return code >= 1 && code <= 6 ? PCIE_SPEED_2_5GT + code - 1 : PCI_SPEED_UNKNOWN;
+}
+
+enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev)
+{
+	u32 lnkcap2 = 0, lnkcap = 0;
+
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP2, &lnkcap2);
+	if (lnkcap2 & PCI_EXP_LNKCAP2_SLS)
+		return lx_pcie_speed(fls(lnkcap2 & PCI_EXP_LNKCAP2_SLS) - 1);
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &lnkcap);
+	return lx_pcie_speed(lnkcap & PCI_EXP_LNKCAP_SLS);
+}
+
+enum pcie_link_width pcie_get_width_cap(struct pci_dev *dev)
+{
+	u32 lnkcap = 0;
+
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &lnkcap);
+	return lnkcap ? FIELD_GET(PCI_EXP_LNKCAP_MLW, lnkcap) : PCIE_LNK_WIDTH_UNKNOWN;
+}
+
+/* Linux takes the narrowest link up to the root port; only the device's own link is
+ * visible here. Bandwidth in Mb/s after line-code overhead, as Linux reports it. */
+u32 pcie_bandwidth_available(struct pci_dev *dev, struct pci_dev **limiting_dev, enum pci_bus_speed *speed,
+			     enum pcie_link_width *width)
+{
+	static const u32 mbps[] = { 2000, 4000, 7877, 15754, 31508, 62015 };
+	u16 lnksta = 0;
+	unsigned int code, lanes;
+
+	pcie_capability_read_word(dev, PCI_EXP_LNKSTA, &lnksta);
+	code = lnksta & PCI_EXP_LNKSTA_CLS;
+	lanes = FIELD_GET(PCI_EXP_LNKSTA_NLW, lnksta);
+	if (speed)
+		*speed = lx_pcie_speed(code);
+	if (width)
+		*width = lanes ?: PCIE_LNK_WIDTH_UNKNOWN;
+	if (limiting_dev)
+		*limiting_dev = dev;
+	return code >= 1 && code <= 6 ? lanes * mbps[code - 1] : 0;
+}
+
+int pcie_get_mps(struct pci_dev *dev)
+{
+	u16 ctl = 0;
+
+	pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &ctl);
+	return 128 << FIELD_GET(PCI_EXP_DEVCTL_PAYLOAD, ctl);
+}
+
+bool pcie_aspm_enabled(struct pci_dev *pdev)
+{
+	return false;
+}
+
+/* AtomicOp routing needs every bridge up to the root port; those are Nova's. */
+int pci_enable_atomic_ops_to_root(struct pci_dev *dev, u32 cap_mask)
+{
+	return -EINVAL;
+}
+
+/* ---------------------------------------------------------------- expansion ROM */
+
+/*
+ * The option ROM through the ROM BAR, as the firmware assigned it (amdgpu reads its
+ * video BIOS from here when other sources fail). The mapping is uncached and stays; the
+ * BAR's decoding is switched off again by pci_unmap_rom().
+ */
+void __iomem *pci_map_rom(struct pci_dev *pdev, size_t *size)
+{
+	u32 rom, mask;
+	u16 cmd;
+	void __iomem *p;
+
+	pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &rom);
+	if (!(rom & PCI_ROM_ADDRESS_MASK))
+		return NULL;
+	pci_write_config_dword(pdev, PCI_ROM_ADDRESS, PCI_ROM_ADDRESS_MASK);
+	pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &mask);
+	mask &= PCI_ROM_ADDRESS_MASK;
+	if (!mask) {
+		pci_write_config_dword(pdev, PCI_ROM_ADDRESS, rom);
+		return NULL;
+	}
+	pci_write_config_dword(pdev, PCI_ROM_ADDRESS, (rom & PCI_ROM_ADDRESS_MASK) | PCI_ROM_ADDRESS_ENABLE);
+	pci_read_config_word(pdev, PCI_COMMAND, &cmd);
+	if (!(cmd & PCI_COMMAND_MEMORY))
+		pci_write_config_word(pdev, PCI_COMMAND, cmd | PCI_COMMAND_MEMORY);
+	*size = ~mask + 1;
+	p = nova_map_mmio(rom & PCI_ROM_ADDRESS_MASK, *size, false);
+	if (p && readw(p) != 0xAA55) {
+		pci_info(pdev, "no option ROM signature in the ROM BAR\n");
+		pci_unmap_rom(pdev, p);
+		return NULL;
+	}
+	return p;
+}
+
+void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
+{
+	u32 reg;
+
+	pci_read_config_dword(pdev, PCI_ROM_ADDRESS, &reg);
+	pci_write_config_dword(pdev, PCI_ROM_ADDRESS, reg & ~PCI_ROM_ADDRESS_ENABLE);
+}
+
+/* ---------------------------------------------------------------- VGA */
+
+/* No VGA arbiter: Nova does not use legacy VGA resources, and there is no default
+ * VGA device for drivers to compare with. */
+int vga_client_register(struct pci_dev *pdev, unsigned int (*set_decode)(struct pci_dev *pdev, bool state))
+{
+	return 0;
+}
+
+struct pci_dev *vga_default_device(void)
+{
+	return NULL;
 }
