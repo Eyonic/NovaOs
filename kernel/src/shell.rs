@@ -53,6 +53,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "peer", args: "<pid> <fd>", help: "which processes hold the other end of a socket", run: cmd_peer },
     Command { name: "trace", args: "<pid> on|off", help: "log a running program's system calls to serial", run: cmd_trace },
     Command { name: "browser", args: "[url]", help: "open Nova Browser (Chromium engine)", run: cmd_browser },
+    Command { name: "open", args: "<file>", help: "open a file as Files does (documents in their app, e.g. .docx)", run: cmd_open },
     Command { name: "download", args: "<url> <file>", help: "save a URL to a file (e.g. a Shields filter list)", run: cmd_download },
     Command { name: "crash", args: "<case>", help: "trigger a CPU exception or panic", run: cmd_crash },
     Command { name: "halt", args: "", help: "stop the CPU", run: cmd_halt },
@@ -118,6 +119,23 @@ fn cmd_browser(args: &str, _: &History) {
         return;
     }
     crate::browser::launch(if args.is_empty() { None } else { Some(String::from(args)) });
+}
+
+fn cmd_open(args: &str, _: &History) {
+    let path = args.trim().trim_start_matches('/');
+    if path.is_empty() {
+        println!("usage: open <file>");
+        return;
+    }
+    if let Some(e) = crate::desktop::handler_for(path) {
+        println!("open: {path} with {}", e.name);
+    } else if !crate::wm::running() {
+        println!("open: the desktop is not running");
+        return;
+    }
+    if let Err(e) = crate::apps::launch(path) {
+        println!("open: {e}");
+    }
 }
 
 fn cmd_trace(args: &str, _: &History) {

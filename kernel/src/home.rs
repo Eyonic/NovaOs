@@ -42,6 +42,8 @@ const HERO_H: i32 = 232;
 const ROW_H: i32 = 304;
 /// Space above a row's cards for its title (the zoomed card grows 21 px upwards).
 const ROW_TITLE: i32 = 48;
+/// The row of Linux programs with desktop entries (desktop.rs).
+const LINUX_ROW: &str = "Office & Creative";
 /// Hover time before a card's preview starts (ticks).
 const PREVIEW_DELAY: u64 = pit::HZ * 6 / 10;
 
@@ -441,6 +443,25 @@ impl Home {
         }
         rows.push(Row { title: "Apps", items: system_apps, scroll: 0 });
 
+        // Linux programs installed in the image with desktop entries (the Craft apps).
+        let linux: Vec<Item> = crate::desktop::entries()
+            .iter()
+            .map(|e| Item {
+                title: e.name.clone(),
+                category: LINUX_ROW,
+                about: if e.comment.is_empty() { "A Linux program.".into() } else { format!("{}.", e.comment.trim_end_matches('.')) },
+                meta: if e.generic.is_empty() { "Linux app".into() } else { format!("{}  -  Linux app", e.generic) },
+                icon: e.icon,
+                color: e.color,
+                art: e.art,
+                kind: Kind::Other,
+                action: Action::Desktop(e.id.clone()),
+            })
+            .collect();
+        if !linux.is_empty() {
+            rows.push(Row { title: LINUX_ROW, items: linux, scroll: 0 });
+        }
+
         if browser {
             let site = |title: &str, url: &str, art: &'static str, about: &str, color: u32| Item {
                 title: title.into(),
@@ -496,8 +517,9 @@ impl Home {
         let mut library_items = take("Apps");
         library_items.extend(take("Your apps"));
         let mut library = grid("All apps", library_items);
+        library.extend(grid(LINUX_ROW, take(LINUX_ROW)));
         library.push(Row { title: "System", items: take("System"), scroll: 0 });
-        let home: Vec<Row> = rows.iter().filter(|r| matches!(r.title, "Continue" | "Your apps" | "Apps")).cloned().collect();
+        let home: Vec<Row> = rows.iter().filter(|r| matches!(r.title, "Continue" | "Your apps" | "Apps" | LINUX_ROW)).cloned().collect();
         self.tab_names = alloc::vec!["Home", "Library"];
         self.tab_rows = alloc::vec![home, library];
         if browser {
@@ -1057,7 +1079,8 @@ impl Home {
             let title = self.rows[r].title;
             if !title.is_empty() {
                 let end = font::draw(scene, MARGIN, ry, title, 20, Weight::Bold, TEXT);
-                let count: usize = if self.tab == 1 && title == "All apps" { self.rows.iter().filter(|r| r.title != "System").map(|r| r.items.len()).sum() } else { self.rows[r].items.len() };
+                // A section's count includes its grid rows (the untitled rows below it).
+                let count: usize = self.rows[r].items.len() + self.rows[r + 1..].iter().take_while(|row| row.title.is_empty()).map(|row| row.items.len()).sum::<usize>();
                 // The count sits on the title's baseline.
                 font::draw(scene, end + 10, ry + 5, &format!("{count}"), 15, Weight::Regular, DIM);
             }

@@ -9,10 +9,12 @@
 //! pixels, which the `wayland` shell command reports (for tests).
 //!
 //! Globals: wl_compositor 5, wl_subcompositor 1, wl_shm 1, wl_seat 5, wl_output 4,
-//! xdg_wm_base 2, wl_data_device_manager 3. Buffers are copied when committed (and
+//! xdg_wm_base 2, wl_data_device_manager 3, zxdg_decoration_manager_v1 1 (always
+//! server-side: Nova's window frame, so toolkits draw no title bar of their own). Buffers are copied when committed (and
 //! released right away); frame callbacks fire at about 60 Hz.
 //!
-//! Protocol reference: wayland.xml and xdg-shell.xml (Wayland 1.x / wayland-protocols),
+//! Protocol reference: wayland.xml, xdg-shell.xml and xdg-decoration-unstable-v1.xml
+//! (Wayland 1.x / wayland-protocols),
 //! https://wayland.freedesktop.org/docs/html/ch04.html (wire format).
 
 use alloc::collections::{BTreeMap, VecDeque};
@@ -172,6 +174,9 @@ enum Obj {
     DataSource,
     DataDevice,
     DataOffer,
+    DecorationManager,
+    /// zxdg_toplevel_decoration_v1 of a toplevel (the toplevel object's id).
+    Decoration { toplevel: u32 },
 }
 
 #[derive(Default)]
@@ -187,6 +192,10 @@ struct Surface {
     /// The first commit got its configure.
     configured: bool,
     title: String,
+    /// xdg_toplevel.set_app_id: picks the window's icon from the program's desktop entry.
+    app_id: String,
+    /// The size last asked for in a configure because the buffer did not fit the screen.
+    asked: Option<(i32, i32)>,
     canvas: Option<Canvas>,
     window: Option<WindowRef>,
     /// Commits so far, and how many brought a buffer (for the status).
@@ -208,6 +217,7 @@ const GLOBALS: &[Global] = &[
     Global { name: 5, interface: "wl_output", version: 4 },
     Global { name: 6, interface: "xdg_wm_base", version: 2 },
     Global { name: 7, interface: "wl_data_device_manager", version: 3 },
+    Global { name: 8, interface: "zxdg_decoration_manager_v1", version: 1 },
 ];
 
 struct Client {
@@ -512,7 +522,15 @@ impl Client {
                     surf.title = title;
                 }
             }
-            (Obj::Toplevel { .. }, _) => {} // app id, sizes, (un)maximize, move, resize
+            (Obj::Toplevel { surface }, 3) => {
+                // set_app_id
+                let s = *surface;
+                let app_id = r.string()?;
+                if let Some(surf) = self.surfaces.get_mut(&s) {
+                    surf.app_id = app_id;
+                }
+            }
+            (Obj::Toplevel { .. }, _) => {} // sizes, (un)maximize, move, resize
             (Obj::Popup { .. }, 0) => self.delete(id),
             (Obj::Popup { .. }, _) => {}
             (Obj::DataDeviceManager, 0) => {
@@ -523,7 +541,23 @@ impl Client {
                 let d = r.u32()?;
                 self.objects.insert(d, Obj::DataDevice);
             }
-            (Obj::Callback | Obj::Registry | Obj::Display | Obj::Output | Obj::Shm | Obj::Seat | Obj::Buffer(_) | Obj::Compositor | Obj::Subcompositor | Obj::Keyboard | Obj::Touch | Obj::Pointer | Obj::DataDeviceManager, _) => {}
+            (Obj::DecorationManager, 0) | (Obj::Decoration { .. }, 0) => self.delete(id),
+            (Obj::DecorationManager, 1) => {
+                // get_toplevel_decoration(id, toplevel): Nova draws every window's frame.
+                let (d, t) = (r.u32()?, r.u32()?);
+                self.objects.insert(d, Obj::Decoration { toplevel: t });
+                self.event(d, 0, &[Arg::U(2)]); // server_side
+            }
+            (Obj::Decoration { toplevel }, _) => {
+                // set_mode / unset_mode: the answer stays server-side, in a new configure.
+                let t = *toplevel;
+                self.event(id, 0, &[Arg::U(2)]);
+                let xdg = self.surfaces.values().find(|s| s.toplevel == Some(t) && s.configured).and_then(|s| s.xdg);
+                if let Some(x) = xdg {
+                    self.event(x, 0, &[Arg::U(serial())]);
+                }
+            }
+            (Obj::Callback | Obj::Registry | Obj::Display | Obj::Output | Obj::Shm | Obj::Seat | Obj::Buffer(_) | Obj::Compositor | Obj::Subcompositor | Obj::Keyboard | Obj::Touch | Obj::Pointer | Obj::DataDeviceManager | Obj::DecorationManager, _) => {}
         }
         Ok(())
     }
@@ -569,6 +603,9 @@ impl Client {
             }
             "wl_data_device_manager" => {
                 self.objects.insert(id, Obj::DataDeviceManager);
+            }
+            "zxdg_decoration_manager_v1" => {
+                self.objects.insert(id, Obj::DecorationManager);
             }
             _ => {}
         }
@@ -652,7 +689,8 @@ impl Client {
         if s.toplevel.is_some() && wm::running() {
             let win = s.window.get_or_insert_with(|| {
                 let title = if s.title.is_empty() { "Linux program".to_string() } else { s.title.clone() };
-                let win = wm::open(&title, '\u{25EB}', wm::theme::ACCENT, w as i32, h as i32, wm::Content::Canvas(Canvas::new(w, h)));
+                let (icon, accent) = crate::desktop::by_app_id(&s.app_id).map_or(('\u{25EB}', wm::theme::ACCENT), |e| (e.icon, e.color));
+                let win = wm::open(&title, icon, accent, w as i32, h as i32, wm::Content::Canvas(Canvas::new(w, h)));
                 wm::set_raw_input(&win);
                 win
             });
@@ -660,6 +698,20 @@ impl Client {
                 wm::set_size(win, w as i32, h as i32);
             }
             wm::present(win, &canvas);
+            // A buffer larger than the screen: the window was made smaller, so ask the
+            // client to draw at that size (once per size; it may insist).
+            let fit = wm::size(win);
+            let ask = (fit != (w as i32, h as i32) && s.asked != Some(fit)).then_some(fit);
+            if ask.is_some() {
+                s.asked = ask;
+            }
+            let (xdg, top) = (s.xdg, s.toplevel);
+            s.canvas = Some(canvas);
+            if let (Some((fw, fh)), Some(x), Some(t)) = (ask, xdg, top) {
+                self.event(t, 0, &[Arg::I(fw), Arg::I(fh), Arg::A(&4u32.to_le_bytes())]);
+                self.event(x, 0, &[Arg::U(serial())]);
+            }
+            return;
         }
         s.canvas = Some(canvas);
     }

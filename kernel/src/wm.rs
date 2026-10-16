@@ -278,6 +278,8 @@ pub enum Action {
     Script(String),
     /// Open a web page in Nova Browser.
     Url(String),
+    /// Start a Linux program from its desktop entry (by ID, see desktop.rs).
+    Desktop(String),
     /// Bring an open window to the front.
     Focus(usize),
     /// Close an open window (stop the program running in it).
@@ -315,6 +317,13 @@ pub fn launch(action: &Action) {
         Action::Script(path) => {
             if let Err(e) = apps::launch(path) {
                 crate::log::warn(&format!("could not start {path}: {e}"));
+            }
+        }
+        Action::Desktop(id) => {
+            if let Some(e) = crate::desktop::entries().iter().find(|e| e.id == *id)
+                && let Err(err) = crate::desktop::launch(e, None)
+            {
+                crate::log::warn(&format!("could not start {}: {err}", e.name));
             }
         }
         Action::Reboot => crate::power::reboot(),

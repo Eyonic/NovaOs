@@ -19,9 +19,17 @@ case "$image" in "$BUILD"/*) ;; *) fail "refusing to write image outside $BUILD:
 log "Creating disk image $image${cmdline:+ (cmdline: $cmdline)}"
 mkdir -p "$(dirname "$image")"
 rm -f "$image"
-# 64 MiB, or more when the image carries large files (the Chromium engine).
-# Links in the sysroot (BusyBox tools) are not counted: mkpak.py stores them as aliases.
-payload_mb=$(( ( $( (du -sbL "$KERNEL_ELF" "$BUILD/userland"; du -sb "$BUILD/sysroot") 2>/dev/null | awk '{s+=$1} END {print s+0}') >> 20 ) ))
+# Shared libraries, the dynamic loader and the Chromium engine: one pak module
+# (many small modules would exhaust Limine's memory map).
+pak=""
+if [[ -d "$BUILD/sysroot" ]] && [[ -n "$(ls -A "$BUILD/sysroot")" ]]; then
+    pak="$BUILD/nova-system.pak"
+    python3 "$ROOT/scripts/mkpak.py" "$BUILD/sysroot" "$pak" >>"$BUILD_LOG" 2>&1 || fail "packing the system files failed"
+fi
+# 64 MiB, or more when the image carries large files (the Chromium engine): sized from
+# the pak itself (links in the sysroot, e.g. BusyBox tools, are aliases in it, and large
+# programs linked from a download cache are copied in).
+payload_mb=$(( ( $( du -sbL "$KERNEL_ELF" "$BUILD/userland" ${pak:+"$pak"} 2>/dev/null | awk '{s+=$1} END {print s+0}') >> 20 ) ))
 image_mb=$(( payload_mb + 64 > 64 ? payload_mb + 64 : 64 ))
 truncate -s "${image_mb}M" "$image"   # sparse: uses only the space actually written
 sfdisk --quiet "$image" <<'PART' >>"$BUILD_LOG" 2>&1 || fail "sfdisk failed (log: $BUILD_LOG)"
@@ -49,12 +57,7 @@ done
 for p in "${programs[@]}"; do
     printf '    module_path: boot():/nova/bin/%s\n    module_string: %s\n' "$(basename "$p")" "$(basename "$p")" >>"$mods"
 done
-# Shared libraries, the dynamic loader and the Chromium engine: one pak module
-# (many small modules would exhaust Limine's memory map).
-pak=""
-if [[ -d "$BUILD/sysroot" ]] && [[ -n "$(ls -A "$BUILD/sysroot")" ]]; then
-    pak="$BUILD/nova-system.pak"
-    python3 "$ROOT/scripts/mkpak.py" "$BUILD/sysroot" "$pak" >>"$BUILD_LOG" 2>&1 || fail "packing the system files failed"
+if [[ -n "$pak" ]]; then
     printf '    module_path: boot():/nova/system.pak\n    module_string: @pak\n' >>"$mods"
 fi
 if [[ "${NOVA_BOOT_MENU:-0}" == 1 ]]; then

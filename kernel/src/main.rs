@@ -12,6 +12,7 @@ mod bootcell;
 mod browser;
 mod claude;
 mod console;
+mod desktop;
 mod cpu;
 mod drivers;
 mod editor;
