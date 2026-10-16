@@ -29,22 +29,25 @@ label: gpt
 start=2048, type=C12A7328-F81F-11D2-BA4B-00A0C93EC93B, name="NOVA ESP"
 PART
 
-# limine.conf from boot/, plus an optional cmdline: line under the kernel's path: line.
+# limine.conf: boot/limine.conf's entry, plus an optional cmdline: line under the
+# kernel's path: line and the module lines below. NOVA_BOOT_MENU=1 (USB sticks for real
+# hardware) shows a menu instead, each entry with the same modules; the default (first)
+# keeps the display away from amdgpu until that has been seen to work on the machine.
 conf="$(mktemp "$BUILD/limine.conf.XXXXXX")"
-trap 'rm -f "$conf"' EXIT
-if [[ -n "$cmdline" ]]; then
-    awk -v c="$cmdline" '{print} /^[[:space:]]+path:/ {match($0,/^[[:space:]]+/); printf "%scmdline: %s\n", substr($0,1,RLENGTH), c}' \
-        "$ROOT/boot/limine.conf" >"$conf"
-else
-    cp "$ROOT/boot/limine.conf" "$conf"
-fi
+mods="$(mktemp "$BUILD/limine.mods.XXXXXX")"
+trap 'rm -f "$conf" "$mods"' EXIT
+entry() {   # entry <title> <cmdline>
+    printf '\n/%s\n    protocol: limine\n    path: boot():/boot/nova-kernel\n' "$1"
+    [[ -z "$2" ]] || printf '    cmdline: %s\n' "$2"
+    cat "$mods"
+}
 # Bundled user programs become Limine modules; the kernel installs them into bin/.
 programs=()
 for p in "$USERLAND_OUT"/*; do
     [[ -f "$p" && -x "$p" ]] && programs+=("$p")
 done
 for p in "${programs[@]}"; do
-    printf '    module_path: boot():/nova/bin/%s\n    module_string: %s\n' "$(basename "$p")" "$(basename "$p")" >>"$conf"
+    printf '    module_path: boot():/nova/bin/%s\n    module_string: %s\n' "$(basename "$p")" "$(basename "$p")" >>"$mods"
 done
 # Shared libraries, the dynamic loader and the Chromium engine: one pak module
 # (many small modules would exhaust Limine's memory map).
@@ -52,12 +55,22 @@ pak=""
 if [[ -d "$BUILD/sysroot" ]] && [[ -n "$(ls -A "$BUILD/sysroot")" ]]; then
     pak="$BUILD/nova-system.pak"
     python3 "$ROOT/scripts/mkpak.py" "$BUILD/sysroot" "$pak" >>"$BUILD_LOG" 2>&1 || fail "packing the system files failed"
-    printf '    module_path: boot():/nova/system.pak\n    module_string: @pak\n' >>"$conf"
+    printf '    module_path: boot():/nova/system.pak\n    module_string: @pak\n' >>"$mods"
+fi
+if [[ "${NOVA_BOOT_MENU:-0}" == 1 ]]; then
+    {
+        printf '# Limine configuration (Limine 8+ syntax), boot menu for real hardware.\ntimeout: 5\n'
+        entry "Nova (safe graphics: GPU driver without display takeover)" "${cmdline:+$cmdline }amdgpu.dc=0"
+        entry "Nova" "$cmdline"
+        entry "Nova (no GPU driver)" "${cmdline:+$cmdline }nova.disable_driver=amdgpu"
+    } >"$conf"
+else
+    { grep -v '^/\|^[[:space:]]' "$ROOT/boot/limine.conf"; entry "Project Nova" "$cmdline"; } >"$conf"
 fi
 
 # The ESP gets a copy without debug info (the full ELF stays in target/ for gdb).
 kernel="$(mktemp "$BUILD/nova-kernel.XXXXXX")"
-trap 'rm -f "$conf" "$kernel"' EXIT
+trap 'rm -f "$conf" "$mods" "$kernel"' EXIT
 objcopy --strip-debug "$KERNEL_ELF" "$kernel" 2>>"$BUILD_LOG" || cp "$KERNEL_ELF" "$kernel"
 
 ESP="$image@@1M"   # mtools syntax: filesystem at byte offset 1 MiB

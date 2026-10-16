@@ -3,6 +3,7 @@
 #   scripts/build.sh            normal build
 #   FEATURES=x scripts/build.sh          build with cargo feature(s) enabled
 #   NOVA_CMDLINE="nova.test=ud" scripts/build.sh   bake a kernel command line into the image
+#   NOVA_BOOT_MENU=1 scripts/build.sh    boot menu with GPU fallback entries (USB sticks for real PCs)
 source "$(dirname "$0")/common.sh"
 mkdir -p "$LOGS"
 BUILD_LOG="$LOGS/build.log"

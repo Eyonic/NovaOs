@@ -9,13 +9,14 @@ stick in a live session and keeps its files in memory.
 
 ```sh
 scripts/fetch-linux.sh                        # once: Linux source for the driver layer
-FEATURES=linux-drivers scripts/build.sh       # build/nova.img
+NOVA_BOOT_MENU=1 FEATURES=linux-drivers scripts/build.sh   # build/nova.img
 ```
 
 `linux-drivers` matters on a PC: without a PS/2 controller the keyboard and mouse work
 only through Linux's USB stack (xHCI + HID), and the Realtek network chip only through
-`r8169`. The image carries the Realtek firmware files from the build host's
-linux-firmware package.
+`r8169`. The image carries the Realtek and Radeon (Navi 21/22) firmware files from the
+build host's linux-firmware package. `NOVA_BOOT_MENU=1` gives the stick a boot menu (see
+below).
 
 ## 2. Write it to a USB stick
 
@@ -36,6 +37,14 @@ Everything on the stick is overwritten.
 - Pick the stick in the firmware's boot menu (often F8, F11 or F12 at power-on).
 - Plug the network cable into the board's Realtek port.
 
+The stick shows a boot menu for 5 seconds; the first entry boots when no key is pressed:
+
+| Entry | Use it |
+|---|---|
+| **Nova (safe graphics)** | the default, and right for the **first boot**. The Radeon driver (`amdgpu`) starts the GPU but leaves the display alone (`amdgpu.dc=0`), so the firmware's screen stays visible |
+| Nova | the full driver, display included. The screen may go dark when amdgpu takes the display over: Nova cannot hand scan-out back to its desktop yet |
+| Nova (no GPU driver) | if a boot hangs at the "amdgpu" line (`nova.disable_driver=amdgpu`) |
+
 Nova shows "Setting up this computer" with one line per PCI device and the driver that
 took it, then (with `nova.mode=shell` or from the desktop's terminal) the shell.
 
@@ -49,6 +58,7 @@ Photos of the screen are enough. In the shell:
 | `ifconfig` | whether DHCP gave the Realtek port an address |
 | `fetch http://example.com` | a real HTTP request over the Realtek chip |
 | `dmesg r8169` | the Linux driver's own messages (chip version, firmware, link speed) |
+| `dmesg amdgpu` | the Radeon driver: VBIOS, firmware, VRAM size, where it stopped |
 | `dmesg firmware` | firmware files that were loaded or missing |
 | `dmesg warning` | everything Nova warned about |
 | `disks` | the NVMe drives and their partitions (read-only unless you run `install`) |
