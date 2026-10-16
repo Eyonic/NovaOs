@@ -197,13 +197,37 @@ pub fn lock() {
     }
     if !try_take(me) {
         let t0 = rdtsc();
+        WAITING.fetch_add(1, Ordering::AcqRel);
         while !try_take(me) {
             service_tlb();
             core::hint::spin_loop();
         }
+        WAITING.fetch_sub(1, Ordering::AcqRel);
         WAIT_CYCLES[me as usize - 1].fetch_add(rdtsc().wrapping_sub(t0), Ordering::Relaxed);
     }
     acquired();
+}
+
+/// CPUs spinning in [`lock`].
+static WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// A point where the lock holder may let others in (the scheduler, between tasks): if
+/// another CPU waits for the lock, hand it over and queue up behind it. Without this, a
+/// CPU running parked tasks one after another (each checks its condition at every
+/// interrupt) could keep the lock for good while threads on other CPUs wait to enter the
+/// kernel.
+pub fn relax() {
+    if WAITING.load(Ordering::Acquire) == 0 || !held() {
+        return;
+    }
+    unlock();
+    // Let a waiter take it before competing again.
+    let t0 = rdtsc();
+    while BKL.load(Ordering::Acquire) == 0 && WAITING.load(Ordering::Acquire) != 0 && rdtsc().wrapping_sub(t0) < 100_000 {
+        service_tlb();
+        core::hint::spin_loop();
+    }
+    lock();
 }
 
 /// [`lock`] from an interrupt or exception that arrived in user mode: other interrupts are

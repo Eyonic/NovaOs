@@ -2496,8 +2496,10 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 addr as i64
             }
             28 => {
-                // madvise: MADV_DONTNEED and MADV_FREE drop the pages (they read as zero again)
-                if a2 == 4 || a2 == 8 {
+                // madvise: MADV_DONTNEED drops the pages (they read as zero again). MADV_FREE
+                // keeps them: a page written after (or while) it is given is the program's
+                // again, which dropping it here would lose to a thread on another CPU.
+                if a2 == 4 {
                     mem().discard(a0, a1);
                 }
                 0

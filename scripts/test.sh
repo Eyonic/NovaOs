@@ -162,7 +162,7 @@ define_case() {
                 CMDLINE="nova.mode=shell"; CASE_TIMEOUT=$(( TIMEOUT > 60 ? TIMEOUT : 60 ))
                 INPUT=("wait:$PROMPT" "ser:smptest $SMP_CPUS" "wait:failed")
                 EXPECT=("${shell[@]}" "smptest: $SMP_CPUS CPUs (sysconf online $SMP_CPUS, configured $SMP_CPUS, get_nprocs $SMP_CPUS, affinity $SMP_CPUS, /proc/cpuinfo $SMP_CPUS)"
-                        "smptest: $(( SMP_CPUS > 1 ? 9 : 6 )) passed, 0 failed")
+                        "smptest: $(( SMP_CPUS > 1 ? 10 : 6 )) passed, 0 failed")
                 CONTAINS=("[nova] smp: $SMP_CPUS of ")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
         vfs)    # The file system Linux programs see (vfs.rs): symbolic and hard links, directories,

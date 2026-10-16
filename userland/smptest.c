@@ -106,6 +106,42 @@ static void parallel_check(int n) {
     }
 }
 
+// ---------------------------------------------------------------- clocks across CPUs
+
+// Two threads pinned to different CPUs pass a token back and forth, each stamping the
+// monotonic clock: a stamp read after seeing the other's must never be smaller.
+static atomic_long token_time;
+static atomic_int token_turn;
+static atomic_int clock_backwards;
+
+static void *clock_thread(void *arg) {
+    long me = (long)arg;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET((int)me, &set);
+    sched_setaffinity(0, sizeof set, &set);
+    for (int i = 0; i < 20000; i++) {
+        while (atomic_load(&token_turn) % 2 != me) {}
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        long t = ts.tv_sec * 1000000000L + ts.tv_nsec;
+        if (t < atomic_load(&token_time)) atomic_fetch_add(&clock_backwards, 1);
+        atomic_store(&token_time, t);
+        atomic_fetch_add(&token_turn, 1);
+    }
+    return NULL;
+}
+
+static void clock_check(void) {
+    pthread_t a, b;
+    pthread_create(&a, NULL, clock_thread, (void *)0L);
+    pthread_create(&b, NULL, clock_thread, (void *)1L);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    printf("smptest: monotonic clock across CPUs 0 and 1: %d backward steps in 40000 hand-overs\n", atomic_load(&clock_backwards));
+    check("CLOCK_MONOTONIC never goes backwards between CPUs", atomic_load(&clock_backwards) == 0);
+}
+
 // ---------------------------------------------------------------- futex stress
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -237,6 +273,7 @@ int main(int argc, char **argv) {
     check("every source reports the same CPU count", onln == conf && onln == get_nprocs() && onln == affinity && onln == info);
     if (argc > 1) check("the expected CPU count", onln == atoi(argv[1]));
     parallel_check(onln > 64 ? 64 : onln);
+    if (onln > 1) clock_check();
     futex_check();
     map_check();
     printf("smptest: %d passed, %d failed\n", passed, failed);

@@ -314,7 +314,8 @@ pub fn sleep_ticks(ticks: u64) {
 /// more work than it can run).
 pub fn tick_kick() {
     let work = QUEUED.load(Ordering::Relaxed) > 0 || crate::pit::ticks() >= NEXT_DEADLINE.load(Ordering::Relaxed);
-    if smp::count() > 1 && work && !smp::is_idle(smp::id()) && !TICK_KICKED.load(Ordering::Relaxed) && smp::kick_idle() {
+    // At the preemption rate: the busy CPU itself looks that often.
+    if smp::count() > 1 && work && crate::pit::ticks() % crate::pit::PREEMPT_TICKS == 0 && !smp::is_idle(smp::id()) && !TICK_KICKED.load(Ordering::Relaxed) && smp::kick_idle() {
         TICK_KICKED.store(true, Ordering::Relaxed);
     }
 }
@@ -358,7 +359,11 @@ impl Scheduler {
 }
 
 fn schedule() {
+    // Other CPUs waiting to enter the kernel (system calls) go first: this CPU may be
+    // about to run task after task, all under the lock.
+    smp::relax();
     let flags = irq_save();
+    TICK_KICKED.store(false, Ordering::Relaxed);
     let me = smp::id();
     let s = scheduler();
     s.reap();
@@ -381,7 +386,10 @@ fn schedule() {
         if s.eligible(i, me, current) {
             if next.is_none() {
                 next = Some(i);
-            } else if i != current {
+            } else if i != current && s.tasks[i].state == State::Ready {
+                // Only woken or preempted tasks are worth a CPU: a parked task that is
+                // runnable because an interrupt came usually just checks and parks again,
+                // which other CPUs cannot do in parallel anyway (the kernel lock).
                 more = true;
             }
         }
@@ -400,7 +408,7 @@ fn schedule() {
     if next != current {
         // The task this CPU leaves may be picked up elsewhere if it can run; and work that
         // this CPU cannot take now goes to an idle CPU.
-        if more || (s.tasks[current].idle_of.is_none() && runnable(s.tasks[current].state)) {
+        if more || (s.tasks[current].idle_of.is_none() && s.tasks[current].state == State::Ready) {
             smp::kick_idle();
         }
         switch_to(s, current, next, me);
