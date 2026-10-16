@@ -18,7 +18,10 @@ traffic: `8139cp` (RealTek RTL8139C+, legacy INTx routed by ACPI through the I/O
 `scripts/test.sh --case linuxnet`) and `e1000e` (Intel 82574, MSI-X through the local APIC,
 `--case linuxmsi`). Linux's whole USB stack runs too: the xHCI host driver, the USB core
 with hubs, HID and the input core, bridged to Nova's keyboard and mouse
-(`--case usbinput`, on a machine with no PS/2 controller).
+(`--case usbinput`, on a machine with no PS/2 controller). The GPU stack (DRM core, TTM,
+`amdgpu` with its display core) is built in and linked (milestone 7a); it registers its
+PCI driver at every boot but has only been run where no AMD GPU is present (QEMU), so
+its probe is untested.
 
 ## Building
 
@@ -29,6 +32,10 @@ FEATURES=linux-drivers scripts/test.sh --case linuxnet
 NOVA_NIC=rtl8139 scripts/run.sh              # boot with a card the Linux driver handles
 NOVA_NIC=e1000e NOVA_CMDLINE=nova.disable_driver=e1000 FEATURES=linux-drivers scripts/build.sh
                                              # (e1000e: switch off Nova's own e1000 driver first)
+NOVA_CMDLINE="amdgpu.dc=0" FEATURES=linux-drivers scripts/build.sh
+                                             # Linux module parameters, as on Linux's command line
+NOVA_CMDLINE="nova.disable_driver=amdgpu" FEATURES=linux-drivers scripts/build.sh
+                                             # keep a Linux driver from probing
 ```
 
 `scripts/build-linux.sh` (called by `build.sh`) does the Linux side:
@@ -38,9 +45,16 @@ NOVA_NIC=e1000e NOVA_CMDLINE=nova.disable_driver=e1000 FEATURES=linux-drivers sc
 2. `make prepare`;
 3. Kbuild compiles the objects in `kernel/linuxkpi/linux-objects.txt` and lx_emul
    (copied to `build/linux/nova/`), so lx_emul gets exactly the
-   flags and headers the Linux objects get;
+   flags and headers the Linux objects get. An entry ending in `/` is a whole directory
+   (`drivers/gpu/`): Kbuild builds its `built-in.a`, a thin archive of everything the
+   configuration enables there, and its members are linked;
 4. the object list goes to `build/linux/nova-objects.list`, which `kernel/build.rs` passes to
    the linker as plain objects.
+
+With the feature, `build.sh` also copies firmware from the host's linux-firmware package
+into the image (never into the repository): Realtek's `rtl_nic` files and amdgpu's files for
+Navi 21 and 22 (`sienna_cichlid_*`, `navy_flounder_*`; `NOVA_AMDGPU_FIRMWARE` picks other
+chips), decompressed.
 
 Without the feature nothing of this is built and the kernel is unchanged.
 
@@ -79,6 +93,11 @@ repository plus the pinned Linux release). Kernels built without the feature are
 * **Probing** (`drivers/mod.rs`): Nova's Rust drivers get the first pick; every PCI function
   still missing a driver is offered to Linux (`nova_lx_pci_add`) before the initcalls run, so
   `pci_register_driver()` probes at once, as on Linux at boot. Records show `linux/<driver>`.
+  `nova.disable_driver=<name>` keeps a Linux driver from probing too. Before a display
+  driver probes, a line on the boot screen names it and that switch (a GPU driver takes the
+  screen over). `driver.parameter=value` words on the kernel command line set built-in
+  drivers' module parameters before the initcalls, as on Linux (`support.c`, from the
+  `__param` section).
 * **Interrupts** (Nova core, also without the feature): ACPI comes from uACPI
   (`kernel/third_party/uacpi`, MIT, vendored; Nova's kernel API for it is `src/acpi.rs`).
   When the MADT describes an I/O APIC, `src/apic.rs` enables the local APIC and I/O APIC and
@@ -101,17 +120,45 @@ repository plus the pinned Linux release). Kernels built without the feature are
 * **Pages**: `alloc_pages()` returns real `struct page`s. Pages come from Nova's heap
   (naturally aligned), and their entries in Linux's `vmemmap` array (at `vmemmap_base`, PML4
   slot 468) are backed with memory on demand by `memory::populate`. `put_page()` frees through
-  Linux's own refcounting. Compound pages (folios > 1 page) are not supported yet.
+  Linux's own refcounting. Compound pages (folios > 1 page) are not supported: `__GFP_COMP`
+  requests of order > 0 fail, and TTM's page pool falls back to smaller orders. `vmap()`
+  maps scattered pages into a window at Linux's `VMALLOC_START` (PML4 slot 402,
+  `memory::vmap`, first-fit with guard pages, unmapped again by `vunmap()`). Without
+  `CONFIG_X86_PAT` Linux code asks for at most UC- instead of write-combining, and the
+  direct map stays write-back (`set_pages_array_wc()` changes nothing; amdgpu turns its
+  write-combined system-memory buffers off without PAT). shmem files (TTM's swap storage)
+  keep their pages in RAM; shrinkers are registered but never called.
+* **Files** (`fs.c`): DRM and dma-buf hand out file descriptors (PRIME buffers, sync files,
+  leases). They are real `struct file`s with Linux's reference counting and release order
+  (`f_op->release`, the dentry's `d_release`, the inode), on anonymous inodes and pseudo
+  file systems (`kern_mount`, `init_pseudo`), so Nova's Linux-program fd layer can wrap
+  them later. The descriptor table is kernel-internal for now. mmap of these files
+  (`vmf_insert_pfn_prot`, `unmap_mapping_range`) waits for milestone 8.
+* **Kernel FPU sections** (`fpu.c`): Nova's kernel never uses FPU/SSE/AVX registers (soft-float
+  Rust, `-mgeneral-regs-only` C), so their live contents belong to a user program.
+  `kernel_fpu_begin()` saves them (XSAVE of every enabled component, else FXSAVE) and loads
+  clean x87/MXCSR state; `kernel_fpu_end()` restores them. Sections nest (an interrupt
+  handler inside a task's section) with one save area per level. amdgpu's display core
+  computes clocks and bandwidth this way. One section runs at every boot as a self-check.
 * **Tasks and sleeping** (`task.c`): every Nova task running Linux code has a
   `task_struct`, and Nova's scheduler points Linux's `current` at it on every switch.
   `schedule()`, `wake_up_process()`, wait queues, completions, semaphores and rwsems follow
   Linux's protocol on top of Nova's park/wake. Work items run on a pool of four worker
   tasks, so one that sleeps (a USB control transfer waiting for its completion, delivered
-  by another work item) does not block the rest, as with Linux's worker pools.
+  by another work item) does not block the rest, as with Linux's worker pools. kthreads
+  and kthread workers are Nova tasks (`nova_task_spawn`) with their own `task_struct`,
+  started stopped as on Linux. hrtimers and irq_work run from the "linux" task, so their
+  resolution is the 1 ms tick. Wound/wait mutexes (`dma_resv`, modeset locks) implement
+  both wait-die and wound-wait backoff with `-EDEADLK`.
+* **IRQ domains** (`irq.c`): virtual IRQ numbers (0x2000 + n) for sources a driver
+  demultiplexes itself (amdgpu forwards its audio co-processor's interrupts this way).
 * **Driver core** (`device.c`): buses, drivers, match-then-probe on `device_add()` and
   `driver_register()`, reference-counted devices with release functions, real devres lists
   and groups. sysfs is enabled in the configuration (the USB hub driver treats a missing
   sysfs node as an error) and implemented as placeholders that accept everything.
+  Free-standing kobjects (amdgpu's IP discovery tree) are reference counted and released
+  through their `kobj_type`; classes, hwmon devices and software nodes exist as far as
+  drivers keep and release them.
 * **Input bridge** (`input.c`, `linuxkpi.rs`): an input handler attached to every Linux input
   device turns keys into PS/2 set 1 scan codes and pointer motion (relative or absolute) into
   Nova mouse reports.
@@ -122,10 +169,13 @@ repository plus the pinned Linux release). Kernels built without the feature are
   Nova's stack keeps the packet instead. Linux's protocol stack is not used.
 * **DMA**: no IOMMU, bus address = physical address. A 16 MiB pool below 4 GiB
   (`memory.rs`, feature only) serves devices with 32-bit masks (Linux's default).
+  `dma_map_sgtable()` and `dma_map_resource()` map physically too; a device is
+  "addressing limited" (TTM then allocates below 4 GiB) exactly when it gets that pool.
 
 ## Adding a driver
 
-1. Enable it in `kernel/linuxkpi/nova.config` and add its object(s) to `linux-objects.txt`.
+1. Enable it in `kernel/linuxkpi/nova.config` and add its object(s) to `linux-objects.txt`
+   (or its directory, for a subsystem as large as DRM).
 2. `scripts/build-linux.sh`, then list what is still missing:
    `ld -r -o /tmp/all.o $(cat build/linux/nova-objects.list) && nm -u /tmp/all.o`
 3. For each symbol, prefer compiling the real Linux file that defines it (check its own `nm -u`
@@ -147,34 +197,55 @@ generation), and Steam.
 | 4 | NVMe boot drive | — | done, natively: `drivers/nvme.rs` (see below) |
 | 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core, input core (done) | task/wait model, driver core, input bridge (done) |
 | 6 | The board's network | `r8169` (RTL8168/8125), phylib, Realtek PHY driver, ethtool link-mode tables | built in and linked; `request_firmware` reads `/lib/firmware` from Nova's disk (the image gets the host's `rtl_nic` files). QEMU has no RTL8168 model, so the first real test is on the reference machine |
-| 7 | GPU | DRM core, TTM, `amdgpu` (incl. display core) | `struct page` backing and page allocation, kernel FPU sections, firmware, KMS to Nova's compositor |
+| 7 | GPU | DRM core, TTM, `amdgpu` (incl. display core), linked (7a) | `struct page` backing and page allocation, kernel FPU sections, firmware, KMS to Nova's compositor |
 | 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |
 | 9 | Steam | Mesa RADV, Steam runtime, Proton (userspace) | a Wayland compositor or Xwayland path, audio (HDA via ALSA), namespaces for the Steam runtime |
 
-### Milestone 7 status: amdgpu compiles
+### Milestone 7 status: amdgpu links (7a)
 
-With `kernel/linuxkpi/amdgpu.config` (amdgpu plus its display core) added to
-nova.config (SI/CIK support, userptr and the KFD compute driver off), Kbuild accepts the
-configuration and compiles all 988 objects of `drivers/gpu/drm` (DRM core, TTM, the
-display helpers, amdgpu, the display core), `drivers/dma-buf` and `drivers/i2c` without an
-error. Linked with Nova's existing Linux objects, they need **246 symbols** that lx_emul
-does not provide yet, in these groups:
+nova.config enables amdgpu with its display core (SI/CIK support, userptr, fbdev emulation
+and the KFD compute driver off). `linux-objects.txt` takes whole directories: everything
+the configuration enables in `drivers/gpu/` (DRM core, TTM, the display helpers, the GPU
+scheduler and buddy allocator, amdgpu, the display core, 989 objects), `drivers/dma-buf/`,
+`drivers/i2c/` and `drivers/video/` (HDMI infoframes, the backlight class). Library code
+came along as is (`lib/rbtree.c`, `sort.c`, `list_sort.c`, `math/gcd.c`, `kfifo.c`,
+`llist.c`, `mm/mempool.c`, the x86 `memmove`/`copy_page`/`clear_page`); the
+other ~210 missing symbols are lx_emul: files (`fs.c`), folios, vmap, shmem, page attributes,
+LRU lists and shrinkers (`mm.c`), hrtimers, irq_work and delayed-work controls
+(`sched.c`), kthreads and kthread workers (`task.c`), IRQ domains (`irq.c`), wound/wait
+and RT mutexes (`base.c`), kobjects, classes, hwmon and software nodes (`device.c`), PCIe
+link queries, the expansion ROM, saved states and resizable-BAR queries (`pci.c`), kernel
+FPU sections (`fpu.c`), and stubs for CEC, perf, power supplies and the VGA arbiter
+(`gpu.c`). The kernel links with no unresolved symbol.
 
-- library code to compile as is: HDMI infoframes (`drivers/video/hdmi.c`), the GPU buddy
-  allocator, `gcd`, interval trees;
-- files: anonymous inodes, `fd_install`/`fget`/`fput`, `dentry_open` (DRM and dma-buf
-  hand out file descriptors);
-- pages and folios: shmem-backed TTM buffer objects, `copy_page`, folio locking and
-  dirtying, page-attribute caching modes (`cachemode2protval`);
-- timers and interrupts: hrtimers, IRQ domains (`generic_handle_domain_irq`), delayed
-  work disable/enable;
-- device core: classes with files, software nodes, `device_for_each_child`, backlight and
-  CEC notifier stubs;
-- DMA: `dma_map_sgtable`, `dma_map_resource`, addressing limits.
+In QEMU (no AMD GPU), amdgpu registers its PCI driver and binds nothing; both test suites
+pass, `--case linuxnet` also checks that `amdgpu.dc=0` on the command line reaches the
+driver's parameter. **Everything past registration is untested**: the first probe will
+happen on the reference machine. What to expect there, most likely problems first:
 
-The display core also needs kernel FPU sections (`kernel_fpu_begin/end`, saving the
-extended state around DC's floating-point code). After linking, bring-up has to happen on
-the reference machine: QEMU has no AMD GPU model.
+- **The screen.** Nova draws on the firmware framebuffer, which lives in VRAM. When amdgpu
+  initializes the display core it reprograms the display pipes, and nothing hands the
+  new scan-out back to Nova's compositor yet (KMS to the compositor is the next step), so
+  the screen may go dark during the probe. A line on the boot screen announces the probe;
+  `nova.disable_driver=amdgpu` boots without it, and `amdgpu.dc=0` brings up the GPU
+  without touching the display (the firmware framebuffer should stay). With the screen
+  dark, the log is only on COM1 (`dmesg` keeps it, but cannot be shown).
+- **Firmware** is read from the image's system pak while drivers probe (the system files
+  are registered in the file system later); a missing file fails the probe with -ENOENT
+  and a "firmware: ... not found" line.
+- **VBIOS**: there is no ACPI VFCT table for Linux code, so amdgpu reads the VBIOS from
+  the ROM BAR (`pci_map_rom`, if the firmware assigned it an address) or through its own
+  ROM registers.
+- **Memory**: the visible VRAM BAR is mapped uncached in 4 KiB pages (`ioremap_wc` is
+  uncached without PAT, and MMIO mappings are never removed); with Resizable BAR enabled
+  that is 16 GiB (32 MiB of page tables, a slow start) and slow CPU access to VRAM.
+  `set_pages_array_wc/uc()` leave the direct map write-back.
+- **Topology**: only functions Nova hands over are visible to Linux code, not the bridges
+  above the GPU (Navi 21 sits behind its own PCIe switch), so link-speed queries see the
+  GPU's own link only, and AtomicOps routing is reported unsupported.
+- **Execution**: kthreads, hrtimers (1 ms resolution), irq_work and wound/wait mutexes are
+  new and only exercised by the boot path so far; a kernel FPU section that sleeps would
+  corrupt user FPU state (Linux forbids it too).
 
 NVMe is the one family on the roadmap that Nova drives natively instead of through Linux:
 it is a single standard interface for every NVMe SSD, while Linux's driver sits on blk-mq and
