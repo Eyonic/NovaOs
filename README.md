@@ -19,6 +19,13 @@ for an app and it writes, checks and opens it.
 
 ![Nova Browser: the Chromium engine with Shields, glyph toolbar and blocked-request badge](docs/screenshots/browser.png)
 
+![Valve's Steam client running on Nova: the sign-in window, drawn by Steam's own Chromium-based UI through Xwayland and Nova's Wayland compositor](docs/screenshots/steam-login.png)
+
+*The unmodified Linux Steam client on Nova's Rust kernel: the 32-bit client, its 64-bit
+web helper (Chromium 126 with GPU, network, storage and renderer processes), the Steam
+runtime's containers, Xwayland and PulseAudio all run on Nova's Linux-compatible system
+calls. (The sign-in QR code is blurred.)*
+
 ## What works
 
 | Area | What Nova does |
@@ -33,7 +40,7 @@ for an app and it writes, checks and opens it.
 | Core apps | Native Rust apps in Nova's style: **Terminal** (smooth monospace font, 2,000 lines of scrollback on the wheel, command blocks, block cursor), **Text Editor** (file explorer, tabs, syntax colours, mouse selection, clipboard, undo/redo, Ctrl-F find, Ctrl-P quick open), **Files** (places, breadcrumbs, search, grid with thumbnails or list, preview pane, open/duplicate/copy path/delete), **System Monitor** (live CPU/memory/storage/network graphs, apps and tasks with End, hardware and drivers), **Settings** (assistant, network, storage and install, privacy and Shields, about) |
 | Assistant | Nova Assistant on DeepSeek (or Claude Code on Anthropic); sign-in from the host's key or Anthropic CLI login, streaming agent loop with tools (files, shell, HTTP, hardware, web search), app creation with screenshot checks |
 | Apps | Rhai scripts with a drawing API (including PNG images); the assistant designs them with a generated mockup, builds them with generated artwork, and they appear on Home |
-| Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory; processes (fork, vfork, posix_spawn, execve with `#!` scripts, wait) and signals (handlers, masks, kill, SIGCHLD); with BusyBox, a Unix shell and ~400 tools (`sh`, then pipelines, loops, `tar`, `awk`, ...). A real file-system view for them: symbolic and hard links, permissions, tmpfs at `/run` and `/home` without NovaFS's size limits, and mount namespaces with bind mounts and `pivot_root`, so container tools (bubblewrap, which Steam's runtime uses) work. 32-bit (i386) Linux programs run too, in compatibility mode (`int 0x80`, TLS descriptors, `ld-linux.so.2`), as Steam's bootstrap needs. GUI programs get a Wayland compositor (each window becomes a Nova window), and X11 programs a display through Xwayland. Valve's Steam launcher runs on it: it downloads, unpacks and installs the Steam client (the client itself does not start yet) |
+| Linux programs | x86-64 Linux binaries run unmodified in user mode: C/C++ (glibc, libstdc++), static or dynamically linked, multi-threaded, with sockets, pipes, epoll and shared memory; processes (fork, vfork, posix_spawn, execve with `#!` scripts, wait) and signals (handlers, masks, kill, SIGCHLD); with BusyBox, a Unix shell and ~400 tools (`sh`, then pipelines, loops, `tar`, `awk`, ...). A real file-system view for them: symbolic and hard links, permissions, tmpfs at `/run` and `/home` without NovaFS's size limits, and mount namespaces with bind mounts and `pivot_root`, so container tools (bubblewrap, which Steam's runtime uses) work. 32-bit (i386) Linux programs run too, in compatibility mode (`int 0x80`, TLS descriptors, `ld-linux.so.2`), as Steam's bootstrap needs. GUI programs get a Wayland compositor (each window becomes a Nova window), and X11 programs a display through Xwayland. Valve's Steam client runs on it up to the sign-in window: the launcher downloads and installs the client, then the 32-bit client starts its Chromium-based web helper (zygote, GPU, network, storage and renderer processes), which draws Steam's UI through Xwayland. Supporting pieces: loopback TCP, `SCM_CREDENTIALS`, a built-in PulseAudio-protocol server (no sound output yet), `/proc/<pid>` identity files and an `lsof` for Steam's connection check |
 | Browser | Nova Browser: the Chromium engine (rendering, JavaScript, TLS) driven by a Rust shell with Shields (ad/tracker blocking, HTTPS upgrades, tracking-parameter removal) |
 
 ## Quick start

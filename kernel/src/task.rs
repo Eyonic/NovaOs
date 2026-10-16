@@ -314,7 +314,14 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
                 }
                 _ => t.name.clone(),
             };
-            (t.id, alloc::format!("{name} [runs {}, {:?}]", t.runs, t.state), state)
+            // The program (and a Chromium child's --type) rather than the inherited task name.
+            let prog = t.user.as_deref().map(|u| {
+                let exe = u.process.exe.try_lock().map(|e| String::from(e.rsplit('/').next().unwrap_or(""))).unwrap_or_default();
+                let kind = u.process.argv.try_lock().and_then(|a| a.iter().find(|a| a.starts_with("--type=")).cloned()).unwrap_or_default();
+                let comm = if u.comm.is_empty() { String::new() } else { alloc::format!(" \"{}\"", u.comm) };
+                alloc::format!(" <{exe}{}{kind}>{comm}", if kind.is_empty() { "" } else { " " })
+            });
+            (t.id, alloc::format!("{name}{} [runs {}, {:?}]", prog.unwrap_or_default(), t.runs, t.state), state)
         })
         .collect()
 }

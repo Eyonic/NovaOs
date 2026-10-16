@@ -168,6 +168,28 @@ impl Drop for End {
 
 impl End {
     pub fn poll(&self) -> (u32, u64) {
+        if let (Some(rx), Some(tx)) = (&self.rx, &self.tx) {
+            // A socket (Linux unix_poll): each direction can be shut down on its own
+            // (shutdown(2) or the peer closing). A shut receive side reads EOF (POLLIN |
+            // POLLRDHUP); POLLHUP only once both directions are shut.
+            let (r, t) = (rx.lock(), tx.lock());
+            let rcv_shut = r.writer_closed || r.reader_closed;
+            let snd_shut = t.reader_closed || t.writer_closed;
+            let mut ev = 0;
+            if r.readable() || rcv_shut {
+                ev |= POLLIN;
+            }
+            if rcv_shut {
+                ev |= POLLRDHUP;
+            }
+            if !snd_shut && t.writable() {
+                ev |= POLLOUT;
+            }
+            if rcv_shut && snd_shut {
+                ev |= POLLHUP;
+            }
+            return (ev, r.generation ^ t.generation.rotate_left(17));
+        }
         let mut ev = 0;
         let mut generation_mark = 0;
         if let Some(rx) = &self.rx {

@@ -279,6 +279,12 @@ for tool in readlink realpath tar xz gzip; do
         done
     fi
 done
+# Nova's lsof (userland/lsof.c) instead of BusyBox's, which ignores -i: Steam runs
+# "lsof -i TCP@addr" to check who is at the other end of its UI's local connection.
+mkdir -p "$SYSROOT/bin"
+rm -f "$SYSROOT/bin/lsof"
+cp "$USERLAND_OUT/lsof" "$SYSROOT/bin/lsof"
+
 # BusyBox (scripts/fetch-busybox.sh), if built: bin/busybox plus one link per tool.
 if [[ -x "$BUILD/busybox/busybox" ]]; then
     log "Including BusyBox $(cat "$BUILD/busybox/VERSION") ($(wc -l < "$BUILD/busybox/applets") tools)"

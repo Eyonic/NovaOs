@@ -96,12 +96,17 @@ pub fn syscall32(f: &mut Frame32) -> i64 {
     thread().syscall_arg2 = a1;
     thread().phase = "convert";
     let r = res(convert(f, nr, a0, a1, a2, a3, a4, a5));
+    proc().recent.lock().push(thread().tid, 0x1000 | nr, [a0, a1, a2], r);
     thread().phase = "returned";
     thread().in_syscall = u64::MAX;
     if trace {
         crate::log::info(&alloc::format!("[{}] i386 {}({a0:#x}, {a1:#x}, {a2:#x}, {a3:#x}, {a4:#x}) = {r}", thread().tid, name32(nr)));
     }
     r
+}
+
+pub fn label(nr: u64) -> String {
+    name32(nr)
 }
 
 fn name32(nr: u64) -> String {

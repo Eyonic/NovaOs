@@ -175,6 +175,36 @@ pub fn describe_fd(p: &Process, fd: u64) -> String {
     }
 }
 
+/// Where the other end of socket/pipe `fd` of process `pid` is held: "pid:fd" pairs
+/// (debugging: the `peer` shell command).
+pub fn find_peer(pid: u64, fd: u64) -> String {
+    let Some(p) = process::find(pid) else { return String::from("no such process") };
+    let Some(file) = p.fds.lock().fds.get(fd as usize).and_then(|f| f.clone()) else { return String::from("no such descriptor") };
+    let (rx, tx) = match &file.lock().kind {
+        Kind::Channel(e) => (e.rx.as_ref().map(|c| Arc::as_ptr(c) as usize), e.tx.as_ref().map(|c| Arc::as_ptr(c) as usize)),
+        _ => return String::from("not a connected socket or pipe"),
+    };
+    let mut out = Vec::new();
+    for q in process::processes() {
+        let Some(t) = q.fds.try_lock() else { continue };
+        for (n, f) in t.fds.iter().enumerate() {
+            let Some(f) = f else { continue };
+            if Arc::ptr_eq(f, &file) {
+                continue;
+            }
+            if let Some(f) = f.try_lock()
+                && let Kind::Channel(e) = &f.kind
+            {
+                let (r2, t2) = (e.rx.as_ref().map(|c| Arc::as_ptr(c) as usize), e.tx.as_ref().map(|c| Arc::as_ptr(c) as usize));
+                if (r2.is_some() && r2 == tx) || (t2.is_some() && t2 == rx) {
+                    out.push(format!("{}:{n}", q.pid));
+                }
+            }
+        }
+    }
+    if out.is_empty() { String::from("no other end held by any process") } else { out.join(" ") }
+}
+
 /// (effective uid, gid) of the calling process, for the owner of files it creates; root
 /// for the kernel's own tasks.
 pub fn creator_ids() -> (u32, u32) {
@@ -268,6 +298,32 @@ fn need_socket(file: &FileRef) -> Result<(), i64> {
         Kind::Channel(e) if e.rx.is_some() && e.tx.is_some() => Ok(()),
         _ => Err(ENOTSOCK),
     }
+}
+
+/// Nova's loopback TCP sockets and their owners, one per line:
+/// "pid ppid uid fd local remote state" (read by /bin/lsof; Linux programs such as Steam
+/// ask lsof which process is at the other end of a local connection).
+fn loopback_table() -> String {
+    let mut out = String::new();
+    for p in process::processes() {
+        let Some(t) = p.fds.try_lock() else { continue };
+        let ppid = p.parent.load(core::sync::atomic::Ordering::Relaxed);
+        let uid = { let c = p.cred.lock(); c.show(c.euid, false) };
+        for (n, f) in t.fds.iter().enumerate() {
+            let Some(f) = f else { continue };
+            let Some(f) = f.try_lock() else { continue };
+            let line = match &f.kind {
+                Kind::Channel(ipc::End { inet: Some((local, peer)), .. }) => format!("127.0.0.1:{local} 127.0.0.1:{peer} ESTABLISHED"),
+                Kind::Unix(UnixSocket { listener: Some(_), name, .. }) if name.len() >= 8 && name[0] == 2 => {
+                    let port = u16::from_be_bytes([name[2], name[3]]);
+                    format!("{}.{}.{}.{}:{port} *:* LISTEN", name[4], name[5], name[6], name[7])
+                }
+                _ => continue,
+            };
+            out.push_str(&format!("{} {ppid} {uid} {n} {line}\n", p.pid));
+        }
+    }
+    out
 }
 
 /// A free loopback TCP port (ephemeral range).
@@ -720,16 +776,28 @@ pub fn etc_file(name: &str) -> Option<String> {
 /// Synthetic /proc and /sys files.
 fn proc_file(name: &str) -> Option<String> {
     let name = name.replace("proc/thread-self/", "proc/self/").replace(&format!("proc/{}/", proc().pid), "proc/self/");
+    if let Some((pid, file)) = name.strip_prefix("proc/").and_then(|r| r.split_once('/'))
+        && let Ok(pid) = pid.parse::<u64>()
+    {
+        let p = process::find(pid)?;
+        return proc_pid_file(&p, file);
+    }
+    if let Some(file) = name.strip_prefix("proc/self/")
+        && matches!(file, "stat" | "cmdline")
+    {
+        return proc_pid_file(proc(), file);
+    }
     let (used, free) = crate::memory::heap_usage();
     let total_kb = (used + free) / 1024;
     Some(match name.as_str() {
         "proc/self/maps" => mem().maps(),
         "proc/self/status" => format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t1\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t{pp}\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
             proc().name,
             proc().threads.load(core::sync::atomic::Ordering::Relaxed),
             used / 1024,
             p = proc().pid,
+            pp = proc().parent.load(core::sync::atomic::Ordering::Relaxed),
             u = { let c = proc().cred.lock(); c.show(c.uid, false) },
             g = { let c = proc().cred.lock(); c.show(c.gid, true) }
         ),
@@ -758,6 +826,7 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/meminfo" => format!("MemTotal:       {total_kb} kB\nMemFree:        {} kB\nMemAvailable:   {} kB\nBuffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\nSwapFree:              0 kB\n", free / 1024, free / 1024),
         "proc/cpuinfo" => format!("processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: {}\ncpu MHz\t\t: 3000.000\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n\n", crate::cpu::brand()),
         "proc/stat" => format!("cpu  {0} 0 0 {0} 0 0 0 0 0 0\ncpu0 {0} 0 0 {0} 0 0 0 0 0 0\nbtime {1}\nprocesses 1\n", pit::ticks(), rtc::unix_time() - pit::ticks() / pit::HZ),
+        "proc/nova/tcp" => loopback_table(),
         "proc/uptime" => format!("{}.{:02} 0.00\n", pit::ticks() / pit::HZ, pit::ticks() % pit::HZ),
         "proc/loadavg" => "0.00 0.00 0.00 1/1 1\n".into(),
         "proc/sys/kernel/osrelease" => "6.8.0-nova\n".into(),
@@ -787,9 +856,39 @@ fn meta(ty: vfs::Type, perm: u32, size: u64, name: &str) -> vfs::Meta {
 
 /// /proc paths of any process ("<pid>/...", "thread-self/...") as "self/...": every
 /// process sees its own data (enough for programs that look up their own pid).
+/// /proc/<pid> files that describe that process (not the caller).
+const PER_PROCESS: &[&str] = &["stat", "status", "cmdline", "comm"];
+
+/// /proc/<pid>/{stat,status,cmdline,comm} of `p`.
+fn proc_pid_file(p: &Process, file: &str) -> Option<String> {
+    let comm: String = p.exe.lock().rsplit('/').next().unwrap_or("").chars().take(15).collect();
+    let ppid = p.parent.load(core::sync::atomic::Ordering::Relaxed);
+    let threads = p.threads.load(core::sync::atomic::Ordering::Relaxed);
+    let (uid, gid) = { let c = p.cred.lock(); (c.show(c.uid, false), c.show(c.gid, true)) };
+    Some(match file {
+        "stat" => format!("{} ({comm}) R {ppid} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 0 0\n", p.pid, p.pid, p.pid),
+        "status" => format!(
+            "Name:\t{comm}\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nThreads:\t{threads}\nVmRSS:\t0 kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            pid = p.pid
+        ),
+        "cmdline" => {
+            let argv = p.argv.lock();
+            if argv.is_empty() { format!("/{}\0", *p.exe.lock()) } else { argv.iter().map(|a| format!("{a}\0")).collect() }
+        }
+        "comm" => format!("{comm}\n"),
+        _ => return None,
+    })
+}
+
 fn proc_norm(rel: &str) -> String {
     let (first, rest) = rel.split_once('/').unwrap_or((rel, ""));
-    if first == "thread-self" || (!first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) && process::exists(first.parse().unwrap_or(0))) {
+    let is_pid = !first.is_empty() && first.bytes().all(|b| b.is_ascii_digit()) && process::exists(first.parse().unwrap_or(0));
+    // Another process's identity files describe that process (ps, lsof, and Steam
+    // walking parent pids need them); its other files still stand in with our own.
+    if is_pid && first.parse::<u64>().ok() != Some(proc().pid) && PER_PROCESS.contains(&rest) {
+        return rel.into();
+    }
+    if first == "thread-self" || is_pid {
         return vfs::join("self", rest);
     }
     rel.into()
@@ -888,7 +987,8 @@ impl vfs::Backend for ProcFs {
         let n = proc_norm(p);
         let ty = |name: &str| self.lstat(&vfs::join(p, name)).map(|m| m.ty).unwrap_or(vfs::Type::Reg);
         let names: Vec<String> = match n.as_str() {
-            "" => PROC_ROOT.iter().map(|s| s.to_string()).chain([proc().pid.to_string()]).collect(),
+            // Every running process, as on Linux (ps, lsof and process-tree walkers list it).
+            "" => PROC_ROOT.iter().map(|s| s.to_string()).chain(process::processes().iter().map(|q| q.pid.to_string())).collect(),
             "self" => PROC_SELF.iter().map(|s| s.to_string()).collect(),
             "self/fd" => fds().fds.iter().enumerate().filter(|(_, f)| f.is_some()).map(|(i, _)| i.to_string()).collect(),
             "self/ns" => NAMESPACES.iter().map(|s| s.to_string()).collect(),
@@ -1656,6 +1756,7 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     thread().syscall_arg = a0;
     thread().syscall_arg2 = a1;
     let r = dispatch(f, nr, a0, a1, a2, a3, a4, a5);
+    proc().recent.lock().push(tid, nr, [a0, a1, a2], r);
     thread().in_syscall = u64::MAX;
     if trace {
         let path = if matches!(nr, 2 | 4 | 6 | 21 | 59 | 80 | 83 | 87 | 89) {
@@ -1692,6 +1793,11 @@ fn kind_name(k: &Kind) -> String {
         Kind::Memfd(_, None) => "memfd".into(),
         Kind::Inet(s) => format!("inet {}", if s.udp { "udp" } else { "tcp" }),
     }
+}
+
+/// A syscall's name for debugging lists: native numbers, or i386 ones (0x1000 + nr).
+pub fn syscall_label(nr: u64) -> String {
+    if nr & 0x1000 != 0 { format!("i386 {}", compat32::label(nr & 0xFFF)) } else { syscall_name(nr) }
 }
 
 fn syscall_name(nr: u64) -> String {
@@ -3105,11 +3211,19 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 3 => 1,                                     // PR_GET_DUMPABLE
                 23 => if a1 <= CAP_LAST { 1 } else { return Err(EINVAL) }, // PR_CAPBSET_READ
                 21 | 22 | 24 | 47 => 0,                     // PR_GET/SET_SECCOMP, PR_CAPBSET_DROP, PR_CAP_AMBIENT
-                1 | 4 | 8 | 15 | 36 | 38 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, SET_NAME, CHILD_SUBREAPER, NO_NEW_PRIVS, SET_VMA
+                1 | 4 | 8 | 36 | 38 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, CHILD_SUBREAPER, NO_NEW_PRIVS, SET_VMA
+                15 => {
+                    // PR_SET_NAME: the thread's name (up to 15 bytes)
+                    let mut n = read_cstr(a1).unwrap_or_default();
+                    n.truncate(15);
+                    thread().comm = n;
+                    0
+                }
                 16 => {
                     // PR_GET_NAME
                     let mut n = [0u8; 16];
-                    let name = proc().name.as_bytes();
+                    let comm = thread().comm.clone();
+                    let name = if comm.is_empty() { proc().name.as_bytes() } else { comm.as_bytes() };
                     n[..name.len().min(15)].copy_from_slice(&name[..name.len().min(15)]);
                     write_user(a1, &n)?;
                     0

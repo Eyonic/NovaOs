@@ -46,6 +46,8 @@ const COMMANDS: &[Command] = &[
     Command { name: "strace", args: "<file> [args]", help: "run a program, logging its system calls to serial", run: cmd_strace },
     Command { name: "wayland", args: "[save <file.ppm>]", help: "Wayland compositor status, or save the largest window as an image", run: cmd_wayland },
     Command { name: "netstat", args: "", help: "TCP sockets: state, endpoints, queued bytes", run: cmd_netstat },
+    Command { name: "recent", args: "<pid>|<name>", help: "show running programs' last system calls", run: cmd_recent },
+    Command { name: "peer", args: "<pid> <fd>", help: "which processes hold the other end of a socket", run: cmd_peer },
     Command { name: "trace", args: "<pid> on|off", help: "log a running program's system calls to serial", run: cmd_trace },
     Command { name: "browser", args: "[url]", help: "open Nova Browser (Chromium engine)", run: cmd_browser },
     Command { name: "download", args: "<url> <file>", help: "save a URL to a file (e.g. a Shields filter list)", run: cmd_download },
@@ -127,6 +129,42 @@ fn cmd_trace(args: &str, _: &History) {
             println!("tracing of process {pid} ({}) {}", p.name, if on { "on" } else { "off" });
         }
         None => println!("no process {pid}"),
+    }
+}
+
+fn cmd_recent(args: &str, _: &History) {
+    let Some(pid) = args.trim().parse::<u64>().ok() else {
+        // A name: the last few calls of every program whose path contains it.
+        let name = args.trim();
+        if name.is_empty() {
+            println!("usage: recent <pid>|<name>");
+            return;
+        }
+        for p in crate::process::processes().iter().filter(|p| p.exe.lock().contains(name)) {
+            println!("== pid {}", p.pid);
+            let lines = p.recent.lock().lines();
+            for l in &lines {
+                println!("{l}");
+            }
+        }
+        return;
+    };
+    match crate::process::find(pid) {
+        Some(p) => {
+            let lines = p.recent.lock().lines();
+            for l in lines {
+                println!("{l}");
+            }
+        }
+        None => println!("no process {pid}"),
+    }
+}
+
+fn cmd_peer(args: &str, _: &History) {
+    let v: alloc::vec::Vec<u64> = args.split_whitespace().filter_map(|a| a.parse().ok()).collect();
+    match v.as_slice() {
+        [pid, fd] => println!("{}", crate::linux::find_peer(*pid, *fd)),
+        _ => println!("usage: peer <pid> <fd>"),
     }
 }
 

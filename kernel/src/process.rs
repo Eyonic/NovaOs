@@ -330,6 +330,8 @@ pub struct Process {
     pub threads: AtomicUsize,
     /// Log every system call to the serial console (`strace`).
     pub trace: AtomicBool,
+    /// The last system calls, raw (the `recent` shell command shows them).
+    pub recent: SpinLock<Recent>,
     /// Parent process id (0: started by Nova itself, e.g. from the shell).
     pub parent: AtomicU64,
     /// Signal dispositions and process-directed pending signals.
@@ -434,6 +436,8 @@ pub struct UserState {
     /// 32-bit threads: a private mapping where compat32.rs builds the 64-bit structures a
     /// converted call needs (0 until first used).
     pub compat_scratch: u64,
+    /// Thread name set with prctl(PR_SET_NAME) (shown by `ps`).
+    pub comm: String,
     /// The system call this thread is in (u64::MAX: none) and its first argument, for `ps`.
     pub in_syscall: u64,
     pub syscall_arg: u64,
@@ -1008,6 +1012,7 @@ impl Process {
             exit_code: AtomicI32::new(0),
             threads: AtomicUsize::new(1),
             trace: AtomicBool::new(false),
+            recent: SpinLock::new(Recent::default()),
             parent: AtomicU64::new(parent),
             signals: SpinLock::new(crate::signal::Signals::new()),
             term_signal: AtomicI32::new(0),
@@ -1152,7 +1157,7 @@ pub fn terminate(p: &Process, sig: u32) {
 
 impl UserState {
     fn new_thread(process: Arc<Process>, tid: u64) -> Box<Self> {
-        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0 })
+        Box::new(Self { process, tid, kernel_rsp: 0, fs_base: 0, fx: FxArea::initial(), exit_ctx: 0, clear_tid: 0, sigmask: 0, pending: 0, altstack: (0, 0, 2), saved_mask: None, compat: false, tls: [0; gdt::TLS_ENTRIES], user_fs: 0, user_gs: 0, sigfpu: Vec::new(), compat_scratch: 0, comm: String::new(), in_syscall: u64::MAX, syscall_arg: 0, syscall_arg2: 0, wake_at: 0, phase: "", robust_list: 0 })
     }
 }
 
@@ -1373,6 +1378,7 @@ pub fn exit_thread(code: i32) -> ! {
         u.process.mem.lock().unmap(u.compat_scratch, crate::linux::COMPAT_SCRATCH_SIZE);
         u.compat_scratch = 0;
     }
+    u.process.recent.lock().forget(u.tid);
     let ctx = u.exit_ctx;
     // SAFETY: ctx was saved by enter_user on this same kernel stack, further up;
     // everything below it (this handler's frames) is abandoned.
@@ -1397,6 +1403,39 @@ pub fn check_exiting() {
     {
         let code = u.process.exit_code.load(Ordering::SeqCst);
         exit_thread(code);
+    }
+}
+
+/// A ring of a process's last system calls: (thread, number, first three arguments,
+/// result). Cheap enough to keep for every program; formatted only when asked.
+#[derive(Default)]
+pub struct Recent {
+    calls: BTreeMap<u64, alloc::collections::VecDeque<(u64, [u64; 3], i64)>>,
+}
+
+impl Recent {
+    pub fn push(&mut self, tid: u64, nr: u64, args: [u64; 3], r: i64) {
+        let q = self.calls.entry(tid).or_default();
+        if q.len() >= 48 {
+            q.pop_front();
+        }
+        q.push_back((nr, args, r));
+    }
+
+    /// Thread exited: forget it.
+    pub fn forget(&mut self, tid: u64) {
+        self.calls.remove(&tid);
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (tid, q) in &self.calls {
+            out.push(format!("thread {tid}:"));
+            for &(nr, a, r) in q {
+                out.push(format!("  {}({:#x}, {:#x}, {:#x}) = {r}", crate::linux::syscall_label(nr), a[0], a[1], a[2]));
+            }
+        }
+        out
     }
 }
 
