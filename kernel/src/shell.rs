@@ -32,6 +32,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "sleep", args: "<seconds>", help: "wait (uses the timer interrupt)", run: cmd_sleep },
     Command { name: "history", args: "", help: "list previous commands", run: cmd_history },
     Command { name: "ps", args: "", help: "list kernel tasks", run: cmd_ps },
+    Command { name: "cpus", args: "", help: "per-CPU idle and kernel-lock time since the last call", run: cmd_cpus },
     Command { name: "dmesg", args: "[text]", help: "kernel log (lines containing text)", run: cmd_dmesg },
     Command { name: "lspci", args: "", help: "PCI devices and their drivers", run: cmd_lspci },
     Command { name: "ifconfig", args: "", help: "network interface status", run: cmd_ifconfig },
@@ -299,6 +300,10 @@ fn cmd_ps(_: &str, _: &History) {
     for (id, name, state) in task::list() {
         println!("{id:>4}  {state:<10} {name}");
     }
+}
+
+fn cmd_cpus(_: &str, _: &History) {
+    print!("{}", crate::smp::stats());
 }
 
 fn cmd_lspci(_: &str, _: &History) {

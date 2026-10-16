@@ -348,6 +348,9 @@ fn legacy_irq(vector: u8, user: bool) {
         pic::end_of_interrupt(irq);
     }
     if irq == pic::IRQ_TIMER {
+        if !user {
+            smp::sample();
+        }
         // Waiting tasks may be runnable now: if this CPU is busy, an idle one looks.
         crate::task::tick_kick();
         // Preempt user programs on the timer, so they cannot monopolise the CPU.
@@ -369,6 +372,9 @@ fn preempt() {
 fn cpu_interrupt(vector: u8, user: bool) {
     match vector {
         smp::TIMER_VECTOR => {
+            if !user {
+                smp::sample();
+            }
             let ticks = smp::tick(smp::id());
             if user && ticks % pit::PREEMPT_TICKS == 0 {
                 preempt();

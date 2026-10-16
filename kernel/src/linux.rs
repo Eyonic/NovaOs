@@ -1744,7 +1744,9 @@ fn sleep_ns(ns: u64) {
             break;
         }
         process::check_exiting(); // exit_group or execve by another thread
-        task::sleep_ticks((end - now).div_ceil(1_000_000_000 / pit::HZ).max(1));
+        // Parked without polling: the deadline, or the program being torn down
+        // (process::kick_threads), ends it.
+        task::block(Some(pit::ticks() + (end - now).div_ceil(1_000_000_000 / pit::HZ).max(1)));
     }
     thread().phase = "slept";
 }
@@ -3882,7 +3884,9 @@ fn futex_wait(addr: u64, val: u32, until: Option<u64>, bitset: u32, shared: bool
         if until.is_some_and(|u| pit::ticks() >= u) {
             return if remove() { Ok(0) } else { Err(ETIMEDOUT) };
         }
-        task::wait_event();
+        // Every way out wakes the task: FUTEX_WAKE (wake_key), the program exiting or a
+        // signal (futex_wake_all), the deadline.
+        task::block(until);
     }
 }
 

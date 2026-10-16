@@ -69,6 +69,8 @@ enum State {
     Ready,
     /// Parked until IRQ_COUNT differs from the stored value.
     Waiting(u64),
+    /// Parked until [`wake`] or the deadline (a tick count; u64::MAX: none). Nothing polls.
+    Blocked(u64),
     Finished,
 }
 
@@ -93,11 +95,13 @@ struct Task {
     idle_of: Option<usize>,
     /// CPUs the task may run on (bit n = CPU n; sched_setaffinity).
     affinity: u64,
+    /// [`wake`] came while the task was not parked: its next [`block`] returns at once.
+    wake_pending: bool,
 }
 
 impl Task {
     fn new(id: usize, name: &str, rsp: u64, stack: Option<Box<[u8]>>, entry: Option<Box<dyn FnOnce() + Send>>, tty: Option<crate::tty::TtyRef>) -> Self {
-        Self { id, name: name.into(), state: State::Ready, rsp, stack, entry, tty, user: None, runs: 0, cpu: None, idle_of: None, affinity: u64::MAX }
+        Self { id, name: name.into(), state: State::Ready, rsp, stack, entry, tty, user: None, runs: 0, cpu: None, idle_of: None, affinity: u64::MAX, wake_pending: false }
     }
 }
 
@@ -255,16 +259,41 @@ pub fn wait_event() {
     schedule();
 }
 
+/// Park until [`wake`] or `deadline` (a tick count), whichever comes first; unlike
+/// [`wait_event`], interrupts do not end the wait, so the task costs nothing meanwhile.
+/// Callers re-check their condition after every return (wakes may be early).
+pub fn block(deadline: Option<u64>) {
+    let flags = irq_save();
+    let s = scheduler();
+    let current = cur(s);
+    let t = &mut s.tasks[current];
+    if core::mem::take(&mut t.wake_pending) {
+        irq_restore(flags);
+        return;
+    }
+    let d = deadline.unwrap_or(u64::MAX);
+    t.state = State::Blocked(d);
+    NEXT_DEADLINE.fetch_min(d, Ordering::Relaxed);
+    schedule();
+    irq_restore(flags);
+}
+
+/// The earliest deadline of a blocked task (an upper bound: it is only lowered here and
+/// recomputed when scheduling), for the boot CPU's tick to know when to look again.
+static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Make a parked task runnable now (e.g. a futex waiter), instead of at the next interrupt.
 pub fn wake(id: usize) {
     let flags = irq_save();
     let s = scheduler();
     let mut kick = false;
-    if let Some(t) = s.tasks.iter_mut().find(|t| t.id == id)
-        && matches!(t.state, State::Waiting(_))
-    {
-        t.state = State::Ready;
-        kick = t.cpu.is_none();
+    if let Some(t) = s.tasks.iter_mut().find(|t| t.id == id) {
+        if matches!(t.state, State::Waiting(_) | State::Blocked(_)) {
+            t.state = State::Ready;
+            kick = t.cpu.is_none();
+        } else if t.state == State::Ready {
+            t.wake_pending = true;
+        }
     }
     irq_restore(flags);
     if kick {
@@ -284,7 +313,8 @@ pub fn sleep_ticks(ticks: u64) {
 /// CPU is busy, wake an idle one to run them (one at a time: it wakes others if it finds
 /// more work than it can run).
 pub fn tick_kick() {
-    if smp::count() > 1 && QUEUED.load(Ordering::Relaxed) > 0 && !smp::is_idle(smp::id()) && !TICK_KICKED.load(Ordering::Relaxed) && smp::kick_idle() {
+    let work = QUEUED.load(Ordering::Relaxed) > 0 || crate::pit::ticks() >= NEXT_DEADLINE.load(Ordering::Relaxed);
+    if smp::count() > 1 && work && !smp::is_idle(smp::id()) && !TICK_KICKED.load(Ordering::Relaxed) && smp::kick_idle() {
         TICK_KICKED.store(true, Ordering::Relaxed);
     }
 }
@@ -293,6 +323,7 @@ fn runnable(state: State) -> bool {
     match state {
         State::Ready => true,
         State::Waiting(seen) => IRQ_COUNT.load(Ordering::SeqCst) != seen,
+        State::Blocked(deadline) => crate::pit::ticks() >= deadline,
         State::Finished => false,
     }
 }
@@ -337,11 +368,15 @@ fn schedule() {
     let mut next = None;
     let mut more = false;
     let mut queued = 0;
+    let mut deadline = u64::MAX;
     for k in 1..=n {
         let i = (current + k) % n;
         let t = &s.tasks[i];
-        if t.cpu.is_none() && t.idle_of.is_none() && t.state != State::Finished {
-            queued += 1;
+        match t.state {
+            State::Blocked(d) => deadline = deadline.min(d),
+            State::Finished => {}
+            _ if t.cpu.is_none() && t.idle_of.is_none() => queued += 1,
+            _ => {}
         }
         if s.eligible(i, me, current) {
             if next.is_none() {
@@ -352,6 +387,7 @@ fn schedule() {
         }
     }
     QUEUED.store(queued, Ordering::Relaxed);
+    NEXT_DEADLINE.store(deadline, Ordering::Relaxed);
     let next = match next {
         Some(i) => {
             s.tasks[i].state = State::Ready;
@@ -416,7 +452,9 @@ fn idle_loop(cpu: usize, mut held: bool) -> ! {
             // SAFETY: halts until the next interrupt, which is handled at once.
             unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
         }
-        IDLE_CYCLES.fetch_add(rdtsc().wrapping_sub(t0), Ordering::Relaxed);
+        let idle = rdtsc().wrapping_sub(t0);
+        IDLE_CYCLES.fetch_add(idle, Ordering::Relaxed);
+        smp::IDLE_CYCLES[cpu].fetch_add(idle, Ordering::Relaxed);
         smp::set_idle(cpu, false);
         irq_restore(flags);
     }
@@ -467,6 +505,14 @@ fn find_thread(s: &Scheduler, tid: u64) -> Option<usize> {
         return Some(cur(s));
     }
     s.tasks.iter().position(|t| t.user.as_deref().is_some_and(|u| u.tid == tid))
+}
+
+/// Wake every parked thread of process `pid` (it is being torn down).
+pub fn wake_process(pid: u64) {
+    let ids: Vec<usize> = scheduler().tasks.iter().filter(|t| t.user.as_deref().is_some_and(|u| u.process.pid == pid)).map(|t| t.id).collect();
+    for id in ids {
+        wake(id);
+    }
 }
 
 /// CPUs that run a thread of process `pid` now (to kick them into the kernel).
@@ -530,7 +576,7 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
             } else {
                 match t.state {
                     State::Ready => "ready",
-                    State::Waiting(_) => "waiting",
+                    State::Waiting(_) | State::Blocked(_) => "waiting",
                     State::Finished => "finished",
                 }
             };

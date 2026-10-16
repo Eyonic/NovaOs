@@ -109,6 +109,75 @@ fn irq_restore(flags: u64) {
 /// Owner CPU + 1, 0 when free. The boot CPU holds it from the start.
 static BKL: AtomicU32 = AtomicU32::new(1);
 
+/// Statistics (the `cpus` shell command), in TSC cycles: since when the lock is held, how
+/// long it was held in all, and how long each CPU waited for it.
+static HELD_SINCE: AtomicU64 = AtomicU64::new(0);
+static HELD_CYCLES: AtomicU64 = AtomicU64::new(0);
+static WAIT_CYCLES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+/// Cycles each CPU spent halted in its idle task (task.rs adds them).
+pub static IDLE_CYCLES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+pub fn rdtsc() -> u64 {
+    let (lo, hi): (u32, u32);
+    // SAFETY: RDTSC only reads the timestamp counter.
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags)) };
+    (hi as u64) << 32 | lo as u64
+}
+
+/// What the lock holder was doing at timer ticks that interrupted it in the kernel: the
+/// system call of its thread (0x1000 + n for i386 calls), 0x2000 = a user thread outside a
+/// system call (page faults, preemption), 0x2001 = a kernel task.
+static SAMPLES: [AtomicU32; 0x2002] = [const { AtomicU32::new(0) }; 0x2002];
+
+/// A timer tick interrupted kernel code on this CPU: if it holds the lock, note what for.
+pub fn sample() {
+    if !held() {
+        return;
+    }
+    let bucket = match crate::task::current_user() {
+        Some(u) if u.in_syscall != u64::MAX => (u.in_syscall & 0x1FFF) as usize,
+        Some(_) => 0x2000,
+        None => 0x2001,
+    };
+    SAMPLES[bucket.min(0x2001)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Per-CPU idle and lock-wait time, how long the lock was held, and what for, since the
+/// previous call (the `cpus` shell command).
+pub fn stats() -> alloc::string::String {
+    static LAST: crate::sync::SpinLock<Option<(u64, u64, [u64; MAX_CPUS], [u64; MAX_CPUS])>> = crate::sync::SpinLock::new(None);
+    let now = rdtsc();
+    let held = HELD_CYCLES.load(Ordering::Relaxed) + now.wrapping_sub(HELD_SINCE.load(Ordering::Relaxed));
+    let idle: [u64; MAX_CPUS] = core::array::from_fn(|c| IDLE_CYCLES[c].load(Ordering::Relaxed));
+    let wait: [u64; MAX_CPUS] = core::array::from_fn(|c| WAIT_CYCLES[c].load(Ordering::Relaxed));
+    let mut last = LAST.lock();
+    let (t0, h0, i0, w0) = last.unwrap_or((0, 0, [0; MAX_CPUS], [0; MAX_CPUS]));
+    *last = Some((now, held, idle, wait));
+    let total = now.wrapping_sub(t0).max(1);
+    let pct = |v: u64| v * 100 / total;
+    let mut out = alloc::format!("big kernel lock held {}% of the time\n", pct(held - h0));
+    for c in (0..MAX_CPUS).filter(|c| online_mask() & (1 << c) != 0) {
+        out += &alloc::format!("cpu {c}: idle {:>3}%  waiting for the lock {:>3}%\n", pct(idle[c] - i0[c]), pct(wait[c] - w0[c]));
+    }
+    let mut top: alloc::vec::Vec<(u32, usize)> = (0..SAMPLES.len()).map(|i| (SAMPLES[i].swap(0, Ordering::Relaxed), i)).filter(|s| s.0 != 0).collect();
+    top.sort_unstable_by(|a, b| b.cmp(a));
+    let n: u32 = top.iter().map(|s| s.0).sum();
+    if n != 0 {
+        out += "lock held for (timer samples):";
+        for &(k, i) in top.iter().take(10) {
+            let what = match i {
+                0x2000 => "user fault/preempt".into(),
+                0x2001 => "kernel tasks".into(),
+                i if i >= 0x1000 => alloc::format!("i386 {}", crate::linux::compat32::label(i as u64 - 0x1000)),
+                i => crate::linux::syscall_label(i as u64),
+            };
+            out += &alloc::format!(" {what} {}%", k * 100 / n);
+        }
+        out += "\n";
+    }
+    out
+}
+
 /// Whether this CPU holds the big kernel lock.
 #[inline]
 pub fn held() -> bool {
@@ -126,9 +195,13 @@ pub fn lock() {
     if BKL.load(Ordering::Relaxed) == me {
         return;
     }
-    while !try_take(me) {
-        service_tlb();
-        core::hint::spin_loop();
+    if !try_take(me) {
+        let t0 = rdtsc();
+        while !try_take(me) {
+            service_tlb();
+            core::hint::spin_loop();
+        }
+        WAIT_CYCLES[me as usize - 1].fetch_add(rdtsc().wrapping_sub(t0), Ordering::Relaxed);
     }
     acquired();
 }
@@ -146,6 +219,7 @@ pub fn lock_from_user() {
 /// The lock was just taken: kernel state that names "the running task" globally follows
 /// this CPU's current task (Linux's `current` in the driver layer).
 fn acquired() {
+    HELD_SINCE.store(rdtsc(), Ordering::Relaxed);
     #[cfg(feature = "linux-drivers")]
     if let Some(id) = crate::task::current_id_checked() {
         crate::linuxkpi::switch_to(id);
@@ -159,6 +233,7 @@ pub fn unlock() {
     debug_assert_eq!(BKL.load(Ordering::Relaxed), me, "unlock without the BKL");
     loop {
         run_deferred();
+        HELD_CYCLES.fetch_add(rdtsc().wrapping_sub(HELD_SINCE.load(Ordering::Relaxed)), Ordering::Relaxed);
         BKL.store(0, Ordering::Release);
         if !deferred_pending() || !try_take(me) {
             return;

@@ -1270,6 +1270,7 @@ pub fn terminate(p: &Process, sig: u32) {
 /// Threads of `p` running user code on other CPUs enter the kernel now (and notice that
 /// the program is exiting) instead of at their next timer tick.
 fn kick_threads(p: &Process) {
+    task::wake_process(p.pid);
     let cpus = task::cpus_running(p.pid) & !(1 << crate::smp::id());
     for cpu in (0..crate::smp::MAX_CPUS).filter(|c| cpus & (1 << c) != 0) {
         crate::smp::kick(cpu);

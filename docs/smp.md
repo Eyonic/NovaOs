@@ -127,6 +127,20 @@ Signals are still delivered when the target thread next returns from a system ca
 before; a thread spinning in user code on another CPU sees a fatal signal (via the exit
 kick) at once, a handled one at its next system call.
 
+## Measurements
+
+Steam from `steam` to its sign-in window (docs/steam.md, QEMU/KVM, 10 GiB), two runs each:
+
+| | update phase | to sign-in window |
+|---|---|---|
+| `nova.cpus=1` | 58 s | 71-72 s |
+| 4 CPUs | 52-53 s | 66-67 s |
+
+The update phase (the bootstrapper fetching and unpacking the client) leaves the CPUs
+85-90% idle: it waits on downloads and sleeps. When the client starts, the BKL is held
+55-90% of the time (mmap, clone, getdents, access, readlink of many processes at once),
+which caps the gain there.
+
 ## Testing
 
 `scripts/common.sh` boots QEMU with `-smp ${NOVA_SMP:-4}`. `NOVA_TEST_CMDLINE="nova.cpus=1"
@@ -143,8 +157,13 @@ switched off).
 * Take the BKL off self-contained hot paths: futex wait/wake, `sched_yield`,
   `clock_gettime`/`gettimeofday` (better: a vDSO), `getpid`-style calls, page faults on
   private anonymous memory.
-* Parked tasks poll: every waiting task becomes runnable at the next interrupt and checks
-  its condition. With hundreds of threads (Steam) that work is serialised by the BKL; real
-  wait queues (futexes first) would remove most of it.
+* Parked tasks poll: a task in `wait_event` becomes runnable at the next interrupt and
+  checks its condition. Futex waits and sleeps no longer do (`task::block`: parked until
+  `task::wake` or a deadline; a wake that comes early is remembered), but poll, epoll and
+  wait4 still do, which is most of the BKL time of an idle Steam (about 12%). They need
+  wake-ups from every event source (sockets, pipes, timers, device interrupts).
+
+`cpus` in the Nova shell shows, since its previous call, each CPU's idle and lock-wait
+time, how long the BKL was held, and what for (the holder's system call at timer ticks).
 * Device interrupts on other CPUs (MSI affinity), asynchronous signal delivery to a thread
   running on another CPU, x2APIC for machines with APIC ids above 254, PCID.
