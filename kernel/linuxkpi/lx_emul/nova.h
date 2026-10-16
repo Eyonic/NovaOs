@@ -93,8 +93,12 @@ void nova_lx_start(void);
 void nova_lx_params(void);
 /* The Linux driver bound to device (bus, devfn), or NULL. */
 const char *nova_lx_pci_driver(u8 bus, u8 devfn);
-/* Nova's scheduler switched to task `task_id`: point Linux's `current` at it. */
-void nova_lx_switch(u64 task_id);
+/* Nova's scheduler switched to a task: point Linux's `current` at its task_struct
+ * (from nova_lx_task_new; NULL for tasks without one). */
+void nova_lx_switch(void *task);
+/* A task_struct for new Nova task `id`, and the end of its task (task.c). */
+void *nova_lx_task_new(u64 id);
+void nova_lx_task_exit(void *task);
 /* Advance jiffies; called from Nova's timer interrupt. */
 void nova_lx_tick(void);
 /* Run the Linux handlers on a PCI line (from Nova's IRQ dispatcher, interrupts off). */

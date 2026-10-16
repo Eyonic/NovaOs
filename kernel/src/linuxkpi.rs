@@ -33,7 +33,9 @@ unsafe extern "C" {
     fn nova_lx_poll();
     fn nova_lx_worker(index: u32);
     fn nova_lx_irq(irq: u32) -> bool;
-    fn nova_lx_switch(task_id: u64);
+    fn nova_lx_switch(task: *mut c_void);
+    fn nova_lx_task_new(id: u64) -> *mut c_void;
+    fn nova_lx_task_exit(task: *mut c_void);
     fn nova_lx_netdev_get(index: u32) -> *mut c_void;
     fn nova_lx_netdev_open(dev: *mut c_void) -> c_int;
     fn nova_lx_netdev_mac(dev: *mut c_void, mac: *mut u8);
@@ -48,10 +50,29 @@ pub fn init() {
     unsafe { nova_lx_init() }
 }
 
-/// Scheduler hook: task `id` runs now, so Linux's `current` must be its task_struct.
-pub fn switch_to(id: usize) {
+/// Scheduler hook: a task runs now, so Linux's `current` must be its task_struct (`lx`,
+/// from [`task_new`]; 0 for tasks without one).
+pub fn switch_to(lx: usize) {
     // SAFETY: lx_emul only updates its current_task pointer (no allocation, no locks).
-    unsafe { nova_lx_switch(id as u64) }
+    unsafe { nova_lx_switch(lx as *mut c_void) }
+}
+
+/// A task_struct for new Nova task `id` (task.rs, at spawn).
+pub fn task_new(id: usize) -> usize {
+    // SAFETY: allocates and initialises a task_struct; task context.
+    unsafe { nova_lx_task_new(id as u64) as usize }
+}
+
+/// Task `lx` has finished: drop its reference to its task_struct.
+pub fn task_exit(lx: usize) {
+    // SAFETY: the reference task_new returned; the free is deferred past an RCU grace
+    // period, so `current` stays valid until the task switches away.
+    unsafe { nova_lx_task_exit(lx as *mut c_void) }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_task_lx(id: u64) -> *mut c_void {
+    task::lx_task(id as usize) as *mut c_void
 }
 
 /// Timer interrupt: advance `jiffies`.

@@ -72,6 +72,8 @@ struct Task {
     user: Option<Box<crate::process::UserState>>,
     /// Times switched in (debugging: `ps`).
     runs: u64,
+    /// Its Linux task_struct (Linux's `current` while it runs; linuxkpi.rs), or 0.
+    lx: usize,
 }
 
 struct Scheduler {
@@ -96,7 +98,7 @@ pub fn init() {
     // SAFETY: called once, before any other task exists.
     unsafe {
         *SCHEDULER.0.get() = Some(Scheduler {
-            tasks: alloc::vec![Task { id: 0, name: "kernel".into(), state: State::Ready, rsp: 0, stack: None, entry: None, tty: None, user: None, runs: 0 }],
+            tasks: alloc::vec![Task { id: 0, name: "kernel".into(), state: State::Ready, rsp: 0, stack: None, entry: None, tty: None, user: None, runs: 0, lx: 0 }],
             current: 0,
             next_id: 1,
         });
@@ -123,7 +125,13 @@ pub fn spawn_with_tty(name: &str, tty: Option<crate::tty::TtyRef>, f: impl FnOnc
     unsafe { core::ptr::copy_nonoverlapping(frame.as_ptr(), rsp as *mut u64, frame.len()) };
     let id = s.next_id;
     s.next_id += 1;
-    s.tasks.push(Task { id, name: name.into(), state: State::Ready, rsp, stack: Some(stack), entry: Some(Box::new(f)), tty, user: None, runs: 0 });
+    #[cfg(feature = "linux-drivers")]
+    let lx = crate::linuxkpi::task_new(id);
+    #[cfg(not(feature = "linux-drivers"))]
+    let lx = 0;
+    // `s` again: the allocation above may have yielded.
+    let s = scheduler();
+    s.tasks.push(Task { id, name: name.into(), state: State::Ready, rsp, stack: Some(stack), entry: Some(Box::new(f)), tty, user: None, runs: 0, lx });
     id
 }
 
@@ -133,6 +141,9 @@ extern "C" fn task_trampoline() -> ! {
         s.tasks[s.current].entry.take().expect("task started twice")
     };
     entry();
+    let s = scheduler();
+    #[cfg(feature = "linux-drivers")]
+    crate::linuxkpi::task_exit(core::mem::take(&mut s.tasks[s.current].lx));
     let s = scheduler();
     s.tasks[s.current].state = State::Finished;
     loop {
@@ -218,7 +229,7 @@ fn schedule() {
                     crate::process::switch_out(s.tasks[old].user.as_deref_mut());
                     crate::process::switch_in(s.tasks[next].user.as_deref());
                     #[cfg(feature = "linux-drivers")]
-                    crate::linuxkpi::switch_to(s.tasks[next].id);
+                    crate::linuxkpi::switch_to(s.tasks[next].lx);
                     let old_rsp = &raw mut s.tasks[old].rsp;
                     let new_rsp = s.tasks[next].rsp;
                     // SAFETY: new_rsp was saved by `switch` or built by `spawn`; old_rsp
@@ -272,6 +283,12 @@ pub fn set_user(user: Option<Box<crate::process::UserState>>) {
     // Load the new address space before the old one (and its page tables) is freed.
     crate::process::switch_in(s.tasks[current].user.as_deref());
     drop(old);
+}
+
+/// The Linux task_struct of task `id` (0 if none or the task is gone).
+#[cfg(feature = "linux-drivers")]
+pub fn lx_task(id: usize) -> usize {
+    scheduler().tasks.iter().find(|t| t.id == id).map_or(0, |t| t.lx)
 }
 
 pub fn current_id() -> usize {
