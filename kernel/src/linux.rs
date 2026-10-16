@@ -636,7 +636,9 @@ fn read_user(addr: u64, len: usize) -> Result<Vec<u8>, i64> {
     if !mem().ensure(addr, len as u64, false) {
         return Err(EFAULT);
     }
-    let mut v = vec![0u8; len];
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| ENOMEM_ERR)?;
+    v.resize(len, 0);
     // SAFETY: the range is mapped in the active (this process's) address space.
     unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, v.as_mut_ptr(), len) };
     Ok(v)
@@ -1742,9 +1744,10 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     let out = match &f.kind {
         Kind::Null => Vec::new(),
         Kind::Path => return Err(EBADF),
-        Kind::Zero => vec![0; len],
+        // Short reads are fine for these, and keep a huge count from sizing a kernel buffer.
+        Kind::Zero => vec![0; len.min(1 << 20)],
         Kind::Random => {
-            let mut v = vec![0; len];
+            let mut v = vec![0; len.min(1 << 20)];
             rand::fill(&mut v);
             v
         }
@@ -1810,7 +1813,7 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
             let start = if *append { contents.len() } else { pos };
             let contents = contents.to_mut();
             if contents.len() < start + data.len() {
-                contents.resize(start + data.len(), 0);
+                vfs::resize_file(contents, (start + data.len()) as u64)?;
             }
             contents[start..start + data.len()].copy_from_slice(data);
             *dirty = true;
@@ -2542,7 +2545,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             77 | 285 => {
                 // ftruncate(fd, len), fallocate(fd, mode, off, len)
                 let file = fds().get(a0 as i64)?;
-                let size = if nr == 77 { a1 } else { a2 + a3 };
+                let size = if nr == 77 { a1 } else { a2.saturating_add(a3) };
                 let mut fl = file.lock();
                 match &mut fl.kind {
                     Kind::Memfd(m, _) => {
@@ -2552,7 +2555,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         }
                     }
                     Kind::File { data, dirty, .. } => {
-                        data.to_mut().resize(size as usize, 0);
+                        vfs::resize_file(data.to_mut(), size)?;
                         *dirty = true;
                     }
                     _ => return Err(EINVAL),

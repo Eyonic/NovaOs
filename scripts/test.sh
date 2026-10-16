@@ -171,7 +171,7 @@ define_case() {
                        "ser:tar cf /run/a.tar . && mkdir /run/x && cd /run/x && tar xf /run/a.tar && readlink l && cat up"
                        "wait:hi" "ser:cp -a /run/x /run/y && echo copied-\$(readlink /run/y/up)" "wait:copied-")
                 EXPECT=("${shell[@]}" "  ok   a link loop gives ELOOP" "  ok   tmpfs hard link: same inode, nlink 2"
-                        "  ok   3000 files in one directory" "vfstest: 43 passed, 0 failed" "  ok   SCM_RIGHTS over a named socket" "unixtest: 13 passed, 0 failed" "target" "hi" "copied-../t/target")
+                        "  ok   3000 files in one directory" "vfstest: 45 passed, 0 failed" "  ok   SCM_RIGHTS over a named socket" "unixtest: 13 passed, 0 failed" "target" "hi" "copied-../t/target")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault" "can't") ;;
         containers) # Mount namespaces (vfs.rs): the host's unmodified bubblewrap, the container
                 # tool Steam's runtime uses, builds a read-only view of / with its own /dev,

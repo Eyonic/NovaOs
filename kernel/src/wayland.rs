@@ -33,6 +33,9 @@ use crate::{pit, task};
 pub const SOCKET_DIR: &str = "run/user/1000";
 pub const SOCKET: &str = "run/user/1000/wayland-0";
 
+/// Largest buffer side accepted from clients (8K displays are 7680 wide).
+const MAX_BUFFER_SIDE: i64 = 16384;
+
 /// US keyboard layout, compiled by `xkbcli compile-keymap --layout us` from
 /// xkeyboard-config (MIT-style license).
 static KEYMAP: &str = include_str!("wayland/us.xkb");
@@ -426,8 +429,13 @@ impl Client {
                 // create_buffer(id, offset, width, height, stride, format)
                 let mem = mem.clone();
                 let (b, offset, width, height, stride, format) = (r.u32()?, r.i32()?, r.i32()?, r.i32()?, r.i32()?, r.u32()?);
-                if format > 1 || width <= 0 || height <= 0 || stride < width * 4 || offset < 0 {
-                    self.error(id, 1, "unsupported buffer");
+                // The sizes come from the client: checked in 64 bits against the pool's
+                // memory, so a bad buffer is a protocol error, never a huge allocation.
+                let (w, h, st, off) = (width as i64, height as i64, stride as i64, offset as i64);
+                let pool_size = mem.lock().size as i64;
+                if format > 1 || !(1..=MAX_BUFFER_SIDE).contains(&w) || !(1..=MAX_BUFFER_SIDE).contains(&h) || st < w * 4 || off < 0 || off + st * (h - 1) + w * 4 > pool_size {
+                    crate::log::warn(&format!("wayland: client {}: rejected buffer {width}x{height}, stride {stride}, offset {offset}, pool {pool_size} bytes", self.id));
+                    self.error(id, 1, "invalid buffer");
                     return Ok(());
                 }
                 self.objects.insert(b, Obj::Buffer(Buffer { mem, offset: offset as usize, width, height, stride, format }));

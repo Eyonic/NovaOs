@@ -191,6 +191,7 @@ fn panic(info: &PanicInfo) -> ! {
     println!();
     println!("!!! KERNEL PANIC !!!");
     println!("{info}");
+    crate::task::panic_context();
     println!("[nova] system halted: kernel panic");
     halt_forever()
 }

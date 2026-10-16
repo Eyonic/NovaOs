@@ -311,6 +311,21 @@ pub fn recent_calls(pid: u64) -> Vec<String> {
     out
 }
 
+/// For a kernel panic: which program was running, the system call it was in, and its
+/// last ones (an allocation failure is usually a size a program passed in).
+pub fn panic_context() {
+    let Some(u) = current_user() else { return };
+    let comm = if u.comm.is_empty() { String::new() } else { alloc::format!(" \"{}\"", u.comm) };
+    crate::println!("[nova] while running pid {} thread {}{comm}", u.process.pid, u.tid);
+    if u.in_syscall != u64::MAX {
+        crate::println!("[nova] in system call {}({:#x}, {:#x}, ...)", crate::linux::syscall_label(u.in_syscall), u.syscall_arg, u.syscall_arg2);
+    }
+    crate::println!("[nova] its last system calls:");
+    for line in u.recent.lines() {
+        crate::println!("{line}");
+    }
+}
+
 /// Run `f` on every thread of process `pid`, the calling one included (seccomp TSYNC).
 /// Tasks never run concurrently, so the others are parked in the kernel meanwhile.
 pub fn each_thread(pid: u64, mut f: impl FnMut(&mut crate::process::UserState)) {

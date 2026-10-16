@@ -144,6 +144,14 @@ int main(void)
 	check(pread(fd, buf, 1, 0) == 1 && buf[0] == 'C', "MAP_SHARED of a tmpfs file shares its pages");
 	close(fd);
 
+	// Sizes come from programs: one the kernel cannot hold is an error for the program,
+	// never a failed kernel allocation.
+	fd = open("/vfs-big", O_RDWR | O_CREAT | O_TRUNC, 0644);
+	check(fd >= 0 && ftruncate(fd, 1LL << 36) == -1 && errno == ENOSPC, "ftruncate to 64 GiB is ENOSPC");
+	check(pwrite(fd, "x", 1, 1LL << 36) == -1 && errno == ENOSPC, "a write at 64 GiB is ENOSPC");
+	close(fd);
+	unlink("/vfs-big");
+
 	mkdir("/run/many", 0755);
 	int made = 0;
 	char name[300];

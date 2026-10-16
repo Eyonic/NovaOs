@@ -38,6 +38,22 @@ pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
+
+/// Grow or shrink a file kept in kernel memory to `len` bytes. Its size comes from a
+/// program (ftruncate, fallocate, a write far past the end), so a size the heap cannot
+/// hold is ENOSPC for that program, never an allocation failure of the kernel.
+pub fn resize_file(data: &mut alloc::vec::Vec<u8>, len: u64) -> Result<(), i64> {
+    let len = usize::try_from(len).map_err(|_| ENOSPC)?;
+    if len > data.len() {
+        // Keep a quarter of the free heap for everything else.
+        let (_, free) = crate::memory::heap_usage();
+        if len - data.len() > free - free / 4 || data.try_reserve_exact(len - data.len()).is_err() {
+            return Err(ENOSPC);
+        }
+    }
+    data.resize(len, 0);
+    Ok(())
+}
 pub const EROFS: i64 = 30;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
@@ -1039,7 +1055,7 @@ impl Backend for NovaFsBackend {
             #[cfg(feature = "linux-drivers")]
             Content::Linux(..) => return Err(EINVAL),
         };
-        data.resize(len as usize, 0);
+        resize_file(&mut data, len)?;
         self.write_back(p, &data)
     }
 
