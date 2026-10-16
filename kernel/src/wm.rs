@@ -837,12 +837,19 @@ impl Desktop {
             let (x, y) = self.cursor;
             (x - cx) * (x - cx) + (y - cy) * (y - cy) <= (BUBBLE_R + 4) * (BUBBLE_R + 4)
         };
-        let ring = BUBBLE_R + 3;
-        self.scene.shadow_round(Rect::new(cx - ring, cy - ring, 2 * ring, 2 * ring), ring, 14, 110);
-        let base = if open { theme::ACCENT } else { 0x2A2C3E };
-        self.scene.fill_circle(cx, cy, ring, if hovered { crate::gfx::blend(base, 0xFFFFFF, 30) } else { base });
-        let r = BUBBLE_R - 1;
-        crate::icons::draw(&mut self.scene, '*', 0xD97757, Rect::new(cx - r, cy - r, 2 * r, 2 * r));
+        // The app icon tile is the button itself (no plate behind it): its shadow, hover
+        // tint and open outline follow the tile's own rounded corners.
+        let tile = Rect::new(cx - BUBBLE_R, cy - BUBBLE_R, 2 * BUBBLE_R, 2 * BUBBLE_R);
+        let radius = tile.w * 23 / 100; // icons::draw's corner
+        self.scene.shadow_round(tile, radius, 14, 110);
+        if open {
+            let out = Rect::new(tile.x - 4, tile.y - 4, tile.w + 8, tile.h + 8);
+            self.scene.stroke_round_rect_w(out, radius + 4, 2, theme::ACCENT);
+        }
+        crate::icons::draw(&mut self.scene, '*', 0xD97757, tile);
+        if hovered {
+            self.scene.blend_round_rect(tile, radius, 0xFFFFFF, 28);
+        }
         if open {
             // A small down chevron: click to tuck the chat away.
             let (bx, by) = (cx + BUBBLE_R - 4, cy - BUBBLE_R + 4);
