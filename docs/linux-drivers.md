@@ -151,6 +151,31 @@ generation), and Steam.
 | 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |
 | 9 | Steam | Mesa RADV, Steam runtime, Proton (userspace) | a Wayland compositor or Xwayland path, audio (HDA via ALSA), namespaces for the Steam runtime |
 
+### Milestone 7 status: amdgpu compiles
+
+With `kernel/linuxkpi/amdgpu.config` (amdgpu plus its display core) added to
+nova.config (SI/CIK support, userptr and the KFD compute driver off), Kbuild accepts the
+configuration and compiles all 988 objects of `drivers/gpu/drm` (DRM core, TTM, the
+display helpers, amdgpu, the display core), `drivers/dma-buf` and `drivers/i2c` without an
+error. Linked with Nova's existing Linux objects, they need **246 symbols** that lx_emul
+does not provide yet, in these groups:
+
+- library code to compile as is: HDMI infoframes (`drivers/video/hdmi.c`), the GPU buddy
+  allocator, `gcd`, interval trees;
+- files: anonymous inodes, `fd_install`/`fget`/`fput`, `dentry_open` (DRM and dma-buf
+  hand out file descriptors);
+- pages and folios: shmem-backed TTM buffer objects, `copy_page`, folio locking and
+  dirtying, page-attribute caching modes (`cachemode2protval`);
+- timers and interrupts: hrtimers, IRQ domains (`generic_handle_domain_irq`), delayed
+  work disable/enable;
+- device core: classes with files, software nodes, `device_for_each_child`, backlight and
+  CEC notifier stubs;
+- DMA: `dma_map_sgtable`, `dma_map_resource`, addressing limits.
+
+The display core also needs kernel FPU sections (`kernel_fpu_begin/end`, saving the
+extended state around DC's floating-point code). After linking, bring-up has to happen on
+the reference machine: QEMU has no AMD GPU model.
+
 NVMe is the one family on the roadmap that Nova drives natively instead of through Linux:
 it is a single standard interface for every NVMe SSD, while Linux's driver sits on blk-mq and
 the generic block layer, which are tied to Linux's VFS and page cache (Genode, whose approach
