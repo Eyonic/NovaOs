@@ -52,6 +52,7 @@ static struct task_struct lx_boot_task = {
 	.usage = REFCOUNT_INIT(1),
 	.comm = "nova-0",
 	.signal = &lx_signal,
+	.group_leader = &lx_boot_task,
 };
 
 DEFINE_PER_CPU_CACHE_HOT(struct task_struct *, current_task) = &lx_boot_task;
@@ -71,6 +72,9 @@ void *nova_lx_task_new(u64 id)
 	refcount_set(&t->usage, 1);
 	t->pid = t->tgid = (pid_t)id;
 	t->signal = &lx_signal;
+	/* Each task leads its own group (amdgpu and the GPU scheduler name and compare
+	 * current->group_leader; one per process would be more exact). */
+	t->group_leader = t;
 	snprintf(t->comm, sizeof(t->comm), "nova-%llu", id);
 	return t;
 }
