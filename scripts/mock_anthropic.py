@@ -295,14 +295,14 @@ def respond(body):
         if step == 1:
             dump = result_text(result)
             log(f"pci_config: {dump.splitlines()[0] if dump else '(empty)'}")
-            s.text("This is an Intel HD Audio controller. Writing a driver port.")
-            s.tool("toolu_drv_2", "write_file", {"path": "drivers/intel_hda.rs",
-                                                 "content": "//! Intel High Definition Audio controller (draft port).\n"
-                                                            "pub struct IntelHda { regs: u64 }\n"})
-            s.tool("toolu_drv_3", "write_file", {"path": "drivers/intel_hda.md",
-                                                 "content": "# Intel HD Audio\nDraft: controller reset and CORB/RIRB setup.\n"})
+            s.text("This is an Intel 82801AA AC'97 audio controller. Writing a driver port.")
+            s.tool("toolu_drv_2", "write_file", {"path": "drivers/ac97.rs",
+                                                 "content": "//! Intel AC'97 audio controller (draft port).\n"
+                                                            "pub struct Ac97 { nambar: u16, nabmbar: u16 }\n"})
+            s.tool("toolu_drv_3", "write_file", {"path": "drivers/ac97.md",
+                                                 "content": "# Intel AC'97\nDraft: codec reset and PCM out buffer descriptor list.\n"})
             return s.finish("tool_use")
-        s.text(f"Intel HD Audio ({addr}): draft driver in drivers/intel_hda.rs; needs an audio interface in the kernel.")
+        s.text(f"Intel AC'97 ({addr}): draft driver in drivers/ac97.rs; needs an audio interface in the kernel.")
         return s.finish("end_turn")
 
     if "poster image" in first:
