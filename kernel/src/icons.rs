@@ -26,20 +26,45 @@ fn name_for(icon: char) -> Option<&'static str> {
     })
 }
 
+/// Icons registered at run time (Linux programs' icons, from their desktop entries): the
+/// image file of each private-use character from U+F0000 on.
+static REGISTERED: SpinLock<Vec<String>> = SpinLock::new(Vec::new());
+const REGISTERED_BASE: u32 = 0xF0000;
+
+/// The icon character for the PNG system file at `path` (the same character for the same
+/// file), for windows and launchers of programs that bring their own icon.
+pub fn register(path: &str) -> char {
+    let mut list = REGISTERED.lock();
+    let i = list.iter().position(|p| p == path).unwrap_or_else(|| {
+        list.push(path.into());
+        list.len() - 1
+    });
+    char::from_u32(REGISTERED_BASE + i as u32).unwrap_or('\u{2666}')
+}
+
+fn registered(icon: char) -> Option<String> {
+    let i = (icon as u32).checked_sub(REGISTERED_BASE)? as usize;
+    REGISTERED.lock().get(i).cloned()
+}
+
 fn image(name: &str) -> Option<Arc<Canvas>> {
+    load(&format!("usr/share/nova/icons/{name}.png"))
+}
+
+fn load(path: &str) -> Option<Arc<Canvas>> {
     static CACHE: SpinLock<Vec<(String, Option<Arc<Canvas>>)>> = SpinLock::new(Vec::new());
-    if let Some((_, c)) = CACHE.lock().iter().find(|(n, _)| n == name) {
+    if let Some((_, c)) = CACHE.lock().iter().find(|(n, _)| n == path) {
         return c.clone();
     }
-    let c = fs::system_file(&format!("usr/share/nova/icons/{name}.png")).and_then(|d| Canvas::from_png(d).ok()).map(Arc::new);
-    CACHE.lock().push((name.into(), c.clone()));
+    let c = fs::system_file(path).and_then(|d| Canvas::from_png(d).ok()).map(Arc::new);
+    CACHE.lock().push((path.into(), c.clone()));
     c
 }
 
 /// Draw the icon for `icon` (an app's icon character) into the square `r`.
 pub fn draw(scene: &mut Canvas, icon: char, color: u32, r: Rect) {
     let radius = r.w * 23 / 100;
-    if let Some(img) = name_for(icon).and_then(image) {
+    if let Some(img) = name_for(icon).and_then(image).or_else(|| registered(icon).and_then(|p| load(&p))) {
         scene.blit_scaled(&img, r, radius, 255);
         return;
     }

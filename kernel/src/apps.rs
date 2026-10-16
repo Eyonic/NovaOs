@@ -497,6 +497,10 @@ pub fn launch(path: &str) -> Result<(), String> {
         crate::settings::open();
         return Ok(());
     }
+    if let Some(entry) = crate::desktop::handler_for(path) {
+        // A document a Linux program claims (desktop entry MimeType), e.g. .docx.
+        return crate::desktop::launch(entry, Some(path));
+    }
     if !path.ends_with(".rhai") {
         // A document: open it in the Text Editor.
         crate::editor::open(Some(path.into()));
