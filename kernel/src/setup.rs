@@ -8,7 +8,9 @@
 //! 3. Live session with a free disk: offer to install Nova onto it.
 //! 4. The desktop starts, with the assistant open.
 //!
-//! Kernel command line `nova.mode=shell` skips 2-4 and runs the text shell (tests).
+//! Kernel command line `nova.mode=shell` skips 2-4 and runs the text shell (tests);
+//! `nova.mode=desktop-shell` skips 2-3 and opens the desktop with a Terminal on the serial
+//! line instead of the assistant.
 
 use alloc::format;
 use alloc::string::String;
@@ -223,6 +225,24 @@ pub fn run() -> ! {
         crate::wayland::start(); // headless: no windows, the `wayland` command shows clients
         crate::pulse::start();
         crate::log::boot_done();
+        loop {
+            crate::shell::run();
+        }
+    }
+
+    // nova.mode=desktop-shell: the desktop with a Terminal whose shell also reads and
+    // writes the serial line, and no first-boot setup (driving GUI programs from tests).
+    if cmdline_flag("nova.mode") == Some("desktop-shell") {
+        println!("[nova] starting the desktop with a serial shell");
+        crate::log::boot_done();
+        if wm::start() {
+            wm::spawn_terminal("Terminal", '>', 0x3B4252, true, |_| loop {
+                crate::shell::run();
+            });
+            loop {
+                task::wait_event();
+            }
+        }
         loop {
             crate::shell::run();
         }
