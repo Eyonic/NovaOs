@@ -78,6 +78,15 @@ fn kind_of(e: &Entry) -> Kind {
     }
 }
 
+/// What a file is, naming the Linux program that opens it if one does (desktop.rs).
+fn kind_label(e: &Entry) -> String {
+    let k = kind_of(e);
+    match crate::desktop::handler_for(&e.path) {
+        Some(app) if !e.folder && matches!(k, Kind::Other | Kind::Image) => format!("{} document", app.name),
+        _ => kind_name(k).into(),
+    }
+}
+
 fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Folder => "Folder",
@@ -662,8 +671,8 @@ impl Files {
                 let ty = r.y + (r.h - font::line_height(ui::BODY)) / 2;
                 self.draw_icon(&mut c, e, Rect::new(r.x + 10, r.y + (r.h - 24) / 2, 24, 24));
                 font::draw_clipped(&mut c, r.x + 46, ty, &e.name, ui::BODY, Weight::Regular, ui::TEXT, r.w - 400);
-                let kind = kind_name(kind_of(e));
-                font::draw(&mut c, area.x + area.w - 330, ty + 1, kind, 13, Weight::Regular, ui::DIM);
+                let kind = kind_label(e);
+                font::draw(&mut c, area.x + area.w - 330, ty + 1, &kind, 13, Weight::Regular, ui::DIM);
                 let size = if e.folder { items(e.count) } else { fmt_size(e.size) };
                 font::draw(&mut c, area.x + area.w - 200, ty + 1, &size, 13, Weight::Regular, ui::DIM);
                 font::draw(&mut c, area.x + area.w - 110, ty + 1, &fmt_time(e.mtime), 13, Weight::Regular, ui::DIM);
@@ -709,7 +718,7 @@ impl Files {
                     font::draw(&mut c, big.x, y, &line, 16, Weight::Bold, ui::TEXT);
                     y += 22;
                 }
-                let detail = if e.folder { format!("Folder  \u{00b7}  {}", items(e.count)) } else { format!("{}  \u{00b7}  {}", kind_name(kind), fmt_size(e.size)) };
+                let detail = if e.folder { format!("Folder  \u{00b7}  {}", items(e.count)) } else { format!("{}  \u{00b7}  {}", kind_label(&e), fmt_size(e.size)) };
                 font::draw(&mut c, big.x, y + 2, &detail, 13, Weight::Regular, ui::DIM);
                 font::draw(&mut c, big.x, y + 22, &format!("Modified {}", fmt_time(e.mtime)), 13, Weight::Regular, ui::DIM);
                 let [open, dup, copy, del] = self.preview_buttons();
