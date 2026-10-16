@@ -65,6 +65,22 @@ Photos of the screen are enough. In the shell:
 
 `dmesg` is the in-memory kernel log (the same lines QEMU shows on its serial console).
 
+## Remote console
+
+A PC has no serial port to watch, so Nova can use the network instead. Build the stick
+with the address of another machine on the same network:
+
+```sh
+NOVA_BOOT_MENU=1 FEATURES=linux-drivers NOVA_CMDLINE="nova.mode=shell nova.remote=192.168.1.97:5599" scripts/build.sh
+```
+
+and listen there before booting: `nc -lk 5599` (or `socat -,raw,echo=0 TCP-LISTEN:5599,reuseaddr`).
+Once DHCP gives Nova an address, it connects out, sends the whole kernel log, and then
+mirrors its serial console both ways: everything Nova prints arrives there, and what is
+typed there reaches Nova's shell. Nova opens no port of its own; if the link drops it
+reconnects every few seconds. If the network driver does not come up, nothing connects:
+photograph the screen instead.
+
 ## Safety
 
 The live session does not write to internal disks: Nova only writes to a disk when you

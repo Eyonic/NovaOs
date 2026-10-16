@@ -48,6 +48,7 @@ fn write_byte(byte: u8) {
         while inb(COM1 + 5) & 0x20 == 0 {} // wait for transmit holding register empty
         outb(COM1, byte);
     }
+    crate::remote::push(&[byte]);
 }
 
 /// Write raw bytes (LF becomes CR LF, as for text).

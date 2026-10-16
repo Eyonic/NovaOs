@@ -48,6 +48,7 @@ mod port;
 mod power;
 mod process;
 mod rand;
+mod remote;
 mod rtc;
 mod selftest;
 mod serial;

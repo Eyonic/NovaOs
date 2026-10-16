@@ -94,6 +94,7 @@ pub fn hardware() {
         }
         None => println!("  {ORANGE}!{RESET} network: no supported network card"),
     }
+    crate::remote::start();
 }
 
 fn ask_yes_no(question: &str, default_yes: bool) -> bool {
