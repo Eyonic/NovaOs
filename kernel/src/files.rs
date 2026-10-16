@@ -59,6 +59,8 @@ enum Kind {
     Folder,
     App,
     Image,
+    Video,
+    Audio,
     Text,
     Code,
     Other,
@@ -70,7 +72,9 @@ fn kind_of(e: &Entry) -> Kind {
     }
     match e.name.rsplit('.').next().unwrap_or("") {
         "rhai" => Kind::App,
-        "png" => Kind::Image,
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => Kind::Image,
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "m4v" | "mpg" | "ogv" => Kind::Video,
+        "mp3" | "flac" | "ogg" | "opus" | "m4a" | "aac" | "wav" => Kind::Audio,
         "txt" | "md" | "log" | "conf" | "csv" => Kind::Text,
         "rs" | "c" | "h" | "cpp" | "py" | "sh" | "js" | "json" | "toml" => Kind::Code,
         _ if !e.name.contains('.') => Kind::Text,
@@ -82,7 +86,9 @@ fn kind_name(k: Kind) -> &'static str {
     match k {
         Kind::Folder => "Folder",
         Kind::App => "Nova app",
-        Kind::Image => "PNG image",
+        Kind::Image => "Picture",
+        Kind::Video => "Video",
+        Kind::Audio => "Music",
         Kind::Text => "Text document",
         Kind::Code => "Source code",
         Kind::Other => "File",
@@ -222,7 +228,7 @@ impl Files {
 
     fn thumb(&mut self, path: &str) -> Option<Arc<Canvas>> {
         if !self.thumbs.contains_key(path) {
-            let img = fs::read(path).ok().and_then(|d| Canvas::from_png(&d).ok()).map(Arc::new);
+            let img = fs::read(path).ok().and_then(|d| crate::media::image::decode(&d).ok()).map(|i| Arc::new(i.frames.into_iter().next().unwrap().0));
             self.thumbs.insert(path.into(), img);
         }
         self.thumbs.get(path).cloned().flatten()
@@ -538,6 +544,8 @@ impl Files {
                 }
                 None => icons::draw(c, '@', 0xD07A3A, r),
             },
+            Kind::Video => icons::draw(c, crate::media::video::ICON, 0xF28A2E, r),
+            Kind::Audio => icons::draw(c, crate::media::music::ICON, 0xE0559A, r),
             k => {
                 // A document tile: page with a folded corner and the extension.
                 let color = match k {

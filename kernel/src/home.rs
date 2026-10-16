@@ -158,14 +158,25 @@ impl Menu {
 // ---------------------------------------------------------------------------
 // Artwork and live app previews (rendered by a background task).
 
+static ART_CACHE: SpinLock<Vec<(String, Option<Arc<Canvas>>)>> = SpinLock::new(Vec::new());
+static WALLPAPER_CHANGED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Photos set a new wallpaper (`system/wallpaper.png`): Home rebuilds its background.
+pub fn wallpaper_changed() {
+    ART_CACHE.lock().retain(|(n, _)| n != "wall");
+    WALLPAPER_CHANGED.store(true, core::sync::atomic::Ordering::Relaxed);
+    wm::request_redraw();
+}
+
 fn art(name: &str) -> Option<Arc<Canvas>> {
-    static CACHE: SpinLock<Vec<(String, Option<Arc<Canvas>>)>> = SpinLock::new(Vec::new());
-    if let Some((_, c)) = CACHE.lock().iter().find(|(n, _)| n == name) {
+    if let Some((_, c)) = ART_CACHE.lock().iter().find(|(n, _)| n == name) {
         return c.clone();
     }
     let path = format!("usr/share/nova/home/{name}.png");
-    let c = fs::system_file(&path).and_then(|d| Canvas::from_png(d).ok()).map(Arc::new);
-    CACHE.lock().push((name.into(), c.clone()));
+    // The wallpaper can be replaced by the user (Photos: "Set as wallpaper").
+    let user = (name == "wall").then(|| fs::read("system/wallpaper.png").ok()).flatten();
+    let c = user.and_then(|d| Canvas::from_png(&d).ok()).or_else(|| fs::system_file(&path).and_then(|d| Canvas::from_png(d).ok())).map(Arc::new);
+    ART_CACHE.lock().push((name.into(), c.clone()));
     c
 }
 
@@ -421,6 +432,9 @@ impl Home {
                 "Text Editor" if bundled => Some("editor"),
                 "System Monitor" if bundled => Some("monitor"),
                 "Settings" if bundled => Some("settings"),
+                "Videos" if bundled => Some("video"),
+                "Music" if bundled => Some("music"),
+                "Photos" if bundled => Some("photos"),
                 _ => None,
             };
             let item = Item {
@@ -950,6 +964,21 @@ impl Home {
 
     pub fn draw(&mut self, scene: &mut Canvas) {
         let (w, h) = (self.width, self.height);
+        if WALLPAPER_CHANGED.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            self.background = match art("wall") {
+                Some(a) => {
+                    let mut b = cover(&a, w, h);
+                    b.blend_rect(b.bounds(), BG, 175);
+                    b
+                }
+                None => {
+                    let mut b = Canvas::new(w as usize, h as usize);
+                    b.gradient(b.bounds(), 0x161827, BG);
+                    b
+                }
+            };
+            self.backdrop = None;
+        }
         let item = self.selected().cloned();
 
         // Backdrop: the focused item's hero artwork across the whole screen. The art

@@ -21,6 +21,9 @@ rhai = { version = "1.26", default-features = false, features = ["no_std", "sync
 sha2 = { version = "0.10", default-features = false }
 spin = { version = "0.9", default-features = false, features = ["lock_api", "spin_mutex", "mutex"] }
 fontdue = { version = "0.9.4", default-features = false, features = ["hashbrown"] }
+# JPEG decoding for the image viewer (no_std + alloc; the kernel target has no SIMD).
+zune-jpeg = { version = "0.5", default-features = false }
+zune-core = { version = "0.5", default-features = false }
 
 [features]
 # Compile in Linux drivers from the Linux source (scripts/fetch-linux.sh), on top of lx_emul
