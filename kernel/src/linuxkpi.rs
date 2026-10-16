@@ -291,8 +291,13 @@ extern "C" fn nova_firmware_read(name: *const u8, name_len: usize, len: *mut usi
     if name.split('/').any(|part| part == "..") {
         return core::ptr::null_mut();
     }
+    let dirs = ["lib/firmware", "usr/lib/firmware"];
     let ns = crate::vfs::root();
-    let Some(bytes) = ["lib/firmware", "usr/lib/firmware"].iter().find_map(|dir| ns.read_program("/", &alloc::format!("/{dir}/{name}")).ok()) else {
+    // Drivers that load firmware while probing (amdgpu) run before the system files are
+    // registered in the file system: then the image's system pak is read directly.
+    let Some(bytes) = dirs.iter().find_map(|dir| ns.read_program("/", &alloc::format!("/{dir}/{name}")).ok()).or_else(|| {
+        dirs.iter().find_map(|dir| crate::process::system_file(&alloc::format!("{dir}/{name}")).map(alloc::borrow::Cow::Borrowed))
+    }) else {
         return core::ptr::null_mut();
     };
     let buf = nova_alloc(bytes.len(), 16, false, false);
@@ -356,6 +361,39 @@ extern "C" fn nova_vmemmap_populate(pfn: u64, count: u64, page_size: u64) -> boo
     memory::populate(memory::VMEMMAP_BASE + pfn * page_size, count * page_size)
 }
 
+/// vmap(): map `count` pages (physical addresses at `phys`) contiguously in the vmap
+/// window, with `cache` page-attribute bits (PWT/PCD); null when the window is full.
+#[unsafe(no_mangle)]
+extern "C" fn nova_vmap(phys: *const u64, count: usize, cache: u64) -> *mut c_void {
+    if count == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: lx_emul passes an array of `count` physical addresses.
+    let frames = unsafe { core::slice::from_raw_parts(phys, count) };
+    memory::vmap(frames, cache).map_or(core::ptr::null_mut(), |virt| virt as *mut c_void)
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_vunmap(virt: *const c_void) {
+    memory::vunmap(virt as u64)
+}
+
+/// Total and free heap bytes (Linux's totalram / freeram).
+#[unsafe(no_mangle)]
+extern "C" fn nova_mem_info(total: *mut u64, free: *mut u64) {
+    let (used, available) = memory::heap_usage();
+    // SAFETY: lx_emul passes valid out pointers.
+    unsafe {
+        *total = (used + available) as u64;
+        *free = available as u64;
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_phys_is_ram(phys: u64) -> bool {
+    memory::is_ram(phys)
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn nova_hhdm_offset() -> u64 {
     memory::hhdm_offset()
@@ -396,6 +434,32 @@ extern "C" fn nova_nanos() -> u64 {
 }
 
 #[unsafe(no_mangle)]
+extern "C" fn nova_unix_time() -> u64 {
+    crate::rtc::unix_time()
+}
+
+/// XSAVE area size for kernel FPU sections (lx_emul/fpu.c); 0 means FXSAVE.
+#[unsafe(no_mangle)]
+extern "C" fn nova_fpu_state_size() -> u64 {
+    crate::process::xsave_size()
+}
+
+/// A kernel task for a Linux kthread: runs `entry(arg)` and ends when it returns.
+#[unsafe(no_mangle)]
+extern "C" fn nova_task_spawn(name: *const c_char, entry: extern "C" fn(*mut c_void), arg: *mut c_void) -> u64 {
+    // SAFETY: lx_emul passes a NUL-terminated name, valid for this call.
+    let name = unsafe { CStr::from_ptr(name) }.to_str().unwrap_or("linux-kthread");
+    struct Start(extern "C" fn(*mut c_void), *mut c_void);
+    // SAFETY: the argument is lx_emul's kthread record, used only by the new task.
+    unsafe impl Send for Start {}
+    let start = Start(entry, arg);
+    task::spawn(name, move || {
+        let start = start;
+        (start.0)(start.1)
+    }) as u64
+}
+
+#[unsafe(no_mangle)]
 extern "C" fn nova_ndelay(ns: u64) {
     let end = pit::nanos() + ns;
     while pit::nanos() < end {
@@ -433,6 +497,30 @@ extern "C" fn nova_task_id() -> u64 {
 #[unsafe(no_mangle)]
 extern "C" fn nova_random_u64() -> u64 {
     crate::rand::u64()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_cmdline(len: *mut usize) -> *const u8 {
+    let cmdline = crate::limine::EXECUTABLE_CMDLINE.get().unwrap_or("");
+    // SAFETY: lx_emul passes a valid out pointer; the command line lives forever.
+    unsafe { *len = cmdline.len() };
+    cmdline.as_ptr()
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn nova_driver_disabled(name: *const u8, len: usize) -> bool {
+    // SAFETY: lx_emul passes the driver name's bytes, valid for this call.
+    let name = unsafe { core::slice::from_raw_parts(name, len) };
+    core::str::from_utf8(name).is_ok_and(crate::drivers::disabled)
+}
+
+/// A line on the boot console: on screen while drivers probe (a GPU probe can take the
+/// display away; the line says how to boot without it), on COM1 and in `dmesg`.
+#[unsafe(no_mangle)]
+extern "C" fn nova_console_line(msg: *const u8, len: usize) {
+    // SAFETY: lx_emul passes a formatted buffer of `len` bytes.
+    let bytes = unsafe { core::slice::from_raw_parts(msg, len) };
+    crate::println!("  {}", core::str::from_utf8(bytes).unwrap_or("(invalid UTF-8)"));
 }
 
 #[unsafe(no_mangle)]

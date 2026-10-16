@@ -219,13 +219,14 @@ define_case() {
                 CONTAINS=("nettest: HTTP/1.1 404 Not Found" "nettest: MSG_PEEK kept the data")
                 FORBID=("$PANIC" "$EXC" "segmentation fault" "illegal instruction") ;;
         linuxnet) # The Linux driver layer: Linux's unmodified 8139cp driver (RTL8139C+ card)
-                # brings the network up for Nova's stack; then DNS and TCP through it.
-                CMDLINE="nova.mode=shell"; MOCK=1; NIC=rtl8139
+                # brings the network up for Nova's stack; then DNS and TCP through it. A Linux
+                # module parameter on the command line reaches the built-in amdgpu driver.
+                CMDLINE="nova.mode=shell amdgpu.dc=0"; MOCK=1; NIC=rtl8139
                 [[ ",${FEATURES:-}," == *,linux-drivers,* ]] || SKIP="kernel built without FEATURES=linux-drivers"
                 INPUT=("wait:$PROMPT" "ser:nettest 10.0.2.2:$MOCK_PORT" "wait:bytes")
                 EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
                 CONTAINS=("linux/8139cp  Linux " "[nova] linux: eth0: link up" "network: online, address 10.0.2.15/24"
-                          "nettest: HTTP/1.1 404 Not Found")
+                          "nettest: HTTP/1.1 404 Not Found" "[nova] linux: parameter amdgpu.dc=0")
                 FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
         usbinput) # The Linux USB stack: xHCI, USB core, HID and the input core, bridged to Nova's
                 # keyboard and mouse. The machine has no PS/2 controller, so every keystroke the

@@ -34,7 +34,12 @@ SECTIONS
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     .rodata : {
         *(.rodata .rodata.*)
-        *(.init.rodata .init.setup __param .altinstructions)
+        *(.init.rodata .init.setup .altinstructions)
+        /* Linux module parameters, set from the kernel command line (lx_emul/support.c). */
+        . = ALIGN(8);
+        __start___param = .;
+        KEEP(*(__param))
+        __stop___param = .;
         . = ALIGN(8);
         __ex_table_start = .;
         KEEP(*(__ex_table))

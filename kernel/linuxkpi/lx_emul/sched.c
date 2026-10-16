@@ -23,6 +23,9 @@
 #include <linux/jiffies.h>
 #include <linux/slab.h>
 #include <linux/list.h>
+#include <linux/hrtimer.h>
+#include <linux/irq_work.h>
+#include <linux/llist.h>
 #include "nova.h"
 
 void nova_park(void);
@@ -230,6 +233,8 @@ void delayed_work_timer_fn(struct timer_list *t)
 bool queue_delayed_work_on(int cpu, struct workqueue_struct *wq, struct delayed_work *dwork,
 			   unsigned long delay)
 {
+	if (lx_work_disabled(&dwork->work))
+		return false;
 	if (test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(&dwork->work)))
 		return false;
 	dwork->wq = wq;
@@ -398,10 +403,11 @@ struct lx_irq {
 };
 
 static struct lx_irq lx_irqs[32];
-static unsigned int lx_irq_disabled_count[512];
-/* Disable depth per IRQ number: GSIs/PIC lines and MSI numbers (0x1000 + vector) apart. */
+static unsigned int lx_irq_disabled_count[768];
+/* Disable depth per IRQ number: GSIs/PIC lines, MSI numbers (0x1000 + vector) and virtual
+ * numbers of IRQ domains (0x2000 + n, irq.c) apart. */
 #define lx_irq_disabled lx_irq_disabled_count
-#define LX_IRQ_SLOT(irq) ((irq) >= 0x1000 ? 256 + ((irq) & 255) : (irq) & 255)
+#define LX_IRQ_SLOT(irq) ((irq) >= 0x2000 ? 512 + ((irq) & 255) : (irq) >= 0x1000 ? 256 + ((irq) & 255) : (irq) & 255)
 
 /* Provided by Nova (linuxkpi.rs): unmask/mask a PCI line at the PIC. */
 void nova_irq_line(unsigned int line, bool enable);
@@ -511,6 +517,12 @@ bool nova_lx_irq(unsigned int line)
 	return lx_irq_run(line, false);
 }
 
+/* A demultiplexed interrupt (irq.c), from inside another handler. */
+void lx_emul_irq_handle(unsigned int irq)
+{
+	lx_irq_run(irq, false);
+}
+
 void lx_emul_irq_poll(void)
 {
 	unsigned long flags;
@@ -538,6 +550,8 @@ void nova_lx_poll(void)
 	lx_emul_irq_poll();
 	lx_emul_napi_poll();
 	lx_emul_timers_run();
+	lx_emul_hrtimers_run();
+	lx_emul_irq_work_run();
 	lx_emul_rcu_run();
 }
 
@@ -569,4 +583,252 @@ bool enable_work(struct work_struct *work)
 		if (lx_disabled_work[i] == work)
 			lx_disabled_work[i] = NULL;
 	return true;
+}
+
+bool disable_delayed_work_sync(struct delayed_work *dwork)
+{
+	bool was_pending = lx_work_unqueue(&dwork->work, &dwork->timer);
+
+	disable_work(&dwork->work);
+	lx_work_wait(&dwork->work);
+	return was_pending;
+}
+
+bool enable_delayed_work(struct delayed_work *dwork)
+{
+	return enable_work(&dwork->work);
+}
+
+bool queue_work_node(int node, struct workqueue_struct *wq, struct work_struct *work)
+{
+	return queue_work_on(WORK_CPU_UNBOUND, wq, work);
+}
+
+/* All queues share one list: draining one waits until the whole list is idle. */
+void drain_workqueue(struct workqueue_struct *wq)
+{
+	__flush_workqueue(wq);
+}
+
+/* The work item the calling worker runs, if the caller is a worker. */
+struct work_struct *current_work(void)
+{
+	unsigned int i;
+
+	for (i = 0; i < lx_workers; i++)
+		if (lx_worker_task[i] == nova_task_id())
+			return lx_running[i];
+	return NULL;
+}
+
+/* ---------------------------------------------------------------- high-resolution timers */
+
+/*
+ * hrtimers run from the "linux" task like timer_list timers, so their resolution is
+ * Nova's timer tick (1 ms); callbacks run with interrupts enabled, outside hard
+ * interrupt context. DRM uses them for its software vblank timer. Active timers are
+ * kept in a short array (Linux sorts them in a tree, but only a handful exist here).
+ */
+static struct hrtimer_clock_base lx_hrtimer_base;
+static struct hrtimer *lx_hrtimers[32];
+
+static int lx_hrtimer_slot(const struct hrtimer *timer)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(lx_hrtimers); i++)
+		if (lx_hrtimers[i] == timer)
+			return i;
+	return -1;
+}
+
+void hrtimer_setup(struct hrtimer *timer, enum hrtimer_restart (*function)(struct hrtimer *),
+		   clockid_t clock_id, enum hrtimer_mode mode)
+{
+	memset(timer, 0, sizeof(*timer));
+	timer->base = &lx_hrtimer_base;
+	ACCESS_PRIVATE(timer, function) = function;
+}
+
+ktime_t hrtimer_cb_get_time(const struct hrtimer *timer)
+{
+	return ktime_get();
+}
+
+/* Add, saturating at KTIME_MAX instead of wrapping. */
+ktime_t ktime_add_safe(const ktime_t lhs, const ktime_t rhs)
+{
+	ktime_t res = ktime_add_unsafe(lhs, rhs);
+
+	if (res < 0 || res < lhs || res < rhs)
+		res = ktime_set(KTIME_SEC_MAX, 0);
+	return res;
+}
+
+/* Take a timer off the active array; interrupts are disabled. */
+static bool lx_hrtimer_dequeue(struct hrtimer *timer)
+{
+	int slot = lx_hrtimer_slot(timer);
+
+	if (slot < 0)
+		return false;
+	lx_hrtimers[slot] = NULL;
+	WRITE_ONCE(timer->is_queued, false);
+	return true;
+}
+
+static void lx_hrtimer_enqueue(struct hrtimer *timer)
+{
+	int slot = lx_hrtimer_slot(timer);
+
+	if (slot < 0)
+		slot = lx_hrtimer_slot(NULL);
+	if (WARN_ON(slot < 0))
+		return;
+	lx_hrtimers[slot] = timer;
+	WRITE_ONCE(timer->is_queued, true);
+}
+
+void hrtimer_start_range_ns(struct hrtimer *timer, ktime_t tim, u64 range_ns, const enum hrtimer_mode mode)
+{
+	unsigned long flags;
+
+	if (mode & HRTIMER_MODE_REL)
+		tim = ktime_add_safe(ktime_get(), tim);
+	local_irq_save(flags);
+	hrtimer_set_expires_range_ns(timer, tim, range_ns);
+	lx_hrtimer_enqueue(timer);
+	local_irq_restore(flags);
+}
+
+int hrtimer_try_to_cancel(struct hrtimer *timer)
+{
+	unsigned long flags;
+	bool queued;
+
+	if (hrtimer_callback_running(timer))
+		return -1;
+	local_irq_save(flags);
+	queued = lx_hrtimer_dequeue(timer);
+	local_irq_restore(flags);
+	return queued;
+}
+
+int hrtimer_cancel(struct hrtimer *timer)
+{
+	int ret;
+
+	while ((ret = hrtimer_try_to_cancel(timer)) < 0)
+		nova_park();
+	return ret;
+}
+
+bool hrtimer_active(const struct hrtimer *timer)
+{
+	return READ_ONCE(timer->is_queued) || timer->base->running == timer;
+}
+
+u64 hrtimer_forward(struct hrtimer *timer, ktime_t now, ktime_t interval)
+{
+	ktime_t delta = ktime_sub(now, hrtimer_get_expires(timer));
+	u64 orun = 1;
+
+	if (delta < 0)
+		return 0;
+	if (interval < NSEC_PER_MSEC / 10)
+		interval = NSEC_PER_MSEC / 10;
+	if (delta >= interval) {
+		orun = ktime_divns(delta, interval);
+		hrtimer_add_expires_ns(timer, orun * interval);
+		if (hrtimer_get_expires(timer) > now)
+			return orun;
+		orun++;
+	}
+	hrtimer_add_expires(timer, interval);
+	return orun;
+}
+
+void lx_emul_hrtimers_run(void)
+{
+	struct hrtimer *expired;
+	unsigned long flags;
+	unsigned int i;
+
+	for (;;) {
+		ktime_t now = ktime_get();
+
+		expired = NULL;
+		local_irq_save(flags);
+		for (i = 0; i < ARRAY_SIZE(lx_hrtimers); i++) {
+			struct hrtimer *t = lx_hrtimers[i];
+
+			if (t && hrtimer_get_softexpires(t) <= now) {
+				lx_hrtimer_dequeue(t);
+				lx_hrtimer_base.running = t;
+				expired = t;
+				break;
+			}
+		}
+		local_irq_restore(flags);
+		if (!expired)
+			break;
+		if (ACCESS_PRIVATE(expired, function)(expired) == HRTIMER_RESTART) {
+			local_irq_save(flags);
+			lx_hrtimer_enqueue(expired);
+			local_irq_restore(flags);
+		}
+		lx_hrtimer_base.running = NULL;
+	}
+}
+
+/* ---------------------------------------------------------------- irq_work */
+
+/* Queued irq_work runs from the "linux" task, which every interrupt wakes (Linux runs
+ * it from a self-interrupt right after the queuing handler returns). */
+static LLIST_HEAD(lx_irq_works);
+
+bool irq_work_queue(struct irq_work *work)
+{
+	if (atomic_fetch_or(IRQ_WORK_CLAIMED, &work->node.a_flags) & IRQ_WORK_PENDING)
+		return false;
+	llist_add(&work->node.llist, &lx_irq_works);
+	return true;
+}
+
+void lx_emul_irq_work_run(void)
+{
+	struct llist_node *list = llist_del_all(&lx_irq_works);
+	struct irq_work *work, *next;
+
+	llist_for_each_entry_safe(work, next, llist_reverse_order(list), node.llist) {
+		unsigned long flags;
+
+		atomic_andnot(IRQ_WORK_PENDING, &work->node.a_flags);
+		local_irq_save(flags);
+		work->func(work);
+		local_irq_restore(flags);
+		atomic_andnot(IRQ_WORK_BUSY, &work->node.a_flags);
+	}
+}
+
+/* Tiny SRCU's grace-period machinery: grace periods are always over here (base.c), so
+ * these never have anything to do. */
+void srcu_drive_gp(struct work_struct *wp)
+{
+}
+
+void srcu_tiny_irq_work(struct irq_work *irq_work)
+{
+}
+
+/* ---------------------------------------------------------------- time conversion */
+
+u64 nsecs_to_jiffies64(u64 n)
+{
+	return div_u64(n, NSEC_PER_SEC / HZ);
+}
+
+unsigned long nsecs_to_jiffies(u64 n)
+{
+	return (unsigned long)nsecs_to_jiffies64(n);
 }

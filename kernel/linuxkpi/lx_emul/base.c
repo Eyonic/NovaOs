@@ -15,6 +15,8 @@
 #include <linux/printk.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
+#include <linux/ww_mutex.h>
+#include <linux/rtmutex.h>
 #include <linux/rcupdate.h>
 #include <linux/srcu.h>
 #include <linux/bottom_half.h>
@@ -58,10 +60,14 @@ void nova_lx_init(void)
 	 * demand, when pages are allocated (mm.c); for other memory virt_to_page() and
 	 * page_to_phys() are pure arithmetic, which is all streaming DMA mapping needs. */
 	vmemmap_base = 0xffffea0000000000UL; /* memory.rs VMEMMAP_BASE */
+	/* Linux's default vmalloc base (PML4 slot 402): Nova's vmap window (mm.c). */
+	vmalloc_base = 0xffffc90000000000UL; /* memory.rs VMAP_BASE */
 	lx_identify_cpu();
+	lx_emul_mm_init();
 }
 
-/* Nova has no vmalloc area: every kernel allocation is in the direct map. */
+/* vmalloc memory comes from Nova's heap, in the direct map; vmap()ed pages are mapped
+ * elsewhere, but nothing asks whether such an address is a vmalloc one. */
 bool is_vmalloc_addr(const void *x)
 {
 	return false;
@@ -262,6 +268,18 @@ int _printk(const char *fmt, ...)
 	return n;
 }
 
+void nova_console_notice(const char *fmt, ...)
+{
+	char buf[256];
+	va_list args;
+	int n;
+
+	va_start(args, fmt);
+	n = vscnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+	nova_console_line(buf, n);
+}
+
 static void lx_dev_printk(const char *level, const struct device *dev, const char *fmt, va_list ap)
 {
 	va_list args;
@@ -410,6 +428,22 @@ ktime_t ktime_get_with_offset(enum tk_offsets offs)
 	return nova_nanos();
 }
 
+ktime_t ktime_get_raw(void)
+{
+	return nova_nanos();
+}
+
+u64 ktime_get_mono_fast_ns(void)
+{
+	return nova_nanos();
+}
+
+/* Wall-clock seconds (RAS error records carry them), from Nova's RTC-based clock. */
+time64_t ktime_get_real_seconds(void)
+{
+	return nova_unix_time();
+}
+
 void ktime_get_snapshot_id(clockid_t clock_id, struct system_time_snapshot *systime_snapshot)
 {
 	memset(systime_snapshot, 0, sizeof(*systime_snapshot));
@@ -453,7 +487,12 @@ static void lx_identify_cpu(void)
 	boot_cpu_data.x86_capability[CPUID_1_ECX] = ecx;
 	boot_cpu_data.x86_clflush_size = 64;
 	boot_cpu_data.x86_cache_alignment = 64;
+	per_cpu(cpu_info, 0) = boot_cpu_data;
 }
+
+/* The per-CPU copy (cpu_data()) and topology, for one CPU. */
+DEFINE_PER_CPU_READ_MOSTLY(struct cpuinfo_x86, cpu_info);
+unsigned int __num_cores_per_package = 1;
 
 /* ---------------------------------------------------------------- locking */
 
@@ -496,6 +535,107 @@ void mutex_unlock(struct mutex *lock)
 bool mutex_is_locked(struct mutex *lock)
 {
 	return atomic_long_read(&lock->owner) != 0;
+}
+
+/* Decrement cnt; if it drops to 0, return true with the mutex held. */
+int atomic_dec_and_mutex_lock(atomic_t *cnt, struct mutex *lock)
+{
+	if (atomic_add_unless(cnt, -1, 1))
+		return 0;
+	mutex_lock(lock);
+	if (!atomic_dec_and_test(cnt)) {
+		mutex_unlock(lock);
+		return 0;
+	}
+	return 1;
+}
+
+/* Real-time mutexes: priority inheritance means nothing without preemption. */
+void __rt_mutex_init(struct rt_mutex *lock, const char *name, struct lock_class_key *key)
+{
+	lock->rtmutex.owner = NULL;
+}
+
+void rt_mutex_lock(struct rt_mutex *lock)
+{
+	while (cmpxchg(&lock->rtmutex.owner, NULL, current) != NULL)
+		nova_yield();
+}
+
+int rt_mutex_trylock(struct rt_mutex *lock)
+{
+	return cmpxchg(&lock->rtmutex.owner, NULL, current) == NULL;
+}
+
+void rt_mutex_unlock(struct rt_mutex *lock)
+{
+	WRITE_ONCE(lock->rtmutex.owner, NULL);
+}
+
+/*
+ * Wound/wait mutexes (dma_resv, DRM modeset locks): a mutex plus the acquire context
+ * holding it. A context that finds a lock taken by another context backs off with
+ * -EDEADLK when the algorithm says so: wait-die classes make the younger context die,
+ * wound-wait classes make the older one wound the holder, which then backs off at its
+ * next contended lock. Otherwise the waiter lets the holder run and retries.
+ */
+static int lx_ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
+{
+	if (ctx && READ_ONCE(lock->ctx) == ctx)
+		return -EALREADY;
+	if (ctx && !ctx->acquired)
+		ctx->wounded = 0;
+	while (!mutex_trylock(&lock->base)) {
+		struct ww_acquire_ctx *holder = READ_ONCE(lock->ctx);
+
+		if (ctx && holder) {
+			bool younger = (long)(ctx->stamp - holder->stamp) > 0;
+
+			if (ctx->is_wait_die) {
+				if (younger && ctx->acquired)
+					return -EDEADLK;
+			} else {
+				if (ctx->wounded && ctx->acquired)
+					return -EDEADLK;
+				if (!younger)
+					WRITE_ONCE(holder->wounded, 1);
+			}
+		}
+		nova_yield();
+	}
+	lock->ctx = ctx;
+	if (ctx)
+		ctx->acquired++;
+	return 0;
+}
+
+int ww_mutex_lock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
+{
+	return lx_ww_mutex_lock(lock, ctx);
+}
+
+int ww_mutex_lock_interruptible(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
+{
+	return lx_ww_mutex_lock(lock, ctx);
+}
+
+int ww_mutex_trylock(struct ww_mutex *lock, struct ww_acquire_ctx *ctx)
+{
+	if (!mutex_trylock(&lock->base))
+		return 0;
+	lock->ctx = ctx;
+	if (ctx)
+		ctx->acquired++;
+	return 1;
+}
+
+void ww_mutex_unlock(struct ww_mutex *lock)
+{
+	if (lock->ctx) {
+		lock->ctx->acquired--;
+		lock->ctx = NULL;
+	}
+	mutex_unlock(&lock->base);
 }
 
 static DEFINE_MUTEX(lx_rtnl_mutex);
@@ -601,13 +741,6 @@ int execute_with_initialized_rng(struct notifier_block *nb)
 }
 
 /* ---------------------------------------------------------------- odds and ends */
-
-/* Module parameters: drivers are built in and keep their defaults. */
-const struct kernel_param_ops param_ops_bool;
-const struct kernel_param_ops param_ops_int;
-const struct kernel_param_ops param_ops_uint;
-const struct kernel_param_ops param_ops_charp;
-const struct kernel_param_ops param_array_ops;
 
 /* vsprintf's %pG/%pGp/%pGv decoders: no flag names (printed as raw numbers). */
 const struct trace_print_flags gfpflag_names[] = { { 0, NULL } };

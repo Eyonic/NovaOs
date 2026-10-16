@@ -2,9 +2,10 @@
 # Build the Linux side of Nova's Linux driver layer: configure the Linux tree from
 # scripts/fetch-linux.sh with kernel/linuxkpi/nova.config, then let Kbuild compile the
 # objects in kernel/linuxkpi/linux-objects.txt and lx_emul (kernel/linuxkpi/lx_emul,
-# copied into the tree as nova/). The list of objects goes to build/linux/nova-objects.list,
-# which kernel/build.rs links into the kernel. scripts/build.sh runs this when FEATURES
-# contains linux-drivers.
+# copied into the tree as nova/). An entry ending in / is a whole directory: Kbuild builds
+# its built-in.a (a thin archive) and every object in it is linked. The list of objects
+# goes to build/linux/nova-objects.list, which kernel/build.rs links into the kernel.
+# scripts/build.sh runs this when FEATURES contains linux-drivers.
 source "$(dirname "$0")/common.sh"
 
 LINUX="$BUILD/linux"
@@ -55,5 +56,15 @@ arch=() rest=()
 for o in "${objects[@]}"; do [[ "$o" == arch/* ]] && arch+=("$o") || rest+=("$o"); done
 (( ${#arch[@]} )) && { make -C "$LINUX" ARCH=x86_64 -j1 "${arch[@]}" >>"$LOG" 2>&1 || fail "Linux objects failed to build (log: $LOG)"; }
 kmake "${rest[@]}" || fail "Linux objects failed to build (log: $LOG)"
-printf '%s\n' "${objects[@]/#/$LINUX/}" > "$LINUX/nova-objects.list"
-log "Linux objects ready ($LINUX/nova-objects.list)"
+# Directories: the members of their thin built-in.a archives (nested directories'
+# archives are flattened into them), as paths relative to the tree when ar runs there.
+list=()
+for o in "${objects[@]}"; do
+    if [[ "$o" == */ ]]; then
+        while IFS= read -r member; do list+=("$member"); done < <(cd "$LINUX" && ar t "${o}built-in.a")
+    else
+        list+=("$o")
+    fi
+done
+printf '%s\n' "${list[@]/#/$LINUX/}" > "$LINUX/nova-objects.list"
+log "Linux objects ready (${#list[@]} objects, $LINUX/nova-objects.list)"
