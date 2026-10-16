@@ -35,6 +35,8 @@ const COMMANDS: &[Command] = &[
     Command { name: "dmesg", args: "[text]", help: "kernel log (lines containing text)", run: cmd_dmesg },
     Command { name: "lspci", args: "", help: "PCI devices and their drivers", run: cmd_lspci },
     Command { name: "ifconfig", args: "", help: "network interface status", run: cmd_ifconfig },
+    Command { name: "audio", args: "", help: "sound output status (HD Audio)", run: cmd_audio },
+    Command { name: "tone", args: "<hz> <ms>", help: "play a sine tone on the sound output", run: cmd_tone },
     Command { name: "host", args: "<name>", help: "look up a host name (DNS)", run: cmd_host },
     Command { name: "fetch", args: "<url>", help: "HTTP GET a URL and print the response", run: cmd_fetch },
     Command { name: "disks", args: "", help: "disks, partitions and the mounted filesystem", run: cmd_disks },
@@ -311,6 +313,68 @@ fn cmd_lspci(_: &str, _: &History) {
         let d = &r.device;
         println!("{}  {:04x}:{:04x}  {:<26} {:<16} {status}", d.address, d.vendor, d.device, d.class_name(), pci::vendor_name(d.vendor));
     }
+}
+
+fn cmd_audio(_: &str, _: &History) {
+    println!("{}", drivers::hda::status());
+}
+
+/// sin(x) for x in [-pi, pi] (the tone generator keeps its phase there): a Taylor series.
+fn sine(x: f64) -> f64 {
+    let x2 = x * x;
+    let mut term = x;
+    let mut sum = x;
+    for n in 1..10 {
+        term = -term * x2 / ((2 * n) * (2 * n + 1)) as f64;
+        sum += term;
+    }
+    sum
+}
+
+fn cmd_tone(args: &str, _: &History) {
+    let mut it = args.split_whitespace().map(|a| a.parse::<u32>());
+    let (Some(Ok(hz)), Some(Ok(ms))) = (it.next(), it.next()) else {
+        println!("usage: tone <hz> <ms>");
+        return;
+    };
+    if !drivers::hda::present() {
+        println!("tone: no sound output");
+        return;
+    }
+    let rate = drivers::hda::RATE as u64;
+    let total = rate * ms.min(60_000) as u64 / 1000;
+    let pi = core::f64::consts::PI;
+    let step = 2.0 * pi * hz.min(20_000) as f64 / rate as f64;
+    let mut phase = 0.0;
+    let mut frame = 0u64;
+    let mut chunk: Vec<i16> = Vec::with_capacity(2048);
+    let mut pending = 0;
+    while frame < total || pending < chunk.len() {
+        if pending == chunk.len() {
+            chunk.clear();
+            pending = 0;
+            while chunk.len() < 2048 && frame < total {
+                // Half amplitude, with 5 ms fades so the start and end do not click.
+                let fade = (frame.min(total - frame) as f64 / (rate / 200) as f64).min(1.0);
+                let s = (sine(phase) * 16000.0 * fade) as i16;
+                chunk.extend_from_slice(&[s, s]);
+                frame += 1;
+                phase += step;
+                if phase > pi {
+                    phase -= 2.0 * pi;
+                }
+            }
+        }
+        let n = drivers::hda::write(&chunk[pending..]);
+        pending += n;
+        if n == 0 {
+            task::sleep_ticks(5);
+        }
+    }
+    while drivers::hda::queued() > 0 {
+        task::sleep_ticks(5);
+    }
+    println!("tone: {hz} Hz for {ms} ms");
 }
 
 fn cmd_ifconfig(_: &str, _: &History) {

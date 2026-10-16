@@ -111,6 +111,23 @@ if compgen -G "$USERLAND_SRC/wayland/*.c" >/dev/null && command -v wayland-scann
         done
     done
 fi
+# PulseAudio clients (userland/pulse/): libpulse-simple, if the host has it; plus the
+# host's pactl, to inspect Nova's sound server (sinks, server info) with the real library.
+if compgen -G "$USERLAND_SRC/pulse/*.c" >/dev/null && [[ -f /usr/include/pulse/simple.h ]]; then
+    for src in "$USERLAND_SRC"/pulse/*.c; do
+        name="$(basename "${src%.*}")"
+        "${CC:-gcc}" -O2 -Wall -o "$USERLAND_OUT/$name" "$src" -lpulse-simple -lpulse -lm >>"$BUILD_LOG" 2>&1 || fail "compiling $src failed (needs libpulse; log: $BUILD_LOG)"
+        strip "$USERLAND_OUT/$name"
+    done
+    [[ -x /usr/bin/pactl ]] && cp /usr/bin/pactl "$USERLAND_OUT/pactl"
+    for prog in "$USERLAND_OUT"/patone "$USERLAND_OUT"/pactl; do
+        [[ -f "$prog" ]] || continue
+        for lib in $(ldd "$prog" | awk '/=> \//{print $3}'); do
+            mkdir -p "$SYSROOT$(dirname "$lib")"
+            cp -L "$lib" "$SYSROOT$lib"
+        done
+    done
+fi
 # X11 clients (userland/x11/): Xlib, if the host has it.
 if compgen -G "$USERLAND_SRC/x11/*.c" >/dev/null && [[ -f /usr/include/X11/Xlib.h ]]; then
     for src in "$USERLAND_SRC"/x11/*.c; do
@@ -184,11 +201,11 @@ if [[ ",${FEATURES:-}," == *,linux-drivers,* && -d /usr/lib/firmware/rtl_nic ]];
     log "Including Realtek NIC firmware ($(ls "$SYSROOT/usr/lib/firmware/rtl_nic" | wc -l) files)"
 fi
 
-# PulseAudio clients (Steam): Nova has no sound server yet, and each failed connection
-# attempt reserves a shared memory pool (64 MiB by default; Steam's 32-bit client retries
-# every fraction of a second until it runs out of address space). Keep the pools small.
+# PulseAudio clients (Steam): each connection reserves a shared memory pool (64 MiB by
+# default), which Nova's server never uses (audio comes over the socket), and Steam's
+# 32-bit client could run out of address space. Keep the pools small; never autospawn.
 mkdir -p "$SYSROOT/etc/pulse"
-printf 'shm-size-bytes = 262144\n' > "$SYSROOT/etc/pulse/client.conf"
+printf 'shm-size-bytes = 262144\nautospawn = no\n' > "$SYSROOT/etc/pulse/client.conf"
 # The rest of glibc (64- and 32-bit): libraries that older programs and Steam's runtime
 # link (libdl, librt, libpthread are stubs in today's glibc), and /bin/bash.
 for dir in /usr/lib /usr/lib32; do

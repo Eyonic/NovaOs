@@ -56,6 +56,10 @@ impl Address {
         (self.read32(offset) >> ((offset & 3) * 8)) as u8
     }
 
+    pub fn write8(&self, offset: u8, value: u8) {
+        config_write(self.bus, self.devfn(), offset as u16, 1, value as u32)
+    }
+
     pub fn write16(&self, offset: u8, value: u16) {
         let shift = (offset & 2) * 8;
         let old = self.read32(offset) & !(0xFFFF << shift);

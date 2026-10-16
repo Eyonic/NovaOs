@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -50,7 +50,7 @@ CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
 # MOCK=1: run with the mock Anthropic API and fail on any protocol violation it logs.
 define_case() {
     EXPECT=() CONTAINS=() FORBID=("$PANIC" "$EXC" "NESTED") CHECK_RIP=0 CMDLINE="nova.test=$1"
-    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET="" SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000 BOOT_DEVICE=sata MACHINE_OPTS="" VMPORT=on
+    INPUT=() FINAL_PROMPT=1 QEMU_EXTRA=() EXPECT_EXIT=0 MOCK=0 BOOT_IMAGE="" FRESH_TARGET="" AUDIO_CHECK=() SKIP="" CASE_TIMEOUT=$TIMEOUT NIC=e1000 BOOT_DEVICE=sata MACHINE_OPTS="" VMPORT=on
     local fault=("$EXC" "$STATUS" "$HALTED")
     local fault_forbid=("$PANIC" "$SHELL_START" "NESTED")
     local shell=("$EXPECTED_BANNER" "$STATUS" "$SHELL_START")
@@ -72,33 +72,33 @@ define_case() {
         setup)  # First boot from the live image: drivers, Claude login, driver porting, installation.
                 CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT"; MOCK=1; EXPECT_EXIT=1
                 FRESH_TARGET=target.img
-                QEMU_EXTRA=(-drive "format=raw,file=${run_dir:-}/target.img" -device ich9-intel-hda)
+                QEMU_EXTRA=(-drive "format=raw,file=${run_dir:-}/target.img" -device AC97)
                 INPUT=("wait:  API key: " "ser:$TEST_KEY" "wait:Install Nova on disk 1? [Y/n]" "raw:y")
                 EXPECT=("$EXPECTED_BANNER" "Setting up this computer" "$CLAUDE_BOX"
-                        "Porting drivers with Claude" "⏺ PciConfig(00:03.0)" "⏺ Write(drivers/intel_hda.rs)"
+                        "Porting drivers with Claude" "⏺ PciConfig(00:03.0)" "⏺ Write(drivers/ac97.rs)"
                         "  ✓ Nova is installed. Your settings and files were copied." "[nova] rebooting")
                 CONTAINS=("e1000  Intel 82540EM" "sata1 (QEMU HARDDISK) 2048 MiB"
-                          "Intel HD audio controller  no driver yet" "✓ Signed in." "network: online, address 10.0.2.15/24")
+                          "Intel audio device         no driver yet" "✓ Signed in." "network: online, address 10.0.2.15/24")
                 FORBID=("$PANIC" "$EXC" "API error") ;;
         installed) # Boot the disk the setup case installed: desktop, Claude Code builds an app.
                 CMDLINE=""; MOCK=1; BOOT_IMAGE="${run_dir:-}/target.img"
-                QEMU_EXTRA=(-device ich9-intel-hda)
+                QEMU_EXTRA=(-device AC97)
                 INPUT=("wait:$CLAUDE_BOX" "wait:> " "ser:make me a clock app" "wait:Your clock app is ready"
                        "sleep:2" "key:meta_l" "sleep:1" "key:up" "key:up" "key:up" "key:ret" "sleep:3" "dump:terminal.ppm")
                 EXPECT=("$EXPECTED_BANNER" "$CLAUDE_BOX" "> make me a clock app" "⏺ Write(apps/clock.rhai)"
                         "⏺ CheckApp(apps/clock.rhai)" "  ⎿  OK, screenshot attached" "⏺ Launch(apps/clock.rhai)")
-                CONTAINS=("storage: installed system, NovaFS on sata0" "Rust port drafted by Claude (drivers/intel_hda.rs)"
+                CONTAINS=("storage: installed system, NovaFS on sata0" "Rust port drafted by Claude (drivers/ac97.rs)"
                           "Your clock app is ready")
                 FORBID=("$PANIC" "$EXC" "API error" "  API key: ") ;;
         hostlogin) # First boot with the host's `ant auth login` token passed in via fw_cfg (as
                 # scripts/run.sh does): no key prompt, requests use Bearer + the OAuth beta.
                 CMDLINE="nova.claude_api=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1
                 [[ -n "${run_dir:-}" ]] && printf 'oauth\nnova-oauth-test-token\nant auth login on the host\n' >"$run_dir/host-credential"
-                QEMU_EXTRA=(-fw_cfg "name=opt/nova/claude-credential,file=${run_dir:-}/host-credential" -device ich9-intel-hda)
+                QEMU_EXTRA=(-fw_cfg "name=opt/nova/claude-credential,file=${run_dir:-}/host-credential" -device AC97)
                 # Signed in twice: first-boot setup, then Claude Code on the desktop.
                 INPUT=("wait:✓ Signed in with your Anthropic CLI login" "wait:Starting the desktop"
                        "wait:✓ Signed in with your Anthropic CLI login" "wait:> ")
-                EXPECT=("$EXPECTED_BANNER" "$CLAUDE_BOX" "Porting drivers with Claude" "⏺ PciConfig(00:03.0)" "⏺ Write(drivers/intel_hda.rs)")
+                EXPECT=("$EXPECTED_BANNER" "$CLAUDE_BOX" "Porting drivers with Claude" "⏺ PciConfig(00:03.0)" "⏺ Write(drivers/ac97.rs)")
                 CONTAINS=("✓ Signed in with your Anthropic CLI login (ant auth login on the host)." "Starting the desktop")
                 FORBID=("$PANIC" "$EXC" "API error" "  API key: " "not usable") ;;
         deepseek) # DeepSeek as the provider (key passed in like scripts/run.sh does): Nova Assistant
@@ -106,7 +106,7 @@ define_case() {
                 # checks DeepSeek's rules (model, effort levels, screenshots beside tool results).
                 CMDLINE="nova.deepseek_api=http://10.0.2.2:$MOCK_PORT/anthropic nova.comfyui=http://10.0.2.2:$MOCK_PORT nova.install=no"; MOCK=1
                 [[ -n "${run_dir:-}" ]] && printf 'deepseek-key\nsk-deepseek-test-0123456789\nDEEPSEEK_API_KEY on the host\n' >"$run_dir/deepseek-credential"
-                QEMU_EXTRA=(-fw_cfg "name=opt/nova/claude-credential,file=${run_dir:-}/deepseek-credential" -device ich9-intel-hda)
+                QEMU_EXTRA=(-fw_cfg "name=opt/nova/claude-credential,file=${run_dir:-}/deepseek-credential" -device AC97)
                 INPUT=("wait:✓ Signed in with a DeepSeek API key" "wait:Starting the desktop"
                        "wait:✓ Signed in with a DeepSeek API key" "wait:> " "ser:make me a clock app" "wait:Your clock app is ready"
                        "wait:> " "ser:/clear" "wait:conversation cleared" "ser:make a poster image" "wait:Poster image ready.")
@@ -254,6 +254,29 @@ define_case() {
                 CONTAINS=("storage: installed system, NovaFS on nvme0 (QEMU NVMe Ctrl, namespace 1) partition 2"
                           "(installed system)")
                 FORBID=("$PANIC" "$EXC" "NESTED") ;;
+        audio)  # Sound: Nova's HD Audio driver on QEMU's ICH6 controller with a duplex codec,
+                # recorded by QEMU's wav backend. A tone from the shell, then libpulse programs
+                # through Nova's PulseAudio server (s16le 48 kHz; float32le 44.1 kHz, converted
+                # and resampled), and pactl; afterwards the WAV must hold exactly those tones.
+                CMDLINE="nova.mode=shell"
+                [[ -f /usr/include/pulse/simple.h ]] || SKIP="libpulse not installed on the host"
+                QEMU_EXTRA=(-audiodev "wav,id=snd0,out.frequency=48000,path=${run_dir:-}/audio.wav" -device intel-hda -device hda-duplex,audiodev=snd0)
+                INPUT=("wait:$PROMPT" "ser:audio" "wait:48 kHz 16-bit stereo" "ser:tone 440 600" "wait:tone: 440 Hz"
+                       "sleep:1" "ser:patone 1000 600" "wait:patone: played 1000" "sleep:1"
+                       "ser:patone 660 600 float 44100" "wait:patone: played 660" "ser:pactl info" "wait:Default Sink:"
+                       "ser:pactl list sinks short" "wait:nova-hda")
+                EXPECT=("${shell[@]}" "tone: 440 Hz for 600 ms" "Default Sink: nova_output")
+                CONTAINS=("hda  QEMU 1af4:" "line out" "patone: played 1000 Hz for 600 ms (s16le, 48000 Hz)"
+                          "patone: played 660 Hz for 600 ms (float32le, 44100 Hz)" "s16le 2ch 48000Hz")
+                FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "failed:" "Connection failure")
+                AUDIO_CHECK=("${run_dir:-}/audio.wav" 440:600 1000:600 660:600) ;;
+        audioich9) # The same driver on QEMU's ICH9 controller with an output-only codec: a tone.
+                CMDLINE="nova.mode=shell"
+                QEMU_EXTRA=(-audiodev "wav,id=snd0,out.frequency=48000,path=${run_dir:-}/audio-ich9.wav" -device ich9-intel-hda -device hda-output,audiodev=snd0)
+                INPUT=("wait:$PROMPT" "ser:tone 880 500" "wait:tone: 880 Hz" "ser:audio" "wait:idle")
+                EXPECT=("${shell[@]}" "tone: 880 Hz for 500 ms")
+                CONTAINS=("hda  QEMU 1af4:" "line out")
+                AUDIO_CHECK=("${run_dir:-}/audio-ich9.wav" 880:500) ;;
         linuxmsi) # Linux's e1000e driver on an Intel 82574 (Nova's own e1000 driver switched off):
                 # MSI-X interrupts through the local APIC, then DHCP, DNS and TCP.
                 CMDLINE="nova.mode=shell nova.disable_driver=e1000"; MOCK=1; NIC=e1000e
@@ -526,6 +549,11 @@ run_case() {
     exec {SERIAL_FD}>&- {MONITOR_FD}>&-
     wait "${cat_pids[@]}" 2>/dev/null || true
     rm -rf -- "$fifo"
+
+    if [[ $verdict == pass && ${#AUDIO_CHECK[@]} -gt 0 ]]; then
+        # QEMU has exited, so the WAV file is complete.
+        python3 "$ROOT/scripts/check_audio.py" "${AUDIO_CHECK[@]}" | sed 's/^/  /' || verdict=fail why="the recorded audio did not match"
+    fi
 
     echo "  ----- serial output -----"
     clean | grep -v -e '^$' -e '^BdsDxe' | sed 's/^/  | /'

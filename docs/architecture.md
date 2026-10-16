@@ -235,6 +235,7 @@ is kept for `lspci`, System Monitor and Claude.
 |---|---|---|
 | Intel 8254x/82574 Ethernet | `drivers/e1000.rs` | legacy descriptors, 64-entry rings, polled |
 | AHCI SATA controller | `drivers/ahci.rs` | IDENTIFY, READ/WRITE DMA EXT, one command slot, polled |
+| HD Audio controller and codecs | `drivers/hda.rs` | CORB/RIRB verbs, widget-graph walk to every output pin, one 48 kHz stereo output stream over a cyclic BDL, polled; see [audio.md](audio.md) |
 | NVMe SSD controller | `drivers/nvme.rs` | admin + one I/O queue pair, PRP lists, every active namespace a disk, 4 KiB-block drives via read-modify-write, polled |
 | PS/2 keyboard and mouse | `keyboard.rs`, `mouse.rs` | scan code set 1; VMware vmmouse backdoor for absolute pointing |
 | 16550 UART | `serial.rs` | polled output, IRQ input |
@@ -656,7 +657,8 @@ All cases run the same kernel binary. `scripts/mkimage.sh` adds `cmdline: nova.t
 | `net` | `nettest 10.0.2.2:<mock port>` | glibc DNS and a TCP HTTP exchange through the Linux socket layer |
 | `chromium` | `chrome-headless-shell --screenshot` of a `data:` URL | the Chromium engine starts, renders and writes the PNG (skipped if Chromium was not downloaded) |
 | `browser` | desktop; "open the test page" typed to Claude Code (mock API) | Claude calls `open_url`, Nova Browser starts Chromium, Chromium fetches the page from the host, Shields blocks its Google Analytics script (skipped without Chromium) |
-| `setup` | live image + empty 2 GiB disk + an Intel HD Audio device; API key typed over serial; `y` to install | drivers bound, login against the mock API, Claude ports the audio driver, installation, reboot (QEMU exits) |
+| `setup` | live image + empty 2 GiB disk + an AC'97 audio device (no Nova driver); API key typed over serial; `y` to install | drivers bound, login against the mock API, Claude ports the audio driver, installation, reboot (QEMU exits) |
+| `audio`, `audioich9` | `tone`, `patone` (libpulse) and `pactl` with QEMU's ICH6/ICH9 HD Audio recorded to a WAV file | the WAV holds exactly the expected tones at the right frequency and length, without discontinuities (`scripts/check_audio.py`); `pactl` sees the `nova_output` sink |
 | `hostlogin` | live image with an OAuth token passed in via fw_cfg, as `run.sh` does; `nova.install=no` | no key prompt; sign-in, driver porting and the desktop session use Bearer + the OAuth beta (the mock rejects anything else) |
 | `installed` | boots the disk `setup` installed; "make me a clock app" over serial | installed-system boot, no login prompt, ported driver recognised, Claude writes, checks (PNG) and launches an app |
 
@@ -686,7 +688,7 @@ Shift makes `keyboard` fail.
 
 ## Not included (by design)
 
-No SMP, USB, audio, GPU acceleration, or Wi-Fi yet (see docs/linux-drivers.md for the plan). Interrupts go through the local APIC and I/O APIC when ACPI describes them (uACPI), else the 8259 PIC; Nova's own Rust drivers are polled. The
+No SMP, USB, audio input, GPU acceleration, or Wi-Fi yet (see docs/linux-drivers.md for the plan). Interrupts go through the local APIC and I/O APIC when ACPI describes them (uACPI), else the 8259 PIC; Nova's own Rust drivers are polled. The
 compatibility layer has no IPv6 or server sockets yet (fork, execve, wait and signals: process.rs, signal.rs). Kernel code
 (drivers, desktop, Rhai apps, the browser shell) shares one address space; Linux programs run in
 user mode. Rhai apps are not sandboxed from the filesystem.
