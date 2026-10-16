@@ -10,7 +10,10 @@
 //! arrow keys + Enter all work.
 //!
 //! Artwork: `usr/share/nova/home/<name>.png` system files (generated images, see
-//! assets/home/README.md); items without artwork get a procedural poster.
+//! assets/README.md): a portrait capsule per item for the cards and a wide
+//! `hero_<name>.png` for the backdrop, composed with its subject on the right so the
+//! title, description and Open button sit on empty space. Items without artwork get a
+//! procedural poster.
 //!
 //! Typing on Home searches: the query shows in the header and the shelves are
 //! replaced by one row of matches across every tab (Escape clears it).
@@ -166,6 +169,11 @@ fn art(name: &str) -> Option<Arc<Canvas>> {
     c
 }
 
+/// The wide backdrop artwork for an item (`hero_<name>.png`), or its capsule if there is none.
+fn hero(name: &str) -> Option<Arc<Canvas>> {
+    art(&format!("hero_{name}")).or_else(|| art(name))
+}
+
 /// Latest rendered frame per app path.
 static PREVIEWS: SpinLock<Vec<(String, u64, Arc<Canvas>)>> = SpinLock::new(Vec::new());
 /// The app the preview task should render next.
@@ -206,15 +214,36 @@ fn hash(s: &str) -> u32 {
     s.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619))
 }
 
-/// Scale `src` to cover `w`x`h` (cropping the overflow, centred).
+/// Scale `src` to cover `w`x`h` (cropping the overflow, centred). Shrinking box-filters
+/// (`blit_scaled`); enlarging, which only the full-screen backdrop does, samples
+/// bilinearly so the artwork stays smooth instead of blocky.
 fn cover(src: &Canvas, w: i32, h: i32) -> Canvas {
     let (sw, sh) = (src.width as i64, src.height as i64);
     let (cw, ch) = if sw * h as i64 > sh * w as i64 { (sh * w as i64 / h as i64, sh) } else { (sw, sw * h as i64 / w as i64) };
-    let (cx, cy) = (((sw - cw) / 2) as i32, ((sh - ch) / 2) as i32);
-    let mut crop = Canvas::new(cw as usize, ch as usize);
-    crop.blit(src, Rect::new(cx, cy, cw as i32, ch as i32), 0, 0);
+    let (cx, cy) = ((sw - cw) / 2, (sh - ch) / 2);
     let mut out = Canvas::new(w as usize, h as usize);
-    out.blit_scaled(&crop, out.bounds(), 0, 255);
+    if cw >= w as i64 {
+        let mut crop = Canvas::new(cw as usize, ch as usize);
+        crop.blit(src, Rect::new(cx as i32, cy as i32, cw as i32, ch as i32), 0, 0);
+        out.blit_scaled(&crop, out.bounds(), 0, 255);
+        return out;
+    }
+    // 24.8 fixed point source coordinates of each output pixel's centre.
+    let pos = |o: i32, n: i32, c: i64, off: i64, limit: i64| -> (usize, u32) {
+        let p = (((2 * o as i64 + 1) * c * 256) / (2 * n as i64) - 128 + off * 256).clamp(0, (limit - 1) * 256);
+        ((p >> 8) as usize, (p & 255) as u32)
+    };
+    for y in 0..h {
+        let (y0, fy) = pos(y, h, ch, cy, sh);
+        let y1 = (y0 + 1).min(sh as usize - 1);
+        for x in 0..w {
+            let (x0, fx) = pos(x, w, cw, cx, sw);
+            let x1 = (x0 + 1).min(sw as usize - 1);
+            let top = blend(src.pixels[y0 * src.width + x0], src.pixels[y0 * src.width + x1], fx);
+            let bottom = blend(src.pixels[y1 * src.width + x0], src.pixels[y1 * src.width + x1], fx);
+            out.pixels[y as usize * w as usize + x as usize] = blend(top, bottom, fy);
+        }
+    }
     out
 }
 
@@ -269,7 +298,8 @@ fn make_poster(item: &Item, w: i32, h: i32) -> Canvas {
             c
         }
     };
-    scrim(&mut c, h / 3, 230);
+    // The capsules keep their bottom quarter quiet for the title; the scrim covers it.
+    scrim(&mut c, h * 2 / 5, 230);
     let size: u16 = if w > CARD_W { 22 } else { 19 };
     let size = if font::width(&item.title, size, Weight::Bold) <= w - 28 { size } else { size - 4 };
     let ty = h - font::line_height(size) - 10;
@@ -437,22 +467,22 @@ impl Home {
             });
         }
 
-        let power = |title: &str, about: &str, action: Action| Item {
+        let power = |title: &str, about: &str, art: &'static str, action: Action| Item {
             title: title.into(),
             category: "System",
             about: about.into(),
             meta: String::new(),
             icon: 'o',
-            color: 0x4C5470,
-            art: Some("power"),
+            color: 0x5B4FA8,
+            art: Some(art),
             kind: Kind::Other,
             action,
         };
         rows.push(Row {
             title: "System",
             items: alloc::vec![
-                power("Restart", "Restart the computer.", Action::Reboot),
-                power("Shut down", "Turn the computer off.", Action::Shutdown),
+                power("Restart", "Restart the computer.", "restart", Action::Reboot),
+                power("Shut down", "Turn the computer off.", "shutdown", Action::Shutdown),
             ],
             scroll: 0,
         });
@@ -922,27 +952,31 @@ impl Home {
         let (w, h) = (self.width, self.height);
         let item = self.selected().cloned();
 
-        // Backdrop: the focused item's artwork across the whole screen, darkened, with a
-        // fade to the shelves and a darker left side under the hero text.
+        // Backdrop: the focused item's hero artwork across the whole screen. The art
+        // keeps its subject on the right, so the darkening is light overall, a gradient
+        // on the left under the hero text, and a fade down to the shelves.
         let key = item.as_ref().map_or(String::new(), |i| i.key());
         if self.backdrop.as_ref().is_none_or(|(k, _)| *k != key) {
-            let mut c = match item.as_ref().and_then(|i| i.art).and_then(art) {
-                Some(a) => cover(&a, w, h),
+            let (mut c, generated) = match item.as_ref().and_then(|i| i.art).and_then(hero) {
+                Some(a) => (cover(&a, w, h), false),
                 // No artwork: the wallpaper, tinted towards the item's colour.
                 None => {
                     let mut c = self.background.clone();
                     if let Some(i) = &item {
                         c.blend_rect(c.bounds(), darken(i.color, 100), 60);
                     }
-                    c
+                    (c, true)
                 }
             };
-            c.blend_rect(c.bounds(), BG, 120);
+            c.blend_rect(c.bounds(), BG, if generated { 120 } else { 70 });
             for x in 0..w * 3 / 5 {
-                let t = 200 - (x * 200 / (w * 3 / 5)) as u32;
+                let t = 190 - (x * 190 / (w * 3 / 5)) as u32;
                 c.blend_rect(Rect::new(x, 0, 1, h), BG, t);
             }
             scrim(&mut c, TOP_BAR + HERO_H / 2, 250);
+            // The shelves sit on the lower half: a second, steeper fade there keeps the
+            // cards and row titles legible on bright art while the hero stays vivid above.
+            scrim(&mut c, TOP_BAR + HERO_H, 150);
             self.backdrop = Some((key, c));
         }
         if let Some((_, c)) = &self.backdrop {
@@ -993,8 +1027,15 @@ impl Home {
             scene.shadow_round(panel, 12, 20, 110);
             scene.fill_round_rect(Rect::new(panel.x - 2, panel.y - 2, panel.w + 4, panel.h + 4), 12, 0x2A2C3E);
             if !Self::draw_live(scene, &item, panel, 10) {
-                let i = self.poster(&item, true);
-                scene.blit_scaled(&self.posters[i].2, panel, 10, 255);
+                // Until the first preview frame: the wide hero art (cropped to the panel),
+                // or the generated poster for items without art.
+                match item.art.and_then(hero) {
+                    Some(a) => scene.blit_scaled(&cover(&a, panel.w, panel.h), panel, 10, 255),
+                    None => {
+                        let i = self.poster(&item, true);
+                        scene.blit_scaled(&self.posters[i].2, panel, 10, 255);
+                    }
+                }
             }
             // A quiet "live" pill: a green dot, not a red banner.
             let badge = if matches!(item.kind, Kind::Window(_)) { "Live" } else { "Preview" };
