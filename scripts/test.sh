@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput drm audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -227,7 +227,20 @@ define_case() {
                 EXPECT=("${shell[@]}" "nettest: 10.0.2.2 resolves to 10.0.2.2" "nettest: connected")
                 CONTAINS=("linux/8139cp  Linux " "[nova] linux: eth0: link up" "network: online, address 10.0.2.15/24"
                           "nettest: HTTP/1.1 404 Not Found" "[nova] linux: parameter amdgpu.dc=0")
-                FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed") ;;
+                # Without nova.vkms=1 / nova.vgem=1 no software GPU appears.
+                FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "kfree of unknown pointer" "probe failed" "[drm] Initialized") ;;
+        drm)    # The user-space GPU path: Linux programs drive Linux's DRM drivers through
+                # /dev/dri (vkms: a virtual display, vgem: GEM buffers and fences, both only
+                # created on request). KMS, dumb buffers, atomic page flips and vblank events,
+                # PRIME between the two, fences through sync files, descriptors passed across
+                # processes; then the same from a 32-bit program (compat_ioctl).
+                CMDLINE="nova.mode=shell nova.vkms=1 nova.vgem=1"
+                [[ ",${FEATURES:-}," == *,linux-drivers,* ]] || SKIP="kernel built without FEATURES=linux-drivers"
+                INPUT=("wait:$PROMPT" "ser:drmtest" "wait: failed" "ser:drmtest32" "wait: failed" "ser:drmtest" "wait: failed")
+                EXPECT=("${shell[@]}" "drmtest: 48 passed, 0 failed" "drmtest32: 13 passed, 0 failed")
+                CONTAINS=("[drm] Initialized vgem 1.0.0 for vgem on minor 0" "[drm] Initialized vkms 1.0.0 for vkms on minor 1"
+                          "atomic page flips paced by vblank" "poll(sync file) wakes when another process signals the fence")
+                FORBID=("$PANIC" "$EXC" "NESTED" "FAIL " "segmentation fault" "kfree of unknown pointer" "timed out" "driver mapping") ;;
         usbinput) # The Linux USB stack: xHCI, USB core, HID and the input core, bridged to Nova's
                 # keyboard and mouse. The machine has no PS/2 controller, so every keystroke the
                 # shell sees comes through the USB keyboard.
