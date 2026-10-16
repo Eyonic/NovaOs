@@ -44,6 +44,7 @@ The stick shows a boot menu for 5 seconds; the first entry boots when no key is 
 | **Nova (safe graphics)** | the default, and right for the **first boot**. The Radeon driver (`amdgpu`) starts the GPU but leaves the display alone (`amdgpu.dc=0`), so the firmware's screen stays visible |
 | Nova | the full driver, display included. The screen may go dark when amdgpu takes the display over: Nova cannot hand scan-out back to its desktop yet |
 | Nova (no GPU driver) | if a boot hangs at the "amdgpu" line (`nova.disable_driver=amdgpu`) |
+| Nova (safe graphics, one CPU) | if a boot hangs or crashes after the "smp:" line: only the boot CPU, as before SMP (`nova.cpus=1`) |
 
 Nova shows "Setting up this computer" with one line per PCI device and the driver that
 took it, then (with `nova.mode=shell` or from the desktop's terminal) the shell.
