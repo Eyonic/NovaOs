@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 /*
  * lx_emul files: struct file objects, inodes and dentries for the pseudo file systems
- * DRM and dma-buf use (anonymous inodes, kern_mount), a file descriptor table, shmem
- * files for TTM's swap storage, and the few seq_file and mmap entry points they need.
+ * DRM and dma-buf use (anonymous inodes, kern_mount), shmem files for TTM's swap
+ * storage, and the few seq_file entry points they need.
  *
  * DRM hands out file descriptors for buffers (PRIME), fences (sync files) and leases;
  * dma-buf ties a buffer's lifetime to its file. The objects here are real struct files
  * with Linux's reference counting and release order (f_op->release, then the dentry's
- * d_release, then the inode), so Nova's Linux-program fd layer can later wrap them. For
- * now the descriptor table is kernel-internal: nothing in user space sees these numbers.
+ * d_release, then the inode). Their file descriptors are Linux programs' own (user.c).
  *
  * shmem files keep their pages in the mapping's xarray, in RAM: Nova has no swap, so
  * "writing out" a page only unlocks it.
@@ -82,6 +81,12 @@ void iput(struct inode *inode)
 		lx_shmem_truncate(inode->i_mapping, 0, ULONG_MAX);
 	xa_destroy(&inode->i_data.i_pages);
 	kfree(inode);
+}
+
+/* Nova's Linux files keep no times (fstat reports none for them). */
+int file_update_time(struct file *file)
+{
+	return 0;
 }
 
 void inode_set_bytes(struct inode *inode, loff_t bytes)
@@ -329,61 +334,6 @@ loff_t default_llseek(struct file *file, loff_t offset, int whence)
 	return offset;
 }
 
-/* ---------------------------------------------------------------- file descriptors */
-
-/* One table for the whole kernel until Linux programs can receive these files. */
-#define LX_FDS 256
-static struct file *lx_fds[LX_FDS];
-static DECLARE_BITMAP(lx_fd_used, LX_FDS);
-static DEFINE_SPINLOCK(lx_fd_lock);
-
-int get_unused_fd_flags(unsigned flags)
-{
-	unsigned int fd;
-
-	spin_lock(&lx_fd_lock);
-	fd = find_next_zero_bit(lx_fd_used, LX_FDS, 3);
-	if (fd < LX_FDS)
-		__set_bit(fd, lx_fd_used);
-	spin_unlock(&lx_fd_lock);
-	return fd < LX_FDS ? fd : -EMFILE;
-}
-
-void put_unused_fd(unsigned int fd)
-{
-	if (fd < LX_FDS)
-		clear_bit(fd, lx_fd_used);
-}
-
-void fd_install(unsigned int fd, struct file *file)
-{
-	if (WARN_ON(fd >= LX_FDS))
-		return;
-	spin_lock(&lx_fd_lock);
-	lx_fds[fd] = file;
-	spin_unlock(&lx_fd_lock);
-}
-
-struct file *fget(unsigned int fd)
-{
-	struct file *file = NULL;
-
-	spin_lock(&lx_fd_lock);
-	if (fd < LX_FDS && lx_fds[fd]) {
-		file = lx_fds[fd];
-		get_file(file);
-	}
-	spin_unlock(&lx_fd_lock);
-	return file;
-}
-
-struct fd fdget(unsigned int fd)
-{
-	struct file *file = fget(fd);
-
-	return file ? CLONED_FD(file) : EMPTY_FD;
-}
-
 /* ---------------------------------------------------------------- shmem */
 
 static int lx_shmem_release(struct inode *inode, struct file *file)
@@ -462,6 +412,13 @@ void shmem_truncate_range(struct inode *inode, loff_t start, uoff_t end)
 	lx_shmem_truncate(inode->i_mapping, start >> PAGE_SHIFT, end >> PAGE_SHIFT);
 }
 
+/* Dropping clean page-cache pages: shmem pages here are only freed by truncation
+ * (drm_gem_shmem purges with shmem_truncate_range first), so there is nothing else. */
+unsigned long invalidate_mapping_pages(struct address_space *mapping, pgoff_t start, pgoff_t end)
+{
+	return 0;
+}
+
 /* No swap: the page stays where it is. Like a successful writeout, unlock it. */
 int shmem_writeout(struct folio *folio, struct swap_iocb **plug, struct list_head *folio_list)
 {
@@ -498,28 +455,12 @@ void *vmemdup_user(const void __user *src, size_t len)
 	return p;
 }
 
-/*
- * Mapping GPU buffers into Linux programs comes with DRM's user interface (milestone 8).
- * Until then no Linux file here is ever mmap()ed, so there is nothing to zap and no
- * fault to serve.
- */
-void unmap_mapping_range(struct address_space *mapping, loff_t const holebegin, loff_t const holelen,
-			 int even_cows)
-{
-}
-
 void vma_set_file(struct vm_area_struct *vma, struct file *file)
 {
 	get_file(file);
 	swap(vma->vm_file, file);
 	if (file)
 		fput(file);
-}
-
-vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr, unsigned long pfn,
-			       pgprot_t pgprot)
-{
-	return VM_FAULT_SIGBUS;
 }
 
 unsigned long mm_get_unmapped_area(struct file *filp, unsigned long addr, unsigned long len,

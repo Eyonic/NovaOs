@@ -13,6 +13,8 @@
 
 #include <linux/types.h>
 
+struct device;
+
 /* Slab caches: lx_emul keeps only what allocation needs (base.c, support.c). */
 struct kmem_cache {
 	const char *name;
@@ -115,6 +117,69 @@ bool nova_lx_netdev_tx_ready(void *dev);
 /* 0 = queued, 1 = queue full (try again later), negative = dropped. */
 int nova_lx_netdev_xmit(void *dev, const u8 *frame, size_t len);
 
+/* Linux files for Linux programs (user.c, called from kernel/src/linux/lxfile.rs). */
+struct lx_ufile;
+struct lx_vma;
+struct page;
+struct file;
+
+/* What Nova needs to show a device node in /dev and /sys (lxfile.rs keeps the layout). */
+struct nova_devnode {
+	char path[64];		/* under /dev, from the class's devnode(): "dri/card0" */
+	char name[32];		/* the device's name: "card0" */
+	char parent[64];	/* the parent device's name: "0000:03:00.0", "vkms" */
+	char bus[16];		/* the parent's bus: "pci", "faux", "platform", "" */
+	char driver[32];	/* the parent's driver: "amdgpu", "" */
+	u32 major, minor;
+	u16 vendor, device, subvendor, subdevice;	/* PCI parents */
+	u32 class_code;
+	u8 revision;
+};
+
+/* Device node `index` (in the order they were added); false past the end. */
+bool nova_lx_devnode(unsigned int index, struct nova_devnode *out);
+
+/* Open device node `devt`: the open file, or NULL and *err. */
+struct lx_ufile *nova_lx_ufile_open(u32 devt, u32 flags, int *err);
+/* The last descriptor is gone (f_op->release when it was the last file reference). */
+void nova_lx_ufile_close(struct lx_ufile *uf);
+long nova_lx_ufile_ioctl(struct lx_ufile *uf, u32 cmd, u64 arg, bool compat);
+long nova_lx_ufile_read(struct lx_ufile *uf, u64 buf, u64 len);
+long nova_lx_ufile_write(struct lx_ufile *uf, u64 buf, u64 len);
+s64 nova_lx_ufile_llseek(struct lx_ufile *uf, s64 offset, int whence);
+/* EPOLL* bits ready now, and the number of wakeups so far in *events. */
+u32 nova_lx_ufile_poll(struct lx_ufile *uf, u64 *events);
+void nova_lx_ufile_setfl(struct lx_ufile *uf, u32 flags);
+/* For fstat and /proc/self/fd: the inode's mode, device number and number, the size
+ * (llseek to the end, as for a dma-buf), and a name ("card0", "dmabuf", "sync_file"). */
+struct nova_ufile_info {
+	u32 mode;
+	u32 rdev_major, rdev_minor;
+	u64 ino;
+	char name[32];
+	bool anon;
+};
+
+void nova_lx_ufile_info(struct lx_ufile *uf, struct nova_ufile_info *info);
+struct file *nova_lx_ufile_get(struct lx_ufile *uf);
+/* For the __get_user/__put_user thunks: may Linux code access this user range? */
+bool nova_lx_user_ok(unsigned long addr, unsigned long len, bool write);
+
+/* mmap() of an open file at [addr, addr + len) in Nova address space `space`: a new
+ * vma, then the driver's mmap on it (0 or -errno; a failed one is freed with _free). */
+struct lx_vma *nova_lx_vma_new(struct lx_ufile *uf, u64 space, u64 addr, u64 len, u32 prot, u32 flags, u64 pgoff,
+			       int *err);
+int nova_lx_vma_mmap(struct lx_vma *v);
+void nova_lx_vma_free(struct lx_vma *v);
+bool nova_lx_vma_writable(struct lx_vma *v);
+/* A fault at addr: 0 when the page is mapped now, else VM_FAULT_* bits. */
+u32 nova_lx_vma_fault(struct lx_vma *v, u64 addr, bool write);
+void nova_lx_vma_trim(struct lx_vma *v, u64 start, u64 end);
+void nova_lx_vma_detach(struct lx_vma *v);
+void nova_lx_vma_close(struct lx_vma *v);
+struct lx_vma *nova_lx_vma_dup(struct lx_vma *v, u64 space);
+void nova_lx_put_page(struct page *page);
+
 /* Interrupt bookkeeping shared between the lx_emul files. */
 void lx_emul_irq_poll(void);
 void lx_emul_irq_handle(unsigned int irq);
@@ -122,6 +187,9 @@ void lx_emul_napi_poll(void);
 void lx_emul_timers_run(void);
 void lx_emul_hrtimers_run(void);
 void lx_emul_irq_work_run(void);
+/* Devices with a device number (user.c): their nodes appear in Nova's /dev. */
+void lx_devnode_add(struct device *dev);
+void lx_devnode_del(struct device *dev);
 /* Memory statistics from Nova (mm.c); called by nova_lx_init. */
 void lx_emul_mm_init(void);
 /* One work-queue worker task (index n < 4); never returns. */

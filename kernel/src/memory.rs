@@ -176,6 +176,8 @@ pub const WRITABLE: u64 = 1 << 1;
 pub const USER: u64 = 1 << 2;
 const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
+/// A 4 KiB entry's caching bits: PWT, PCD and PAT (bit 7), as drivers ask for them.
+pub const PAGE_CACHE_BITS: u64 = WRITE_THROUGH | CACHE_DISABLE | 1 << 7;
 const HUGE: u64 = 1 << 7;
 const ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 

@@ -607,6 +607,8 @@ int device_add(struct device *dev)
 	INIT_LIST_HEAD(&dev->p->bus_node);
 	get_device(dev->parent);
 
+	if (MAJOR(dev->devt))
+		lx_devnode_add(dev);
 	b = dev->bus ? lx_bus_find(dev->bus, true) : NULL;
 	if (b) {
 		blocking_notifier_call_chain(&b->notifier, BUS_NOTIFY_ADD_DEVICE, dev);
@@ -628,6 +630,8 @@ void device_del(struct device *dev)
 {
 	struct lx_bus *b = dev->bus ? lx_bus_find(dev->bus, false) : NULL;
 
+	if (MAJOR(dev->devt))
+		lx_devnode_del(dev);
 	if (b)
 		blocking_notifier_call_chain(&b->notifier, BUS_NOTIFY_DEL_DEVICE, dev);
 	device_release_driver(dev);
@@ -829,45 +833,6 @@ struct device *device_create(const struct class *cls, struct device *parent, dev
 }
 
 void device_destroy(const struct class *cls, dev_t devt)
-{
-}
-
-/* Character device nodes appear with Nova's device filesystem (later); registering one
- * succeeds so drivers carry on. */
-int register_chrdev_region(dev_t from, unsigned count, const char *name)
-{
-	return 0;
-}
-
-void unregister_chrdev_region(dev_t from, unsigned count)
-{
-}
-
-int __register_chrdev(unsigned int major, unsigned int baseminor, unsigned int count, const char *name,
-		      const struct file_operations *fops)
-{
-	/* As Linux: 0 for a fixed major, the major number when one is assigned. */
-	return major ? 0 : 240;
-}
-
-void __unregister_chrdev(unsigned int major, unsigned int baseminor, unsigned int count, const char *name)
-{
-}
-
-void cdev_init(struct cdev *cdev, const struct file_operations *fops)
-{
-	memset(cdev, 0, sizeof(*cdev));
-	cdev->ops = fops;
-}
-
-int cdev_add(struct cdev *p, dev_t dev, unsigned count)
-{
-	p->dev = dev;
-	p->count = count;
-	return 0;
-}
-
-void cdev_del(struct cdev *p)
 {
 }
 

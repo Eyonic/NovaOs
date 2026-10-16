@@ -16,3 +16,4 @@ obj-y += fs.o
 obj-y += irq.o
 obj-y += fpu.o
 obj-y += gpu.o
+obj-y += user.o

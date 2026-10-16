@@ -306,6 +306,13 @@ pub struct Memory {
     mmap_next: u64,
     /// A 32-bit program's address space: everything stays below 4 GiB.
     pub compat: bool,
+    /// Mappings of Linux drivers' files (linux/lxfile.rs): start -> (end, their Linux
+    /// vma). Their ranges are areas too; their pages are the drivers' frames.
+    #[cfg(feature = "linux-drivers")]
+    pub lx_vmas: BTreeMap<u64, (u64, usize)>,
+    /// Pages mapped in them: virtual page -> struct page reference kept (0 for none).
+    #[cfg(feature = "linux-drivers")]
+    lx_pages: BTreeMap<u64, usize>,
 }
 
 // SAFETY: the raw page pointers refer to heap pages owned by this value.
@@ -474,7 +481,12 @@ pub fn oom_scratch_page() -> *mut u8 {
 
 impl Memory {
     fn new(cr3: u64) -> Self {
-        Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), labels: BTreeMap::new(), unmapped: alloc::collections::VecDeque::new(), mapped: alloc::collections::VecDeque::new(), full_reported: false, areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP, compat: false }
+        Self { cr3, pages: BTreeMap::new(), tables: Vec::new(), borrowed: alloc::collections::BTreeSet::new(), foreign: alloc::collections::BTreeSet::new(), shared: Vec::new(), labels: BTreeMap::new(), unmapped: alloc::collections::VecDeque::new(), mapped: alloc::collections::VecDeque::new(), full_reported: false, areas: Vec::new(), brk_start: 0, brk: 0, mmap_next: MMAP_TOP, compat: false,
+            #[cfg(feature = "linux-drivers")]
+            lx_vmas: BTreeMap::new(),
+            #[cfg(feature = "linux-drivers")]
+            lx_pages: BTreeMap::new(),
+        }
     }
 
     /// Map a zeroed page at `va` (page aligned) if not mapped yet; returns its kernel pointer.
@@ -689,6 +701,13 @@ impl Memory {
             if write && !self.area_at(page).is_some_and(|a| a.writable) {
                 return false; // read-only memory: the caller reports EFAULT
             }
+            // Linux drivers' mappings fill through their fault handlers, which must not
+            // run under this lock: the copy that follows faults them in.
+            #[cfg(feature = "linux-drivers")]
+            if self.lx_vma_at(page).is_some() {
+                page += PAGE;
+                continue;
+            }
             if !self.pages.contains_key(&page) {
                 match self.area_at(page) {
                     Some(a) if !write || a.writable => {
@@ -702,6 +721,94 @@ impl Memory {
             page += PAGE;
         }
         true
+    }
+
+    /// Is [addr, addr+len) inside areas (writable ones if `write`)? Nothing is mapped:
+    /// for Linux code's copy_from_user/copy_to_user, whose accesses fault pages in.
+    pub fn accessible(&self, addr: u64, len: u64, write: bool) -> bool {
+        let Some(end) = addr.checked_add(len) else { return false };
+        if addr < USER_MIN || end > USER_MAX {
+            return false;
+        }
+        let mut page = addr & !(PAGE - 1);
+        while page < end {
+            match self.area_at(page) {
+                Some(a) if !write || a.writable => page = a.end.min(end.next_multiple_of(PAGE)).max(page + PAGE),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// The Linux vma mapping `va`, if any.
+    #[cfg(feature = "linux-drivers")]
+    pub fn lx_vma_at(&self, va: u64) -> Option<usize> {
+        self.lx_vmas.range(..=va).next_back().filter(|(_, (end, _))| va < *end).map(|(_, &(_, v))| v)
+    }
+
+    /// A Linux driver maps frame `phys` at `va` in vma `vma` (vmf_insert_pfn and
+    /// friends): `flags` are the page-table bits it asks for (RW, cache, NX); `page` is
+    /// a struct page reference the mapping keeps. False if `vma` no longer maps `va`.
+    #[cfg(feature = "linux-drivers")]
+    pub fn lx_insert(&mut self, vma: usize, va: u64, phys: u64, flags: u64, page: usize) -> bool {
+        if vma == 0 || self.lx_vma_at(va) != Some(vma) {
+            return false;
+        }
+        if let Some(old) = self.lx_pages.remove(&va) {
+            self.unmap_page(va);
+            crate::linux::lxfile::put_page(old);
+        }
+        // Writable only where the area is (mprotect may have taken write access away).
+        let writable = flags & WRITABLE != 0 && self.area_at(va).is_some_and(|a| a.writable);
+        let bits = (flags & (memory::PAGE_CACHE_BITS | NX)) | PRESENT | USER | if writable { WRITABLE } else { 0 };
+        let tables = &mut self.tables;
+        // SAFETY: a lower-half address of this space; the frame belongs to the driver,
+        // which unmaps it again (lx_zap) before it reuses it.
+        unsafe { memory::map_page_in(self.cr3, va, phys, bits, PRESENT | WRITABLE | USER, &mut |t| tables.push(t)) };
+        self.lx_pages.insert(va, page);
+        true
+    }
+
+    /// unmap_mapping_range(): drop the pages of vma `vma` in [start, end); the next
+    /// access faults again.
+    #[cfg(feature = "linux-drivers")]
+    pub fn lx_zap(&mut self, vma: usize, start: u64, end: u64) {
+        if self.lx_vmas.values().any(|&(_, v)| v == vma) {
+            self.lx_drop_pages(start, end);
+        }
+    }
+
+    #[cfg(feature = "linux-drivers")]
+    fn lx_drop_pages(&mut self, start: u64, end: u64) {
+        let doomed: Vec<u64> = self.lx_pages.range(start..end).map(|(&va, _)| va).collect();
+        for va in doomed {
+            let page = self.lx_pages.remove(&va).unwrap_or(0);
+            self.unmap_page(va);
+            crate::linux::lxfile::put_page(page);
+        }
+    }
+
+    /// munmap over Linux mappings: whole ones are retired (closed after the system
+    /// call), cut ones shrink.
+    #[cfg(feature = "linux-drivers")]
+    fn lx_unmap(&mut self, start: u64, end: u64) {
+        self.lx_drop_pages(start, end);
+        let hit: Vec<(u64, u64, usize)> = self.lx_vmas.iter().map(|(&s, &(e, v))| (s, e, v)).filter(|&(s, e, _)| s < end && start < e).collect();
+        for (s, e, v) in hit {
+            self.lx_vmas.remove(&s);
+            if start <= s && end >= e {
+                crate::linux::lxfile::retire(v);
+            } else if start <= s {
+                crate::linux::lxfile::trim(v, end, e);
+                self.lx_vmas.insert(end, (e, v));
+            } else if end >= e {
+                crate::linux::lxfile::trim(v, s, start);
+                self.lx_vmas.insert(s, (start, v));
+            } else {
+                // A hole in the middle: the vma keeps its range (its pages there are gone).
+                self.lx_vmas.insert(s, (e, v));
+            }
+        }
     }
 
     /// Reserve a fresh area of `len` bytes for mmap; returns its start.
@@ -846,6 +953,8 @@ impl Memory {
         }
         let nr = task::current_user().map_or(u64::MAX, |u| u.in_syscall);
         self.unmapped.push_back((start, end, nr | 0x10000));
+        #[cfg(feature = "linux-drivers")]
+        self.lx_drop_pages(start, end);
         let doomed: Vec<u64> = self.pages.range(start..end).map(|(&va, _)| va).collect();
         for va in doomed {
             if let Some(p) = self.pages.remove(&va) {
@@ -917,6 +1026,8 @@ impl Memory {
         }
         let nr = task::current_user().map_or(u64::MAX, |u| u.in_syscall);
         self.unmapped.push_back((start, end, nr));
+        #[cfg(feature = "linux-drivers")]
+        self.lx_unmap(start, end);
         let mut kept = Vec::new();
         for a in self.areas.drain(..) {
             if a.end <= start || a.start >= end {
@@ -969,6 +1080,16 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        // Linux mappings: their frames are the drivers'; the vmas close after this.
+        #[cfg(feature = "linux-drivers")]
+        {
+            for (_, page) in core::mem::take(&mut self.lx_pages) {
+                crate::linux::lxfile::put_page(page);
+            }
+            for (_, (_, v)) in core::mem::take(&mut self.lx_vmas) {
+                crate::linux::lxfile::retire(v);
+            }
+        }
         for (va, p) in core::mem::take(&mut self.pages) {
             if !self.borrowed.contains(&va) && !self.foreign.contains(&va) {
                 // SAFETY: from the page pool in map_zero_page; the address space is gone.
@@ -1432,8 +1553,38 @@ impl Recent {
 /// A user-mode page fault: fill demand areas. Returns false if the access is invalid.
 pub fn page_fault(addr: u64, error: u64) -> bool {
     let Some(u) = task::current_user() else { return false };
+    let mem = u.process.mem.lock();
+    fill_fault(mem, addr, error)
+}
+
+/// A page fault of kernel code on a program's memory: Linux driver code copying from or
+/// to it (copy_from_user checked the range first) touches pages that are not present
+/// yet. Served like the program's own faults; false if the address space is busy (the
+/// faulting code holds its lock) or the access is invalid.
+pub fn kernel_user_fault(addr: u64, error: u64) -> bool {
+    let Some(u) = task::current_user() else { return false };
+    if !(USER_MIN..USER_MAX).contains(&addr) {
+        return false; // a null pointer in kernel code is a kernel bug, reported as such
+    }
+    let Some(mem) = u.process.mem.try_lock() else { return false };
+    fill_fault(mem, addr, error)
+}
+
+fn fill_fault(mut mem: crate::sync::SpinLockGuard<'_, Memory>, addr: u64, error: u64) -> bool {
+    let Some(u) = task::current_user() else { return false };
     let page = addr & !(PAGE - 1);
-    let mut mem = u.process.mem.lock();
+    // A Linux driver's mapping: its fault handler maps the page (it may sleep, so the
+    // address-space lock is let go first).
+    #[cfg(feature = "linux-drivers")]
+    if let Some(vma) = mem.lx_vma_at(page) {
+        let write = error & 2 != 0;
+        if error & 1 != 0 || (write && !mem.area_at(page).is_some_and(|a| a.writable)) {
+            crate::log::warn(&format!("{}: protection fault at {addr:#x} in a driver mapping", u.process.name));
+            return false;
+        }
+        drop(mem);
+        return crate::linux::lxfile::fault(vma, addr, write);
+    }
     if error & 1 != 0 {
         // Present page: only a write to a shared system-file page is legitimate.
         if error & 2 != 0 && mem.borrowed.contains(&page) && mem.area_at(page).is_some_and(|a| a.writable) {
@@ -1966,6 +2117,10 @@ pub fn fork(parent_regs: &SyscallFrame, vfork: bool, child_stack: u64, tls: Opti
             return Err(12); // ENOMEM
         }
     }
+    // Linux drivers' mappings: the child gets its own vmas (their open runs driver code,
+    // so outside the address-space locks).
+    #[cfg(feature = "linux-drivers")]
+    crate::linux::lxfile::fork(&parent.mem, &child.mem);
     *child.fds.lock() = parent.fds.lock().fork();
     {
         let from = parent.signals.lock();

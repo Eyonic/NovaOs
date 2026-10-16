@@ -92,6 +92,8 @@ pub struct Meta {
     pub nlink: u32,
     pub uid: u32,
     pub gid: u32,
+    /// Device number of a character device (st_rdev, Linux's encoding), else 0.
+    pub rdev: u64,
 }
 
 /// The contents of a regular file being opened.
@@ -104,6 +106,9 @@ pub enum Content {
     Shared(SharedRef),
     /// A device node: null, zero, full, random, urandom, tty.
     Device(&'static str),
+    /// A Linux driver's device node (major, minor): DRM's /dev/dri/*.
+    #[cfg(feature = "linux-drivers")]
+    Linux(u32, u32),
 }
 
 /// A file system. Paths are relative to its root, canonical, and contain no symbolic
@@ -621,6 +626,8 @@ impl Namespace {
                 alloc::borrow::Cow::Owned(s.read(0, size))
             }
             Content::Device(_) => return Err(EACCES),
+            #[cfg(feature = "linux-drivers")]
+            Content::Linux(..) => return Err(EACCES),
         })
     }
 }
@@ -762,21 +769,21 @@ impl Backend for NovaFsBackend {
         let ino = ino_of(p);
         let u = Self::owner(p);
         if let Some(t) = self.link_target(p) {
-            return Ok(Meta { ty: Type::Lnk, perm: 0o777, size: t.len() as u64, mtime: 0, ino, nlink: 1, uid: u, gid: u });
+            return Ok(Meta { ty: Type::Lnk, perm: 0o777, size: t.len() as u64, mtime: 0, ino, nlink: 1, uid: u, gid: u, rdev: 0 });
         }
         let perm = self.with_meta(|m| m.modes.get(p).copied());
         if self.with_meta(|m| m.fifos.contains_key(p)) {
-            return Ok(Meta { ty: Type::Fifo, perm: perm.unwrap_or(0o644), size: 0, mtime: 0, ino, nlink: 1, uid: u, gid: u });
+            return Ok(Meta { ty: Type::Fifo, perm: perm.unwrap_or(0o644), size: 0, mtime: 0, ino, nlink: 1, uid: u, gid: u, rdev: 0 });
         }
         if let Some((size, mtime)) = self.is_file(p) {
-            return Ok(Meta { ty: Type::Reg, perm: perm.unwrap_or_else(|| Self::default_perm(p)), size, mtime, ino, nlink: 1, uid: u, gid: u });
+            return Ok(Meta { ty: Type::Reg, perm: perm.unwrap_or_else(|| Self::default_perm(p)), size, mtime, ino, nlink: 1, uid: u, gid: u, rdev: 0 });
         }
         if self.is_dir(p) {
             let u = if matches!(p, "" | "etc" | "tmp" | "bin" | "usr" | "lib" | "lib64") { 0 } else { u };
-            return Ok(Meta { ty: Type::Dir, perm: perm.unwrap_or(if p == "tmp" { 0o1777 } else { 0o755 }), size: 4096, mtime: 0, ino, nlink: 2, uid: u, gid: u });
+            return Ok(Meta { ty: Type::Dir, perm: perm.unwrap_or(if p == "tmp" { 0o1777 } else { 0o755 }), size: 4096, mtime: 0, ino, nlink: 2, uid: u, gid: u, rdev: 0 });
         }
         if let Some(text) = crate::linux::etc_file(p) {
-            return Ok(Meta { ty: Type::Reg, perm: 0o644, size: text.len() as u64, mtime: 0, ino, nlink: 1, uid: 0, gid: 0 });
+            return Ok(Meta { ty: Type::Reg, perm: 0o644, size: text.len() as u64, mtime: 0, ino, nlink: 1, uid: 0, gid: 0, rdev: 0 });
         }
         Err(ENOENT)
     }
@@ -1003,6 +1010,8 @@ impl Backend for NovaFsBackend {
             Content::Static(s) => s.to_vec(),
             Content::Copy(v) => v,
             Content::Shared(_) | Content::Device(_) => return Err(EINVAL),
+            #[cfg(feature = "linux-drivers")]
+            Content::Linux(..) => return Err(EINVAL),
         };
         crate::fs::write(to, &data).map_err(|_| ENOSPC)
     }
@@ -1019,6 +1028,8 @@ impl Backend for NovaFsBackend {
             Content::Static(_) => return Err(EROFS),
             Content::Copy(v) => v,
             Content::Shared(_) | Content::Device(_) => return Err(EINVAL),
+            #[cfg(feature = "linux-drivers")]
+            Content::Linux(..) => return Err(EINVAL),
         };
         data.resize(len as usize, 0);
         self.write_back(p, &data)
@@ -1148,7 +1159,7 @@ impl Backend for TmpFs {
             Type::Lnk => n.target.len() as u64,
             Type::Chr | Type::Fifo => 0,
         };
-        Ok(Meta { ty: n.ty, perm: n.perm, size, mtime: n.mtime, ino: self.base | ino, nlink: n.nlink, uid: n.uid, gid: n.gid })
+        Ok(Meta { ty: n.ty, perm: n.perm, size, mtime: n.mtime, ino: self.base | ino, nlink: n.nlink, uid: n.uid, gid: n.gid, rdev: 0 })
     }
 
     fn link_target(&self, p: &str) -> Option<String> {

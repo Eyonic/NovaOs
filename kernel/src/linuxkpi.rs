@@ -147,6 +147,13 @@ pub fn spawn_poller() {
             unsafe { nova_lx_worker(index) }
         });
     }
+    // Driver mappings of programs that exited: their vm_ops->close, which can drop the
+    // last reference to a DRM file and wait for the display (a vblank this "linux" task
+    // delivers), so it runs on its own task.
+    task::spawn("linux-files", || loop {
+        crate::linux::lxfile::reap();
+        task::sleep_ticks(10);
+    });
     task::spawn("linux", || loop {
         // SAFETY: lx_emul's poll loop; only ever called from this task.
         unsafe { nova_lx_poll() };
