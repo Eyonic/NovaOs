@@ -827,6 +827,10 @@ fn proc_file(name: &str) -> Option<String> {
         "proc/cpuinfo" => format!("processor\t: 0\nvendor_id\t: GenuineIntel\nmodel name\t: {}\ncpu MHz\t\t: 3000.000\ncpu cores\t: 1\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 avx avx2\n\n", crate::cpu::brand()),
         "proc/stat" => format!("cpu  {0} 0 0 {0} 0 0 0 0 0 0\ncpu0 {0} 0 0 {0} 0 0 0 0 0 0\nbtime {1}\nprocesses 1\n", pit::ticks(), rtc::unix_time() - pit::ticks() / pit::HZ),
         "proc/nova/tcp" => loopback_table(),
+        "proc/nova/net" => {
+            let ((rx, tx), (polls, frames)) = (crate::net::counters(), crate::net::poll_counters());
+            format!("rx_bytes {rx}\ntx_bytes {tx}\nrx_frames {frames}\npolls {polls}\nuptime_ms {}\n", pit::ticks() * 1000 / pit::HZ)
+        }
         "proc/uptime" => format!("{}.{:02} 0.00\n", pit::ticks() / pit::HZ, pit::ticks() % pit::HZ),
         "proc/loadavg" => "0.00 0.00 0.00 1/1 1\n".into(),
         "proc/sys/kernel/osrelease" => "6.8.0-nova\n".into(),
@@ -1756,7 +1760,7 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     thread().syscall_arg = a0;
     thread().syscall_arg2 = a1;
     let r = dispatch(f, nr, a0, a1, a2, a3, a4, a5);
-    proc().recent.lock().push(tid, nr, [a0, a1, a2], r);
+    thread().recent.push(nr, [a0, a1, a2], r);
     thread().in_syscall = u64::MAX;
     if trace {
         let path = if matches!(nr, 2 | 4 | 6 | 21 | 59 | 80 | 83 | 87 | 89) {
@@ -2678,7 +2682,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     0x541B => {
                         // FIONREAD
                         let n = match &file.lock().kind {
-                            Kind::Channel(e) => e.rx.as_ref().map_or(0, |c| if c.lock().readable() { 1 } else { 0 }),
+                            Kind::Channel(e) => e.rx.as_ref().map_or(0, |c| c.lock().pending(e.kind != ipc::SockType::Stream)),
+                            Kind::Inet(s) => crate::net::recv_pending(s.handle, s.udp),
                             _ => 0,
                         };
                         write_user(a2, &(n as u32).to_le_bytes())?;

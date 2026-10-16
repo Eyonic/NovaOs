@@ -82,6 +82,10 @@ impl Channel {
     pub fn readable(&self) -> bool {
         !self.queue.is_empty()
     }
+    /// FIONREAD: queued bytes (streams), or the next message's length (datagrams).
+    pub fn pending(&self, datagram: bool) -> usize {
+        if datagram { self.queue.front().map_or(0, |m| m.data.len()) } else { self.bytes }
+    }
     pub fn writable(&self) -> bool {
         self.bytes < CAPACITY
     }

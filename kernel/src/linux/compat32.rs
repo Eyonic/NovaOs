@@ -96,7 +96,7 @@ pub fn syscall32(f: &mut Frame32) -> i64 {
     thread().syscall_arg2 = a1;
     thread().phase = "convert";
     let r = res(convert(f, nr, a0, a1, a2, a3, a4, a5));
-    proc().recent.lock().push(thread().tid, 0x1000 | nr, [a0, a1, a2], r);
+    thread().recent.push(0x1000 | nr, [a0, a1, a2], r);
     thread().phase = "returned";
     thread().in_syscall = u64::MAX;
     if trace {

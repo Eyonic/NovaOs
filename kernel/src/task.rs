@@ -279,6 +279,21 @@ pub fn current_id() -> usize {
     s.tasks[s.current].id
 }
 
+/// The last system calls of every thread of process `pid` (the `recent` command).
+pub fn recent_calls(pid: u64) -> Vec<String> {
+    let s = scheduler();
+    let mut out = Vec::new();
+    for t in &s.tasks {
+        if let Some(u) = t.user.as_deref()
+            && u.process.pid == pid
+        {
+            out.push(alloc::format!("thread {}{}:", u.tid, if u.comm.is_empty() { String::new() } else { alloc::format!(" \"{}\"", u.comm) }));
+            out.extend(u.recent.lines());
+        }
+    }
+    out
+}
+
 /// (id, name, state) of every task, for the `ps` command.
 pub fn list() -> Vec<(usize, String, &'static str)> {
     let s = scheduler();

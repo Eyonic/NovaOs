@@ -47,8 +47,8 @@ const TX_CMD_RS: u8 = 1 << 3;
 const DESC_DD: u8 = 1 << 0;
 const RX_EOP: u8 = 1 << 1;
 
-const RX_COUNT: usize = 64;
-const TX_COUNT: usize = 64;
+const RX_COUNT: usize = 512;
+const TX_COUNT: usize = 256;
 const BUF_SIZE: usize = 2048;
 
 /// PCI device IDs handled by this driver (vendor 0x8086).

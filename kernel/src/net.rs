@@ -24,9 +24,18 @@ use crate::{pit, rand, task};
 struct NicDevice(Box<dyn Nic>);
 
 static RX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Stack polls by the network task, and received frames (netstat: frames per poll).
+static POLLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RX_FRAMES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static TX_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// (received, sent) Ethernet bytes since boot.
+/// (stack polls, received frames) since boot.
+pub fn poll_counters() -> (u64, u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (POLLS.load(Relaxed), RX_FRAMES.load(Relaxed))
+}
+
 pub fn counters() -> (u64, u64) {
     use core::sync::atomic::Ordering::Relaxed;
     (RX_BYTES.load(Relaxed), TX_BYTES.load(Relaxed))
@@ -61,6 +70,7 @@ impl phy::Device for NicDevice {
             let frame = self.0.receive()?;
             if !frame.is_empty() {
                 RX_BYTES.fetch_add(frame.len() as u64, core::sync::atomic::Ordering::Relaxed);
+                RX_FRAMES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 return Some((RxToken(frame), TxToken(&mut *self.0)));
             }
         }
@@ -74,7 +84,9 @@ impl phy::Device for NicDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = 1514;
-        caps.max_burst_size = Some(32);
+        // smoltcp limits the TCP receive window to this many segments; the NIC rings hold
+        // hundreds of frames (e1000: 512), so a small burst size would cap downloads.
+        caps.max_burst_size = Some(256);
         caps
     }
 }
@@ -161,6 +173,7 @@ pub fn init(nic: Box<dyn Nic>) {
         next_port,
     });
     task::spawn("net", || loop {
+        POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let _ = with_stack(|s| {
             s.poll();
             reap_orphans(s);
@@ -453,6 +466,18 @@ pub fn tcp_send(h: SocketHandle, data: &[u8]) -> Result<usize, SockErr> {
 
 /// Receive TCP data. With `peek` the data stays queued (MSG_PEEK: Chromium peeks one
 /// byte to check that an idle connection is still alive; consuming it corrupts TLS).
+/// FIONREAD: bytes waiting (TCP), or the size of the next datagram (UDP).
+pub fn recv_pending(h: SocketHandle, udp: bool) -> usize {
+    with_stack(|s| {
+        if udp {
+            s.sockets.get_mut::<smoltcp::socket::udp::Socket>(h).peek().map_or(0, |(data, _)| data.len())
+        } else {
+            s.sockets.get::<tcp::Socket>(h).recv_queue()
+        }
+    })
+    .unwrap_or(0)
+}
+
 pub fn tcp_recv(h: SocketHandle, buf: &mut [u8], peek: bool) -> Result<usize, SockErr> {
     with_stack(|s| {
         s.poll();
@@ -497,7 +522,13 @@ pub fn udp_recv(h: SocketHandle, buf: &mut [u8], peek: bool) -> Result<(usize, I
                 (n, *meta)
             })
         } else {
-            u.recv_slice(buf)
+            // Like Linux, a datagram larger than the buffer is truncated (smoltcp's
+            // recv_slice would dequeue it and then report an error, losing it).
+            u.recv().map(|(data, meta)| {
+                let n = data.len().min(buf.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                (n, meta)
+            })
         };
         match r {
             Ok((n, meta)) => match meta.endpoint.addr {

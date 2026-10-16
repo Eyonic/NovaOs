@@ -142,7 +142,7 @@ fn cmd_recent(args: &str, _: &History) {
         }
         for p in crate::process::processes().iter().filter(|p| p.exe.lock().contains(name)) {
             println!("== pid {}", p.pid);
-            let lines = p.recent.lock().lines();
+            let lines = crate::task::recent_calls(p.pid);
             for l in &lines {
                 println!("{l}");
             }
@@ -151,7 +151,7 @@ fn cmd_recent(args: &str, _: &History) {
     };
     match crate::process::find(pid) {
         Some(p) => {
-            let lines = p.recent.lock().lines();
+            let lines = crate::task::recent_calls(p.pid);
             for l in lines {
                 println!("{l}");
             }
@@ -170,7 +170,8 @@ fn cmd_peer(args: &str, _: &History) {
 
 fn cmd_netstat(_: &str, _: &History) {
     let (rx, tx) = crate::net::counters();
-    println!("received {rx} bytes, sent {tx} bytes");
+    let (polls, frames) = crate::net::poll_counters();
+    println!("received {rx} bytes, sent {tx} bytes; {frames} frames in {polls} polls, uptime {} ms", crate::pit::ticks() * 1000 / crate::pit::HZ);
     for line in crate::net::tcp_sockets() {
         println!("{line}");
     }
