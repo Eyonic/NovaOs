@@ -32,6 +32,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "sleep", args: "<seconds>", help: "wait (uses the timer interrupt)", run: cmd_sleep },
     Command { name: "history", args: "", help: "list previous commands", run: cmd_history },
     Command { name: "ps", args: "", help: "list kernel tasks", run: cmd_ps },
+    Command { name: "dmesg", args: "[text]", help: "kernel log (lines containing text)", run: cmd_dmesg },
     Command { name: "lspci", args: "", help: "PCI devices and their drivers", run: cmd_lspci },
     Command { name: "ifconfig", args: "", help: "network interface status", run: cmd_ifconfig },
     Command { name: "host", args: "<name>", help: "look up a host name (DNS)", run: cmd_host },
@@ -165,6 +166,12 @@ fn cmd_peer(args: &str, _: &History) {
     match v.as_slice() {
         [pid, fd] => println!("{}", crate::linux::find_peer(*pid, *fd)),
         _ => println!("usage: peer <pid> <fd>"),
+    }
+}
+
+fn cmd_dmesg(args: &str, _: &History) {
+    for line in crate::log::lines(args.trim()) {
+        println!("{line}");
     }
 }
 

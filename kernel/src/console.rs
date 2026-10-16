@@ -175,6 +175,7 @@ pub fn print(args: fmt::Arguments) {
     }
     let _ = Serial.write_fmt(args);
     write_screen(args);
+    crate::log::capture(args);
 }
 
 #[macro_export]

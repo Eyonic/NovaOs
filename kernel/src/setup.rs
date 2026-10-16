@@ -221,6 +221,7 @@ pub fn run() -> ! {
         println!("[nova] starting shell");
         crate::wayland::start(); // headless: no windows, the `wayland` command shows clients
         crate::pulse::start();
+        crate::log::boot_done();
         loop {
             crate::shell::run();
         }
@@ -245,6 +246,7 @@ pub fn run() -> ! {
         task::sleep_ticks(pit::HZ);
     }
 
+    crate::log::boot_done();
     if !wm::start() {
         loop {
             crate::shell::run();
