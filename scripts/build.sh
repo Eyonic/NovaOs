@@ -169,6 +169,21 @@ if [[ -f /etc/ssl/certs/ca-certificates.crt ]]; then
     mkdir -p "$SYSROOT/etc/ssl/certs"
     cp -L /etc/ssl/certs/ca-certificates.crt "$SYSROOT/etc/ssl/certs/"
 fi
+# Firmware for the Linux drivers (FEATURES=linux-drivers): the Realtek NICs' rtl_nic
+# files, from the host's linux-firmware package (redistributable binaries, copied into the
+# image only, never into the repository). r8169 loads them with request_firmware().
+if [[ ",${FEATURES:-}," == *,linux-drivers,* && -d /usr/lib/firmware/rtl_nic ]]; then
+    mkdir -p "$SYSROOT/usr/lib/firmware/rtl_nic"
+    for f in /usr/lib/firmware/rtl_nic/*; do
+        case "$f" in
+            *.zst) zstd -qdcf "$f" > "$SYSROOT/usr/lib/firmware/rtl_nic/$(basename "${f%.zst}")" ;;
+            *.xz) xz -dc "$f" > "$SYSROOT/usr/lib/firmware/rtl_nic/$(basename "${f%.xz}")" ;;
+            *) cp "$f" "$SYSROOT/usr/lib/firmware/rtl_nic/" ;;
+        esac
+    done
+    log "Including Realtek NIC firmware ($(ls "$SYSROOT/usr/lib/firmware/rtl_nic" | wc -l) files)"
+fi
+
 # PulseAudio clients (Steam): Nova has no sound server yet, and each failed connection
 # attempt reserves a shared memory pool (64 MiB by default; Steam's 32-bit client retries
 # every fraction of a second until it runs out of address space). Keep the pools small.

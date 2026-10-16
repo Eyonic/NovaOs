@@ -198,8 +198,22 @@ static void lx_work_enqueue(struct work_struct *work)
 	lx_wake_workers();
 }
 
+/* Work items turned off with disable_work() (Linux counts this in work->data; a short
+ * list does here: drivers disable one or two items while they are down). */
+static struct work_struct *lx_disabled_work[32];
+
+static bool lx_work_disabled(struct work_struct *work)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(lx_disabled_work); i++)
+		if (lx_disabled_work[i] == work)
+			return true;
+	return false;
+}
+
 bool queue_work_on(int cpu, struct workqueue_struct *wq, struct work_struct *work)
 {
+	if (lx_work_disabled(work))
+		return false;
 	if (test_and_set_bit(WORK_STRUCT_PENDING_BIT, work_data_bits(work)))
 		return false;
 	lx_work_enqueue(work);
@@ -525,4 +539,34 @@ void nova_lx_poll(void)
 	lx_emul_napi_poll();
 	lx_emul_timers_run();
 	lx_emul_rcu_run();
+}
+
+/* disable_work(): cancel the item and refuse to queue it until enable_work(). */
+bool disable_work(struct work_struct *work)
+{
+	bool was_pending = cancel_work(work);
+
+	if (!lx_work_disabled(work))
+		for (unsigned int i = 0; i < ARRAY_SIZE(lx_disabled_work); i++)
+			if (!lx_disabled_work[i]) {
+				lx_disabled_work[i] = work;
+				break;
+			}
+	return was_pending;
+}
+
+bool disable_work_sync(struct work_struct *work)
+{
+	bool was_pending = disable_work(work);
+
+	lx_work_wait(work);
+	return was_pending;
+}
+
+bool enable_work(struct work_struct *work)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(lx_disabled_work); i++)
+		if (lx_disabled_work[i] == work)
+			lx_disabled_work[i] = NULL;
+	return true;
 }

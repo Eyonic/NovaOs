@@ -146,7 +146,7 @@ generation), and Steam.
 | 3 | Real hardware boot | uACPI | PCIe ECAM from MCFG and ACPI power off / reboot (done); devices behind bridges, local APIC timer |
 | 4 | NVMe boot drive | — | done, natively: `drivers/nvme.rs` (see below) |
 | 5 | USB input | `drivers/usb/core`, `xhci`, `usbhid`, HID core, input core (done) | task/wait model, driver core, input bridge (done) |
-| 6 | The board's network | `r8169` (RTL8168/8125) | firmware loading (`request_firmware` from Nova's disk) |
+| 6 | The board's network | `r8169` (RTL8168/8125), phylib, Realtek PHY driver, ethtool link-mode tables | built in and linked; `request_firmware` reads `/lib/firmware` from Nova's disk (the image gets the host's `rtl_nic` files). QEMU has no RTL8168 model, so the first real test is on the reference machine |
 | 7 | GPU | DRM core, TTM, `amdgpu` (incl. display core) | `struct page` backing and page allocation, kernel FPU sections, firmware, KMS to Nova's compositor |
 | 8 | Userspace for games | — | fork/exec, signals, DRM ioctls and mmap of GPU buffers for Linux programs |
 | 9 | Steam | Mesa RADV, Steam runtime, Proton (userspace) | a Wayland compositor or Xwayland path, audio (HDA via ALSA), namespaces for the Steam runtime |

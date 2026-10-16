@@ -6,6 +6,23 @@
 drivers/net/ethernet/realtek/8139cp.o
 drivers/net/ethernet/realtek/8139too.o
 drivers/net/mii.o
+drivers/net/ethernet/realtek/r8169_main.o
+drivers/net/ethernet/realtek/r8169_firmware.o
+drivers/net/ethernet/realtek/r8169_phy_config.o
+drivers/net/phy/phy.o
+drivers/net/phy/phy-c45.o
+drivers/net/phy/phy-core.o
+drivers/net/phy/phy_device.o
+drivers/net/phy/linkmode.o
+drivers/net/phy/phy_link_topology.o
+drivers/net/phy/phy_caps.o
+drivers/net/phy/mdio_bus_provider.o
+drivers/net/phy/phy_port.o
+drivers/net/phy/mdio_device.o
+drivers/net/phy/mdio_bus.o
+drivers/net/phy/mdio_devres.o
+drivers/net/phy/stubs.o
+drivers/net/phy/realtek/realtek_main.o
 drivers/net/ethernet/intel/e1000e/82571.o
 drivers/net/ethernet/intel/e1000e/ich8lan.o
 drivers/net/ethernet/intel/e1000e/80003es2lan.o
@@ -60,6 +77,7 @@ drivers/input/ff-core.o
 
 # Subsystem code used as is
 net/ethernet/eth.o
+net/ethtool/common.o
 drivers/pci/iomap.o
 
 # Library code

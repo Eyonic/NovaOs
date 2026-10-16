@@ -925,3 +925,50 @@ void nova_lx_start(void)
 			pr_warn("initcall %ps failed: %d\n", fn, ret);
 	}
 }
+
+/* Maximum read request size, in the PCI Express Device Control register. */
+int pcie_set_readrq(struct pci_dev *dev, int rq)
+{
+	u8 pos = pci_find_capability(dev, PCI_CAP_ID_EXP);
+	u16 ctl;
+
+	if (rq < 128 || rq > 4096 || !is_power_of_2(rq))
+		return -EINVAL;
+	if (!pos)
+		return -EINVAL;
+	pci_read_config_word(dev, pos + PCI_EXP_DEVCTL, &ctl);
+	ctl = (ctl & ~PCI_EXP_DEVCTL_READRQ) | ((ffs(rq) - 8) << 12);
+	return pci_write_config_word(dev, pos + PCI_EXP_DEVCTL, ctl);
+}
+
+/* Report and clear the error bits of the PCI status register. */
+int pci_status_get_and_clear_errors(struct pci_dev *pdev)
+{
+	u16 status;
+
+	if (pci_read_config_word(pdev, PCI_STATUS, &status))
+		return -EIO;
+	status &= PCI_STATUS_ERROR_BITS;
+	if (status)
+		pci_write_config_word(pdev, PCI_STATUS, status);
+	return status;
+}
+
+/* Managed versions: Nova never unloads drivers, so the resources stay. */
+int pcim_set_mwi(struct pci_dev *pdev)
+{
+	return pci_set_mwi(pdev);
+}
+
+void __iomem *pcim_iomap_region(struct pci_dev *pdev, int bar, const char *name)
+{
+	void __iomem *p = pci_iomap(pdev, bar, 0);
+
+	return p ? p : IOMEM_ERR_PTR(-ENOMEM);
+}
+
+/* Resetting a bus means resetting a bridge's secondary side; not done here. */
+int pci_reset_bus(struct pci_dev *dev)
+{
+	return -ENOTTY;
+}

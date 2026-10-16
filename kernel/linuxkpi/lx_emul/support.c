@@ -672,3 +672,32 @@ int component_add(struct device *dev, const struct component_ops *ops)
 {
 	return 0;
 }
+
+/* kfree_rcu()/kvfree_rcu(): free `ptr` after a grace period (with a NULL head, after
+ * waiting for one now). The object is freed from an RCU callback on a small record. */
+struct lx_kvfree_rcu {
+	struct rcu_head rcu;
+	void *ptr;
+};
+
+static void lx_kvfree_rcu_cb(struct rcu_head *head)
+{
+	struct lx_kvfree_rcu *r = container_of(head, struct lx_kvfree_rcu, rcu);
+
+	kvfree(r->ptr);
+	kfree(r);
+}
+
+void kvfree_call_rcu(struct rcu_head *head, void *ptr)
+{
+	struct lx_kvfree_rcu *r = kmalloc(sizeof(*r), GFP_ATOMIC);
+
+	if (!head || !r) {
+		kfree(r);
+		synchronize_rcu();
+		kvfree(ptr);
+		return;
+	}
+	r->ptr = ptr;
+	call_rcu(&r->rcu, lx_kvfree_rcu_cb);
+}

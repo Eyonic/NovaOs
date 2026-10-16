@@ -644,3 +644,19 @@ char *file_path(struct file *filp, char *buf, int buflen)
 {
 	return ERR_PTR(-ENOENT);
 }
+
+/* Log a probe error (except -EPROBE_DEFER, which is not one) and return it. */
+int dev_err_probe(const struct device *dev, int err, const char *fmt, ...)
+{
+	struct va_format vaf;
+	va_list args;
+
+	if (err != -EPROBE_DEFER) {
+		va_start(args, fmt);
+		vaf.fmt = fmt;
+		vaf.va = &args;
+		dev_err(dev, "error %pe: %pV", ERR_PTR(err), &vaf);
+		va_end(args);
+	}
+	return err;
+}

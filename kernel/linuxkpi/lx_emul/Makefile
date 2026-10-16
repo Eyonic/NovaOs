@@ -11,3 +11,4 @@ obj-y += task.o
 obj-y += device.o
 obj-y += support.o
 obj-y += input.o
+obj-y += firmware.o

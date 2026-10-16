@@ -279,6 +279,33 @@ extern "C" fn nova_netdev_rx(dev: *mut c_void, frame: *const u8, len: usize) {
     }
 }
 
+// ---------------------------------------------------------------- firmware
+
+/// request_firmware(): /lib/firmware/<name> (or /usr/lib/firmware/<name>) copied into a
+/// nova_alloc() buffer that lx_emul frees with nova_free; null if absent.
+#[unsafe(no_mangle)]
+extern "C" fn nova_firmware_read(name: *const u8, name_len: usize, len: *mut usize) -> *mut u8 {
+    // SAFETY: lx_emul passes the firmware name's bytes, valid for this call.
+    let name = unsafe { core::slice::from_raw_parts(name, name_len) };
+    let Ok(name) = core::str::from_utf8(name) else { return core::ptr::null_mut() };
+    if name.split('/').any(|part| part == "..") {
+        return core::ptr::null_mut();
+    }
+    let ns = crate::vfs::root();
+    let Some(bytes) = ["lib/firmware", "usr/lib/firmware"].iter().find_map(|dir| ns.read_program("/", &alloc::format!("/{dir}/{name}")).ok()) else {
+        return core::ptr::null_mut();
+    };
+    let buf = nova_alloc(bytes.len(), 16, false, false);
+    if !buf.is_null() {
+        // SAFETY: buf holds bytes.len() bytes; len is lx_emul's out-parameter.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, bytes.len());
+            *len = bytes.len();
+        }
+    }
+    buf
+}
+
 // ---------------------------------------------------------------- memory
 
 /// Live allocations: lx_emul's kfree() has no size, the Rust allocator needs the layout.

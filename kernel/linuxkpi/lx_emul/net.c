@@ -22,6 +22,9 @@
 #include <net/flow_dissector.h>
 #include <net/net_namespace.h>
 #include <net/checksum.h>
+#include <linux/ethtool_netlink.h>
+#include <linux/u64_stats_sync.h>
+#include <linux/phy.h>
 #include "nova.h"
 
 /* ---------------------------------------------------------------- devices */
@@ -98,6 +101,13 @@ int register_netdev(struct net_device *dev)
 
 		if (err)
 			return err;
+	}
+	/* Per-CPU traffic counters the driver asked for (Linux's register_netdevice
+	 * allocates them; with one CPU a per-CPU pointer is the object itself). */
+	if (dev->pcpu_stat_type == NETDEV_PCPU_STAT_TSTATS && !dev->tstats) {
+		dev->tstats = (struct pcpu_sw_netstats __percpu *)kzalloc(sizeof(struct pcpu_sw_netstats), GFP_KERNEL);
+		if (!dev->tstats)
+			return -ENOMEM;
 	}
 	dev->ifindex = i + 1;
 	dev->reg_state = NETREG_REGISTERED;
@@ -788,4 +798,125 @@ int nova_lx_netdev_xmit(void *opaque, const u8 *frame, size_t len)
 		return 1;
 	}
 	return 0;
+}
+
+/* ---------------------------------------------------------------- features, statistics, link */
+
+/* Recompute the active features from what the driver offers and wants (Linux's
+ * __netdev_update_features without the upper-device and notifier parts). */
+void netdev_update_features(struct net_device *dev)
+{
+	netdev_features_t features = dev->hw_features & dev->wanted_features;
+
+	features |= dev->features & ~dev->hw_features;
+	if (dev->netdev_ops && dev->netdev_ops->ndo_fix_features)
+		features = dev->netdev_ops->ndo_fix_features(dev, features);
+	if (features == dev->features)
+		return;
+	if (dev->netdev_ops && dev->netdev_ops->ndo_set_features &&
+	    dev->netdev_ops->ndo_set_features(dev, features) < 0)
+		return;
+	dev->features = features;
+}
+
+void dev_fetch_sw_netstats(struct rtnl_link_stats64 *s,
+			   const struct pcpu_sw_netstats __percpu *netstats)
+{
+	int cpu;
+
+	if (!netstats)
+		return;
+	for_each_possible_cpu(cpu) {
+		const struct pcpu_sw_netstats *st = per_cpu_ptr(netstats, cpu);
+
+		s->rx_packets += u64_stats_read(&st->rx_packets);
+		s->rx_bytes += u64_stats_read(&st->rx_bytes);
+		s->tx_packets += u64_stats_read(&st->tx_packets);
+		s->tx_bytes += u64_stats_read(&st->tx_bytes);
+	}
+}
+
+/* Link state changes reach Nova through netif_carrier_on/off; nothing else listens. */
+void linkwatch_fire_event(struct net_device *dev)
+{
+}
+
+/* Cable tests are requested over ethtool netlink, which Nova does not have. */
+int ethnl_cable_test_alloc(struct phy_device *phydev, u8 cmd)
+{
+	return -EOPNOTSUPP;
+}
+
+void ethnl_cable_test_free(struct phy_device *phydev)
+{
+}
+
+void ethnl_cable_test_finished(struct phy_device *phydev)
+{
+}
+
+int ethnl_cable_test_result_with_src(struct phy_device *phydev, u8 pair, u8 result, u32 src)
+{
+	return 0;
+}
+
+int ethnl_cable_test_fault_length_with_src(struct phy_device *phydev, u8 pair, u32 cm, u32 src)
+{
+	return 0;
+}
+
+void napi_consume_skb(struct sk_buff *skb, int budget)
+{
+	dev_kfree_skb_any(skb);
+}
+
+static void lx_devm_free_netdev(void *dev)
+{
+	free_netdev(dev);
+}
+
+struct net_device *devm_alloc_etherdev_mqs(struct device *dev, int sizeof_priv, unsigned int txqs,
+					   unsigned int rxqs)
+{
+	struct net_device *ndev = alloc_etherdev_mqs(sizeof_priv, txqs, rxqs);
+
+	if (ndev && devm_add_action_or_reset(dev, lx_devm_free_netdev, ndev))
+		return NULL;
+	return ndev;
+}
+
+void netif_set_tso_max_size(struct net_device *dev, unsigned int size)
+{
+	dev->tso_max_size = min(GSO_MAX_SIZE, size);
+	if (size < READ_ONCE(dev->gso_max_size))
+		WRITE_ONCE(dev->gso_max_size, size);
+}
+
+void netif_set_tso_max_segs(struct net_device *dev, unsigned int segs)
+{
+	dev->tso_max_segs = segs;
+	if (segs < READ_ONCE(dev->gso_max_segs))
+		WRITE_ONCE(dev->gso_max_segs, segs);
+}
+
+/* Software interrupt coalescing (deferred NAPI) is a tuning default; Nova keeps it off. */
+void netdev_sw_irq_coalesce_default_on(struct net_device *dev)
+{
+}
+
+void ethtool_rss_notify(struct net_device *dev, u32 type, u32 rss_context)
+{
+}
+
+/* Memory-provider channels (io_uring zero copy) are not used. */
+u32 dev_get_min_mp_channel_count(const struct net_device *dev)
+{
+	return 0;
+}
+
+/* PHY packages (several PHYs in one chip, such as switch PHYs) are not supported. */
+int devm_phy_package_join(struct device *dev, struct phy_device *phydev, int base_addr,
+			  size_t priv_size)
+{
+	return -ENODEV;
 }

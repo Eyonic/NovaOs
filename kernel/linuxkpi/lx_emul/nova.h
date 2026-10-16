@@ -54,6 +54,10 @@ u64 nova_random_u64(void);
 /* Interrupts: unmask (enable) or mask a PCI line at Nova's interrupt controller. */
 void nova_irq_line(unsigned int line, bool enable);
 
+/* Firmware: the bytes of /lib/firmware/<name> in a nova_alloc() buffer (freed with
+ * nova_free), or NULL. */
+void *nova_firmware_read(const char *name, size_t name_len, size_t *len);
+
 /* Network: a frame the Linux driver received, for Nova's network stack. */
 void nova_netdev_rx(void *dev, const u8 *frame, size_t len);
 

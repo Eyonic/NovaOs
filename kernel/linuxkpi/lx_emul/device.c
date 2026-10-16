@@ -24,6 +24,8 @@
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
+#include <linux/sysfs.h>
 #include "nova.h"
 
 struct device_private {
@@ -766,4 +768,43 @@ int cdev_add(struct cdev *p, dev_t dev, unsigned count)
 
 void cdev_del(struct cdev *p)
 {
+}
+
+/* ---------------------------------------------------------------- classes, links, sysfs */
+
+/* Classes keep only a name here (no device lists), so nothing is found. */
+struct device *class_find_device(const struct class *class, const struct device *start,
+				 const void *data, device_match_t match)
+{
+	return NULL;
+}
+
+/* Device links order suspend and removal; Nova does neither, so none are kept. */
+struct device_link *device_link_add(struct device *consumer, struct device *supplier, u32 flags)
+{
+	return NULL;
+}
+
+int device_match_name(struct device *dev, const void *name)
+{
+	return sysfs_streq(dev_name(dev), name);
+}
+
+int device_match_fwnode(struct device *dev, const void *fwnode)
+{
+	return dev_fwnode(dev) == fwnode;
+}
+
+int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr, const struct ns_common *ns)
+{
+	return 0;
+}
+
+void sysfs_remove_file_ns(struct kobject *kobj, const struct attribute *attr, const struct ns_common *ns)
+{
+}
+
+int sysfs_create_link_nowarn(struct kobject *kobj, struct kobject *target, const char *name)
+{
+	return 0;
 }
