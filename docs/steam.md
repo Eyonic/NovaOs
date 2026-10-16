@@ -38,7 +38,7 @@ Each of these was found by running Steam and is a general Linux-compatibility fi
 |---|---|
 | 32-bit client with a 4 GiB address space | i386 compatibility mode; mmap that fails with ENOMEM instead of overlapping mappings; per-thread kernel buffers kept above 4 GiB |
 | Steam runtime containers | mount namespaces, bind mounts, `pivot_root`, user namespaces (bubblewrap) |
-| Audio (libpulse retries for ever without a server) | a PulseAudio native-protocol server in the kernel (`pulse.rs`) with no devices |
+| Audio (libpulse retries for ever without a server) | a PulseAudio native-protocol server in the kernel (`pulse.rs`); with an HD Audio device it plays streams (see [audio.md](audio.md)) |
 | Chromium's zygote (it asks the browser for each child's pid) | `SO_PASSCRED` / `SCM_CREDENTIALS` |
 | Chromium's sandbox IPC (localtime, fonts) | Linux `poll` semantics for half-shut Unix sockets (`shutdown(SHUT_RD/SHUT_WR)`) |
 | The UI's websocket to the client | loopback TCP (127.0.0.1) |
