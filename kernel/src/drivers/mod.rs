@@ -8,6 +8,7 @@
 
 pub mod ahci;
 pub mod e1000;
+pub mod hda;
 pub mod nvme;
 
 use alloc::boxed::Box;
@@ -97,6 +98,7 @@ pub fn probe_all(mut progress: impl FnMut(&Record)) -> Probed {
     }
     #[cfg(feature = "linux-drivers")]
     bind_linux(&mut records, &mut probed);
+    hda::start();
     for record in &records {
         progress(record);
     }
@@ -177,6 +179,12 @@ fn bind(dev: &Device, probed: &mut Probed) -> Status {
                 Status::Bound { driver: "ahci", detail }
             }
             Err(e) => Status::Failed { driver: "ahci", error: e },
+        };
+    }
+    if (dev.class, dev.subclass) == (0x04, 0x03) && !disabled("hda") {
+        return match hda::probe(dev) {
+            Ok(detail) => Status::Bound { driver: "hda", detail },
+            Err(e) => Status::Failed { driver: "hda", error: e },
         };
     }
     match (dev.class, dev.subclass) {
