@@ -113,3 +113,18 @@ icons), round caps and joins, drawn at 4x and box-filtered down so the edges are
 anti-aliased. `forward` and `back`, `up`, and the chevrons are the same arrow turned, so
 pairs match exactly. The kernel tints them (`ui::symbol`) in the text colours, or draws
 them white on a coloured tile (`ui::tile`) for sidebar sections.
+
+## Craft App Suite icons and placeholder art (third-party)
+
+`icons/craft_<app>.png`, `home/craft_<app>.png` and `home/hero_craft_<app>.png` are not
+generated for Nova: they are made by `scripts/make-craft-art.py` from each app's own icon
+(`assets/app-icon/hicolor/256x256/apps/ai.storyteller.<app>.png` in its repository) for the
+Craft App Suite by storytold: WordCraft, GridCraft, DeckCraft, PdfCraft, PhotoCraft,
+LightCraft, FilmCraft, SoundCraft, VectorCraft, DesignCraft, FigCraft, CadCraft,
+EffectCraft and the ArtCraft launcher (https://github.com/storytold/<app>), licensed
+MIT OR Apache-2.0, Copyright (c) their authors. The icons are used as the apps' icons for
+the apps themselves (installed with `NOVA_CRAFT=...`, see docs/craft-apps.md); the script
+only fills the transparent corners with the tile colour and resizes (icons), or places the
+icon on a black stage with a haze of that colour and a floor reflection (capsules 352x500,
+heroes 768x480, in the layout of Home's key art above). They are placeholders until the
+apps get key art in the series' direction.
