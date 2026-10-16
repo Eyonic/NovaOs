@@ -294,6 +294,18 @@ pub fn recent_calls(pid: u64) -> Vec<String> {
     out
 }
 
+/// Run `f` on every thread of process `pid`, the calling one included (seccomp TSYNC).
+/// Tasks never run concurrently, so the others are parked in the kernel meanwhile.
+pub fn each_thread(pid: u64, mut f: impl FnMut(&mut crate::process::UserState)) {
+    for t in scheduler().tasks.iter_mut() {
+        if let Some(u) = t.user.as_deref_mut()
+            && u.process.pid == pid
+        {
+            f(u);
+        }
+    }
+}
+
 /// (id, name, state) of every task, for the `ps` command.
 pub fn list() -> Vec<(usize, String, &'static str)> {
     let s = scheduler();

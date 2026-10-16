@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 vfs containers wayland busybox net linuxnet linuxmsi usbinput audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 seccomp vfs containers wayland busybox net linuxnet linuxmsi usbinput audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -151,6 +151,16 @@ define_case() {
                         "proctest: 15 passed, 0 failed" "  ok   each thread has its own __thread variable"
                         "threads32: 7 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
+        seccomp) # seccomp for sandboxes (Chromium's): no_new_privs, BPF filters with ERRNO, TRAP
+                # (SIGSYS handler emulating the call), KILL, TSYNC, fork/exec, strict mode
+                # (userland/seccomptest.c).
+                CMDLINE="nova.mode=shell"
+                INPUT=("wait:$PROMPT" "ser:seccomptest" "wait:seccomptest: " "wait:seccomptest: ")
+                EXPECT=("${shell[@]}" "seccomptest: seccomp filters and strict mode"
+                        "  ok   SECCOMP_RET_TRAP: SIGSYS handler sees siginfo and ucontext, sets the result in rax"
+                        "  ok   SECCOMP_FILTER_FLAG_TSYNC: other threads get the filter; a diverged thread blocks it"
+                        "  ok   strict mode: write() still works" "seccomptest: 13 passed, 0 failed")
+                FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall") ;;
         vfs)    # The file system Linux programs see (vfs.rs): symbolic and hard links, directories,
                 # rename, permissions, tmpfs at /run (userland/vfstest.c), named Unix sockets
                 # (userland/unixtest.c), and BusyBox tar and cp keeping symbolic links.

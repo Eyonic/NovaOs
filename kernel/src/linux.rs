@@ -29,6 +29,7 @@ use crate::gdt;
 use crate::vfs;
 
 pub mod compat32;
+pub mod seccomp;
 pub mod sysv;
 use crate::sync::SpinLock;
 use crate::{ipc, pit, rand, rtc, task};
@@ -673,7 +674,23 @@ fn lexical(cwd: &str, path: &str) -> String {
 
 /// The calling process's mount namespace.
 fn ns() -> Arc<vfs::Namespace> {
+    if let Some(n) = &thread().ns_override {
+        return n.clone();
+    }
     proc().ns.lock().clone()
+}
+
+/// The path of directory `at` for a lookup of `p` relative to it. A directory outside
+/// the caller's root (a descriptor opened before chroot) still works, as on Linux: the
+/// rest of this system call then resolves paths inside that directory alone.
+fn dir_base(at: &vfs::At) -> String {
+    match ns().vpath(at) {
+        Some(p) => p,
+        None => {
+            thread().ns_override = Some(vfs::Namespace::rooted_at(at));
+            String::new()
+        }
+    }
 }
 
 /// Where an open directory is now, in this process's namespace ("" if unreachable).
@@ -792,10 +809,11 @@ fn proc_file(name: &str) -> Option<String> {
     Some(match name.as_str() {
         "proc/self/maps" => mem().maps(),
         "proc/self/status" => format!(
-            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t{pp}\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            "Name:\t{}\nState:\tR (running)\nTgid:\t{p}\nPid:\t{p}\nPPid:\t{pp}\nUid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nThreads:\t{}\nVmRSS:\t{} kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n{}",
             proc().name,
             proc().threads.load(core::sync::atomic::Ordering::Relaxed),
             used / 1024,
+            seccomp_status(proc().pid),
             p = proc().pid,
             pp = proc().parent.load(core::sync::atomic::Ordering::Relaxed),
             u = { let c = proc().cred.lock(); c.show(c.uid, false) },
@@ -872,7 +890,8 @@ fn proc_pid_file(p: &Process, file: &str) -> Option<String> {
     Some(match file {
         "stat" => format!("{} ({comm}) R {ppid} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {threads} 0 0 0 0\n", p.pid, p.pid, p.pid),
         "status" => format!(
-            "Name:\t{comm}\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nThreads:\t{threads}\nVmRSS:\t0 kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n",
+            "Name:\t{comm}\nState:\tR (running)\nTgid:\t{pid}\nPid:\t{pid}\nPPid:\t{ppid}\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nGid:\t{gid}\t{gid}\t{gid}\t{gid}\nThreads:\t{threads}\nVmRSS:\t0 kB\nCpus_allowed:\t1\nCpus_allowed_list:\t0\n{}",
+            seccomp_status(p.pid),
             pid = p.pid
         ),
         "cmdline" => {
@@ -882,6 +901,28 @@ fn proc_pid_file(p: &Process, file: &str) -> Option<String> {
         "comm" => format!("{comm}\n"),
         _ => return None,
     })
+}
+
+/// status's NoNewPrivs/Seccomp lines: the calling thread's for its own process, the
+/// main thread's for another.
+fn seccomp_status(pid: u64) -> String {
+    if pid == proc().pid {
+        return seccomp::status_lines(thread().no_new_privs, &thread().seccomp);
+    }
+    let mut out = None;
+    task::each_thread(pid, |t| {
+        if out.is_none() || t.tid == pid {
+            out = Some(seccomp::status_lines(t.no_new_privs, &t.seccomp));
+        }
+    });
+    out.unwrap_or_default()
+}
+
+/// clone with CLONE_FS: the other processes that share the caller's root and working
+/// directory.
+fn fs_sharers() -> Vec<Arc<Process>> {
+    let Some(token) = proc().fs_share.lock().clone() else { return Vec::new() };
+    process::processes().into_iter().filter(|q| q.pid != proc().pid && q.fs_share.lock().as_ref().is_some_and(|t| Arc::ptr_eq(t, &token))).collect()
 }
 
 fn proc_norm(rel: &str) -> String {
@@ -921,9 +962,9 @@ fn fd_link(n: i64) -> Option<String> {
     })
 }
 
-const PROC_DIRS: &[&str] = &["", "self", "self/fd", "self/ns", "self/task", "sys", "sys/kernel", "sys/kernel/yama", "sys/vm", "sys/fs", "sys/fs/inotify", "sys/user"];
+const PROC_DIRS: &[&str] = &["", "self", "self/fd", "self/fdinfo", "self/ns", "self/task", "sys", "sys/kernel", "sys/kernel/yama", "sys/vm", "sys/fs", "sys/fs/inotify", "sys/user"];
 const PROC_ROOT: &[&str] = &["self", "thread-self", "cpuinfo", "meminfo", "mounts", "stat", "uptime", "loadavg", "filesystems", "sys"];
-const PROC_SELF: &[&str] = &["exe", "root", "cwd", "fd", "ns", "maps", "status", "stat", "statm", "cmdline", "comm", "mountinfo", "mounts", "limits", "oom_score_adj", "uid_map", "gid_map", "setgroups", "cgroup"];
+const PROC_SELF: &[&str] = &["exe", "root", "cwd", "fd", "fdinfo", "ns", "maps", "status", "stat", "statm", "cmdline", "comm", "mountinfo", "mounts", "limits", "oom_score_adj", "uid_map", "gid_map", "setgroups", "cgroup"];
 const NAMESPACES: &[&str] = &["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"];
 
 struct ProcFs;
@@ -1219,8 +1260,9 @@ fn at_path(dirfd: i64, p: &str) -> Result<String, i64> {
             Kind::Dir { at } => Some(at),
             _ => None,
         }) {
-            let base = dir_path(at);
+            let at = at.clone();
             drop(f);
+            let base = dir_base(&at);
             return Ok(resolve(&format!("/{base}/{p}")));
         }
     }
@@ -1236,7 +1278,11 @@ fn at_path_nf(dirfd: i64, p: &str, follow: bool) -> Result<String, i64> {
             Kind::Dir { at } => Some(at),
             _ => None,
         }) {
-            Some(at) => format!("/{}/{p}", dir_path(at)),
+            Some(at) => {
+                let at = at.clone();
+                drop(f);
+                format!("/{}/{p}", dir_base(&at))
+            }
             None => String::from(p),
         }
     } else {
@@ -1756,10 +1802,17 @@ pub fn syscall(f: &mut SyscallFrame) -> i64 {
     let (nr, a0, a1, a2, a3, a4, a5) = (f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let trace = proc().trace.load(core::sync::atomic::Ordering::Relaxed);
     let tid = thread().tid;
+    if thread().seccomp.mode != seccomp::MODE_DISABLED
+        && let Some(r) = seccomp::check(f.rip, nr, [a0, a1, a2, a3, a4, a5], false)
+    {
+        thread().recent.push(nr, [a0, a1, a2], r);
+        return r;
+    }
     thread().in_syscall = nr;
     thread().syscall_arg = a0;
     thread().syscall_arg2 = a1;
     let r = dispatch(f, nr, a0, a1, a2, a3, a4, a5);
+    thread().ns_override = None;
     thread().recent.push(nr, [a0, a1, a2], r);
     thread().in_syscall = u64::MAX;
     if trace {
@@ -1813,7 +1866,7 @@ fn syscall_name(nr: u64) -> String {
  39 => "getpid", 40 => "sendfile", 57 => "fork", 58 => "vfork", 59 => "execve", 61 => "wait4", 62 => "kill", 77 => "ftruncate", 87 => "unlink", 84 => "rmdir", 88 => "symlink", 266 => "symlinkat", 86 => "link", 265 => "linkat", 280 => "utimensat", 76 => "truncate", 90 => "chmod", 285 => "fallocate", 41 => "socket", 42 => "connect", 44 => "sendto", 45 => "recvfrom", 46 => "sendmsg", 47 => "recvmsg",
         42 => "connect", 49 => "bind", 53 => "socketpair", 307 => "sendmmsg", 56 => "clone", 60 => "exit", 63 => "uname", 72 => "fcntl", 79 => "getcwd",
         89 => "readlink", 96 => "gettimeofday", 97 => "getrlimit", 99 => "sysinfo", 137 => "statfs", 138 => "fstatfs",
-        157 => "prctl", 158 => "arch_prctl", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
+        157 => "prctl", 158 => "arch_prctl", 317 => "seccomp", 186 => "gettid", 202 => "futex", 204 => "sched_getaffinity",
         213 => "epoll_create", 217 => "getdents64", 218 => "set_tid_address", 228 => "clock_gettime",
         231 => "exit_group", 232 => "epoll_wait", 233 => "epoll_ctl", 257 => "openat", 262 => "newfstatat",
         273 => "set_robust_list", 332 => "statx", 281 => "epoll_pwait", 284 => "eventfd", 290 => "eventfd2", 291 => "epoll_create1",
@@ -1845,8 +1898,12 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let (dirfd, path, flags) = if nr == 2 { (AT_FDCWD, a0, a1) } else { (a0 as i32 as i64, a1, a2) };
                 let mut p = read_cstr(path)?;
                 if dirfd != AT_FDCWD && !p.starts_with('/') {
-                    if let Kind::Dir { at } = &fds().get(dirfd)?.lock().kind {
-                        p = format!("/{}/{p}", dir_path(at));
+                    let at = match &fds().get(dirfd)?.lock().kind {
+                        Kind::Dir { at } => Some(at.clone()),
+                        _ => None,
+                    };
+                    if let Some(at) = at {
+                        p = format!("/{}/{p}", dir_base(&at));
                     }
                 }
                 let file = open(&p, flags, (if nr == 2 { a2 } else { a3 }) as u32)?;
@@ -2291,7 +2348,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         // The peer is not tracked; programs talking over local sockets
                         // run as the same user, so the caller's own ids stand in.
                         let (uid, gid) = { let cr = proc().cred.lock(); (cr.show(cr.euid, false), cr.show(cr.egid, true)) };
-                        c.extend_from_slice(&(proc().pid as i32).to_le_bytes());
+                        c.extend_from_slice(&(process::pid_view(proc(), proc().pid) as i32).to_le_bytes());
                         c.extend_from_slice(&uid.to_le_bytes());
                         c.extend_from_slice(&gid.to_le_bytes());
                         c
@@ -2788,9 +2845,10 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 sleep_ns(ns);
                 0
             }
-            39 => proc().pid as i64,
-            186 => thread().tid as i64,
-            110 => proc().parent.load(core::sync::atomic::Ordering::Relaxed) as i64, // getppid
+            // Ids as the caller's PID namespace numbers them.
+            39 => process::pid_view(proc(), proc().pid) as i64,
+            186 => process::pid_view(proc(), thread().tid) as i64,
+            110 => process::pid_view(proc(), proc().parent.load(core::sync::atomic::Ordering::Relaxed)) as i64, // getppid
             60 => process::exit_thread(a0 as i32 & 0xFF),
             231 => process::exit(a0 as i32 & 0xFF),
             63 => {
@@ -2857,6 +2915,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     Kind::Dir { at } => dir_path(at),
                     _ => return Err(ENOTDIR),
                 };
+                for q in fs_sharers() {
+                    q.fds.lock().cwd = path.clone();
+                }
                 fds().cwd = path;
                 0
             }
@@ -2865,6 +2926,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let name = resolve(&read_cstr(a0)?);
                 if !is_dir(&name) {
                     return Err(ENOENT);
+                }
+                for q in fs_sharers() {
+                    q.fds.lock().cwd = name.clone();
                 }
                 fds().cwd = name;
                 0
@@ -3165,10 +3229,21 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 if !is_dir(&p) {
                     return Err(ENOTDIR);
                 }
+                // /proc/self/... names the caller: once it is gone, so is the directory
+                // (Chromium's sandbox chroots a CLONE_FS child into its own fdinfo).
+                let p = match p.strip_prefix("proc/self/") {
+                    Some(rest) => format!("proc/{}/{rest}", proc().pid),
+                    None => p,
+                };
                 let new = ns().chroot(&p);
-                *proc().ns.lock() = new;
+                *proc().ns.lock() = new.clone();
                 let cwd = fds().cwd.clone();
-                fds().cwd = if cwd == p { String::new() } else { cwd.strip_prefix(&format!("{p}/")).unwrap_or("").into() };
+                let cwd: String = if cwd == p { String::new() } else { cwd.strip_prefix(&format!("{p}/")).unwrap_or("").into() };
+                fds().cwd = cwd.clone();
+                for q in fs_sharers() {
+                    *q.ns.lock() = new.clone();
+                    q.fds.lock().cwd = cwd.clone();
+                }
                 0
             }
             272 => {
@@ -3180,6 +3255,11 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 if a0 & CLONE_NEWUSER != 0 {
                     process::unshare_user(proc().pid);
+                }
+                if a0 & process::CLONE_NEWPID != 0 {
+                    // The caller stays where it is; its next child is the new namespace's init.
+                    let base = proc().child_pidns.lock().clone().or_else(|| proc().pidns.lock().clone());
+                    *proc().child_pidns.lock() = Some(process::PidNs::new(base));
                 }
                 0
             }
@@ -3215,8 +3295,19 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 // prctl
                 3 => 1,                                     // PR_GET_DUMPABLE
                 23 => if a1 <= CAP_LAST { 1 } else { return Err(EINVAL) }, // PR_CAPBSET_READ
-                21 | 22 | 24 | 47 => 0,                     // PR_GET/SET_SECCOMP, PR_CAPBSET_DROP, PR_CAP_AMBIENT
-                1 | 4 | 8 | 36 | 38 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, CHILD_SUBREAPER, NO_NEW_PRIVS, SET_VMA
+                24 | 47 => 0,                               // PR_CAPBSET_DROP, PR_CAP_AMBIENT
+                1 | 4 | 8 | 36 | 0x53564d41 => 0, // PDEATHSIG, SET_DUMPABLE, KEEPCAPS, CHILD_SUBREAPER, SET_VMA
+                21 => thread().seccomp.mode as i64,         // PR_GET_SECCOMP
+                22 => seccomp::prctl_set(a1, a2)?,          // PR_SET_SECCOMP
+                38 => {
+                    // PR_SET_NO_NEW_PRIVS: one way only
+                    if a1 != 1 || a2 | a3 | a4 != 0 {
+                        return Err(EINVAL);
+                    }
+                    thread().no_new_privs = true;
+                    0
+                }
+                39 => if a1 | a2 | a3 | a4 != 0 { return Err(EINVAL) } else { thread().no_new_privs as i64 }, // PR_GET_NO_NEW_PRIVS
                 15 => {
                     // PR_SET_NAME: the thread's name (up to 15 bytes)
                     let mut n = read_cstr(a1).unwrap_or_default();
@@ -3235,6 +3326,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 _ => return Err(EINVAL),
             },
+            317 => seccomp::seccomp(a0, a1, a2)?,
             95 => 0o022,                   // umask
             96 => {
                 // gettimeofday
@@ -3446,7 +3538,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             218 => {
                 // set_tid_address
                 thread().clear_tid = a0;
-                thread().tid as i64
+                process::pid_view(proc(), thread().tid) as i64
             }
             228 => {
                 // clock_gettime
@@ -3535,7 +3627,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 n as i64
             }
-            57 | 58 => process::fork(f, nr == 58, 0, None)? as i64, // fork, vfork
+            57 | 58 => process::pid_view(proc(), process::fork(f, nr == 58, 0, None, 0)?) as i64, // fork, vfork
             59 | 322 => {
                 // execve(path, argv, envp), execveat(dirfd, path, argv, envp, flags)
                 let (path, argv, envp) = if nr == 59 { (a0, a1, a2) } else { (a1, a2, a3) };
@@ -3562,6 +3654,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 if sig > signal::NSIG {
                     return Err(EINVAL);
                 }
+                let pid = if pid > 0 { process::pid_lookup(proc(), pid as u64).ok_or(ESRCH)? as i64 } else { pid };
                 if pid == proc().pid as i64 || pid == 0 {
                     signal::send_process(proc(), sig, proc().pid);
                 } else if pid > 0 {
@@ -3582,6 +3675,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 if sig > signal::NSIG {
                     return Err(EINVAL);
                 }
+                let tid = process::pid_lookup(proc(), tid).ok_or(ESRCH)?;
+                let a0 = if nr == 234 { process::pid_lookup(proc(), a0).ok_or(ESRCH)? } else { a0 };
                 if tid == thread().tid {
                     signal::send_self(thread(), sig);
                 } else if let Some(p) = process::find(if nr == 234 { a0 } else { tid }) {
@@ -3594,7 +3689,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
             61 => {
                 // wait4(pid, wstatus, options, rusage)
                 let nohang = a2 & 1 != 0;
-                match process::wait_child(a0 as i32 as i64, nohang, true)? {
+                let want = a0 as i32 as i64;
+                let want = if want > 0 { process::pid_lookup(proc(), want as u64).ok_or(10i64)? as i64 } else { want }; // ECHILD
+                match process::wait_child(want, nohang, true)? {
                     Some((pid, status)) => {
                         if a1 != 0 {
                             write_user(a1, &status.to_le_bytes())?;
@@ -3602,14 +3699,14 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         if a3 != 0 {
                             write_user(a3, &[0u8; 144])?;
                         }
-                        pid as i64
+                        process::pid_view(proc(), pid) as i64
                     }
                     None => 0,
                 }
             }
             247 => {
                 // waitid(idtype, id, infop, options): P_ALL 0, P_PID 1
-                let pid = if a0 == 1 { a1 as i32 as i64 } else { -1 };
+                let pid = if a0 == 1 { process::pid_lookup(proc(), a1 as i32 as u64).ok_or(10i64)? as i64 } else { -1 }; // ECHILD
                 let (nohang, reap) = (a3 & 1 != 0, a3 & 0x0100_0000 == 0); // WNOHANG, WNOWAIT
                 match process::wait_child(pid, nohang, reap)? {
                     Some((child, status)) => {
@@ -3619,7 +3716,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                             info[0..4].copy_from_slice(&(signal::SIGCHLD as i32).to_le_bytes());
                             let (code, value) = if status & 0x7F != 0 { (2, status & 0x7F) } else { (1, (status >> 8) & 0xFF) };
                             info[8..12].copy_from_slice(&(code as i32).to_le_bytes());
-                            info[16..20].copy_from_slice(&(child as i32).to_le_bytes());
+                            info[16..20].copy_from_slice(&(process::pid_view(proc(), child) as i32).to_le_bytes());
                             info[24..28].copy_from_slice(&value.to_le_bytes());
                             write_user(a2, &info)?;
                         }
@@ -3656,19 +3753,20 @@ const CAP_LAST: u64 = 40;
 /// glibc's posix_spawn uses with CLONE_VFORK, is served as a vfork-style copy).
 fn clone(f: &SyscallFrame, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> Result<i64, i64> {
     if flags & CLONE_VM == 0 || flags & CLONE_THREAD == 0 {
-        let pid = process::fork(f, flags & CLONE_VFORK != 0, stack, (flags & CLONE_SETTLS != 0).then_some(tls))?;
+        let pid = process::fork(f, flags & CLONE_VFORK != 0, stack, (flags & CLONE_SETTLS != 0).then_some(tls), flags)?;
         if flags & CLONE_NEWNS != 0 {
             process::unshare_ns(pid);
         }
         if flags & CLONE_NEWUSER != 0 {
             process::unshare_user(pid);
         }
+        let pid = process::pid_view(proc(), pid);
         if flags & CLONE_PARENT_SETTID != 0 {
             write_user(parent_tid, &(pid as u32).to_le_bytes())?;
         }
         return Ok(pid as i64);
     }
-    let tid = process::spawn_thread(f, stack, (flags & CLONE_SETTLS != 0).then_some(tls), if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 });
+    let tid = process::pid_view(proc(), process::spawn_thread(f, stack, (flags & CLONE_SETTLS != 0).then_some(tls), if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 }));
     if flags & CLONE_PARENT_SETTID != 0 {
         write_user(parent_tid, &(tid as u32).to_le_bytes())?;
     }
@@ -4012,7 +4110,7 @@ fn recvmsg(fd: i64, msg: u64, flags: u64) -> Result<i64, i64> {
         c.extend_from_slice(&28u64.to_le_bytes());
         c.extend_from_slice(&1i32.to_le_bytes());
         c.extend_from_slice(&2i32.to_le_bytes());
-        c.extend_from_slice(&(sender as i32).to_le_bytes());
+        c.extend_from_slice(&(process::pid_view(proc(), sender as u64) as i32).to_le_bytes());
         c.extend_from_slice(&uid.to_le_bytes());
         c.extend_from_slice(&gid.to_le_bytes());
         c.resize(32, 0);

@@ -32,6 +32,7 @@ pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
 pub const SIGURG: u32 = 23;
 pub const SIGWINCH: u32 = 28;
+pub const SIGSYS: u32 = 31;
 pub const NSIG: u32 = 64;
 
 const SIG_DFL: u64 = 0;
@@ -193,6 +194,11 @@ pub(crate) fn pending_masked(u: &UserState, mask: u64) -> bool {
     (u.pending | u.process.signals.lock().pending) & mask != 0
 }
 
+/// The seccomp details for a SIGSYS a filter raised in this thread (taken once).
+pub(crate) fn sigsys_info(u: &mut UserState, sig: u32, to_thread: bool) -> Option<crate::linux::seccomp::Sigsys> {
+    if sig == SIGSYS && to_thread { u.sigsys.take() } else { None }
+}
+
 // rt_sigframe layout (x86-64): pretcode, ucontext, siginfo; the FPU state follows.
 const UC: u64 = 8;
 const UC_STACK: u64 = UC + 16;
@@ -285,7 +291,15 @@ fn push_frame(u: &mut UserState, f: &mut SyscallFrame, sig: u32, sender: u32, to
         w64(UC_SIGMASK, old_mask);
         w32(INFO, sig);
         w32(INFO + 8, if to_thread { SI_TKILL as u32 } else { SI_USER as u32 });
-        w32(INFO + 16, sender);
+        w32(INFO + 16, process::pid_view(&u.process, sender as u64) as u32);
+        if let Some(t) = sigsys_info(u, sig, to_thread) {
+            // _sigsys: call address, call number, audit architecture; si_errno = filter data.
+            w32(INFO + 4, t.errno);
+            w32(INFO + 8, crate::linux::seccomp::SYS_SECCOMP);
+            w64(INFO + 16, t.call_addr);
+            w32(INFO + 24, t.syscall);
+            w32(INFO + 28, t.arch);
+        }
         // The live SIMD state belongs to this thread (the kernel does not use it).
         process::save_fpu(fpstate as *mut u8);
         if xsave_size != 0 {
