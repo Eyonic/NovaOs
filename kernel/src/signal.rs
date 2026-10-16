@@ -136,6 +136,26 @@ pub fn send_self(u: &mut UserState, sig: u32) {
     }
 }
 
+/// Make `sig` pending for thread `tid` of process `p` (tgkill to another thread), and
+/// wake it so a blocking call returns to deliver it: glibc's pthread_cancel relies on
+/// SIGCANCEL reaching exactly the thread it cancels. False if there is no such thread.
+pub fn send_thread(p: &process::Process, tid: u64, sig: u32) -> bool {
+    if sig == SIGKILL {
+        process::terminate(p, SIGKILL);
+        return true;
+    }
+    if !crate::task::with_user_thread(p.pid, tid, |u| {
+        if sig != 0 && sig <= NSIG {
+            u.pending |= bit(sig);
+        }
+    }) {
+        return false;
+    }
+    crate::linux::futex_wake_all(p);
+    crate::ipc::notify();
+    true
+}
+
 /// A deliverable (pending and not blocked) signal for `u`, if any, without taking it.
 pub fn has_deliverable(u: &UserState) -> bool {
     let s = u.process.signals.lock();

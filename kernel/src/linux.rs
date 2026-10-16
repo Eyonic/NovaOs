@@ -3584,6 +3584,8 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 if tid == thread().tid {
                     signal::send_self(thread(), sig);
+                } else if signal::send_thread(proc(), tid, sig) {
+                    // Another thread of ours, exactly that one.
                 } else if let Some(p) = process::find(if nr == 234 { a0 } else { tid }) {
                     signal::send_process(&p, sig, proc().pid); // to the process: delivered to some thread
                 } else {
@@ -3835,6 +3837,11 @@ fn futex_wait(addr: u64, val: u32, until: Option<u64>, bitset: u32, shared: bool
         if p.exiting.load(core::sync::atomic::Ordering::SeqCst) {
             remove();
             return Err(EINTR);
+        }
+        // A signal interrupts the wait, as on Linux: glibc's pthread_cancel sends
+        // SIGCANCEL and the thread acts on it when its wait returns and starts again.
+        if signal::has_deliverable(thread()) {
+            return if remove() { Ok(0) } else { Err(EINTR) };
         }
         if until.is_some_and(|u| pit::ticks() >= u) {
             return if remove() { Ok(0) } else { Err(ETIMEDOUT) };
