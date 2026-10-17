@@ -181,5 +181,21 @@ switched off).
   that wake limited to polls where smoltcp moved a packet, idle Steam's lock time fell to
   about 1%, but the Steam client then stalled before starting its web helper on 4 CPUs
   (some socket readiness is not announced by packet activity). That needs finding first.
+
+  Second attempt (2026-10-17, not merged), measured on fresh images with the same script
+  (baseline: web helper +62 s, sign-in +66 s, idle Steam 14% lock time):
+  - the network task notifies only when a fingerprint of every socket's readiness
+    (state, can/may recv/send, queue lengths) changes, whoever polled the stack;
+  - `ipc::wait` parks in a new `Io` state until `notify`, a device interrupt (a separate
+    counter that the timer does not bump), the caller's deadline, the expiry of a timerfd
+    the caller itself polled, or a 10 ms re-check;
+  - every `next_gen()` marks a change, and the system-call exit wakes waiters once.
+
+  Steam then reached the sign-in window at +127 s, or later. Logging showed that almost
+  no readiness was found only by the 10 ms re-check, so wake-ups were not missed. The cost
+  is the opposite: `notify` wakes every I/O waiter (100+ Chromium threads), and doing so
+  after every state-changing system call wakes them far more often than once per tick.
+  The way forward is per-object wait queues (a waiter registers on the channels, sockets
+  and timerfds it polls, and a change wakes only those), not a global wake list.
 * Device interrupts on other CPUs (MSI affinity), asynchronous signal delivery to a thread
   running on another CPU, x2APIC for machines with APIC ids above 254, PCID.
