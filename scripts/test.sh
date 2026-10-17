@@ -339,10 +339,12 @@ define_case() {
                        "ser:$ch data:text/html,<img%20src=https://www.wikipedia.org/static/favicon/wikipedia.ico%20onerror=document.title='E'%20onload=document.title='K'>" "wait:</html>")
                 EXPECT=("${shell[@]}")
                 CONTAINS=("<title>K</title>") ;;
-        chromium) # The Chromium engine renders a page (no network needed) to a PNG.
+        chromium) # The Chromium engine renders a page (no network needed) to a PNG, in its normal
+                # multi-process mode (zygote, renderer, GPU process; --single-process is unsupported
+                # upstream and CHECK-fails in a destructor on exit).
                 CMDLINE="nova.mode=shell"
                 [[ -d "$BUILD/sysroot/opt/chromium" ]] || SKIP="Chromium not downloaded (scripts/fetch-chromium.sh)"
-                INPUT=("wait:$PROMPT" "ser:run opt/chromium/chrome-headless-shell --no-sandbox --single-process --no-zygote --disable-gpu --screenshot=/tmp/t.png --window-size=640,480 data:text/html,<h1>Nova</h1>" "wait:bytes written to file /tmp/t.png" "ser:ls tmp")
+                INPUT=("wait:$PROMPT" "ser:run opt/chromium/chrome-headless-shell --no-sandbox --disable-gpu --screenshot=/tmp/t.png --window-size=640,480 data:text/html,<h1>Nova</h1>" "wait:bytes written to file /tmp/t.png" "ser:ls tmp")
                 EXPECT=("${shell[@]}")
                 CONTAINS=("bytes written to file /tmp/t.png" "tmp/t.png")
                 FORBID=("$PANIC" "$EXC" "FATAL") ;;
