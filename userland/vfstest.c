@@ -3,6 +3,8 @@
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
+#include <stdint.h>
+#include <sys/inotify.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -151,6 +153,34 @@ int main(void)
 	check(pwrite(fd, "x", 1, 1LL << 36) == -1 && errno == ENOSPC, "a write at 64 GiB is ENOSPC");
 	close(fd);
 	unlink("/vfs-big");
+
+	// inotify: the changes made in a watched directory arrive as events, in order.
+	mkdir("/tmp/watched", 0755);
+	int in = inotify_init1(IN_NONBLOCK);
+	int wd = inotify_add_watch(in, "/tmp/watched", IN_CREATE | IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_DELETE);
+	check(in >= 0 && wd > 0, "inotify: watch a directory");
+	write_file("/tmp/watched/a", "x");
+	mkdir("/tmp/watched/d", 0755);
+	rename("/tmp/watched/a", "/tmp/watched/b");
+	unlink("/tmp/watched/b");
+	char ev[1024];
+	ssize_t got = read(in, ev, sizeof ev);
+	char seen[256] = "";
+	uint32_t from_cookie = 0, to_cookie = 0;
+	for (char *e = ev; got > 0 && e < ev + got;) {
+		struct inotify_event *ie = (struct inotify_event *)e;
+		char one[48];
+		snprintf(one, sizeof one, "%s%x:%s", seen[0] ? " " : "", ie->mask, ie->len ? ie->name : "");
+		strncat(seen, one, sizeof seen - strlen(seen) - 1);
+		if (ie->mask & IN_MOVED_FROM) from_cookie = ie->cookie;
+		if (ie->mask & IN_MOVED_TO) to_cookie = ie->cookie;
+		e += sizeof *ie + ie->len;
+	}
+	check(strcmp(seen, "100:a 8:a 40000100:d 40:a 80:b 200:b") == 0, "inotify: create, close-write, mkdir, move, delete events");
+	if (strcmp(seen, "100:a 8:a 40000100:d 40:a 80:b 200:b") != 0) printf("       got: %s\n", seen);
+	check(from_cookie != 0 && from_cookie == to_cookie, "inotify: a rename's two events share a cookie");
+	check(read(in, ev, sizeof ev) == -1 && errno == EAGAIN && inotify_rm_watch(in, wd) == 0, "inotify: queue drained, watch removed");
+	close(in);
 
 	mkdir("/run/many", 0755);
 	int made = 0;

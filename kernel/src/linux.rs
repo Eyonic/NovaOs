@@ -29,6 +29,7 @@ use crate::gdt;
 use crate::vfs;
 
 pub mod compat32;
+pub mod inotify;
 pub mod seccomp;
 #[cfg(feature = "linux-drivers")]
 pub mod lxfile;
@@ -108,6 +109,7 @@ pub enum Kind {
     Channel(ipc::End),
     EventFd(Arc<SpinLock<ipc::EventFd>>),
     TimerFd(Arc<SpinLock<ipc::TimerFd>>),
+    Inotify(inotify::InotifyRef),
     /// signalfd: reads the pending signals in its mask as signalfd_siginfo records.
     SignalFd(u64),
     Epoll(ipc::Epoll),
@@ -460,6 +462,7 @@ fn poll_file(f: &FileRef) -> (u32, u64) {
         Kind::Channel(end) => end.poll(),
         Kind::EventFd(e) => e.lock().poll(),
         Kind::TimerFd(t) => t.lock().poll(),
+        Kind::Inotify(i) => i.lock().poll(),
         Kind::SignalFd(mask) => (if signal::pending_masked(thread(), *mask) { ipc::POLLIN } else { 0 }, 0),
         Kind::Unix(UnixSocket { listener: Some(l), .. }) => l.lock().poll(),
         Kind::Unix(_) => (0, 0),
@@ -596,6 +599,8 @@ fn flush(f: &mut OpenFile) {
             crate::log::warn(&format!("could not write back {path}: error {e}"));
         }
         *dirty = false;
+        inotify::notify(path, inotify::IN_MODIFY, false);
+        inotify::notify(path, inotify::IN_CLOSE_WRITE, false);
     }
 }
 
@@ -996,6 +1001,7 @@ fn fd_link(n: i64) -> Option<String> {
         Kind::Channel(_) => "socket:[1]".into(),
         Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
         Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
+        Kind::Inotify(_) => "anon_inode:inotify".into(),
         Kind::SignalFd(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Memfd(_, None) => "/memfd: (deleted)".into(),
@@ -1053,7 +1059,7 @@ impl vfs::Backend for ProcFs {
         let file = fds().get(fd).ok()?;
         let f = file.lock();
         let at = match (&f.at, &f.kind) {
-            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::Unix(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
+            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::Unix(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
             (Some(at), _) => at.clone(),
             (None, Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at))) => at.clone(),
             _ => return None,
@@ -1444,7 +1450,7 @@ fn stat_file(f: &OpenFile) -> Vec<u8> {
         },
         Kind::Dir { at } => at.mount.fs.lstat(&at.rel).map(|m| stat_meta(&m)).unwrap_or_else(|_| stat_buf(0o40755, 4096, 0, 2)),
         Kind::Channel(e) => stat_buf(if e.rx.is_some() && e.tx.is_some() { 0o140777 } else { 0o10600 }, 0, 0, 3),
-        Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) => stat_buf(0o600, 0, 0, 4),
+        Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Epoll(_) | Kind::SignalFd(_) => stat_buf(0o600, 0, 0, 4),
         Kind::Memfd(m, Some(at)) => match at.mount.fs.lstat(&at.rel) {
             Ok(meta) => stat_meta(&vfs::Meta { size: m.lock().size, ..meta }),
             Err(_) => stat_buf(0o100644, m.lock().size, 0, 7),
@@ -1508,6 +1514,7 @@ fn open(path: &str, flags: u64, mode: u32) -> Result<FileRef, i64> {
                         return Err(EROFS);
                     }
                     m.fs.create(&rel, mode & !0o022)?;
+                    inotify::notify(&name, inotify::IN_CREATE, false);
                     m.fs.lstat(&rel)?
                 }
                 Err(e) => return Err(e),
@@ -1767,6 +1774,22 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     if let Some(t) = timer {
         return timerfd_read(f, &t, len);
     }
+    let watcher = match &f.lock().kind {
+        Kind::Inotify(i) => Some(i.clone()),
+        _ => None,
+    };
+    if let Some(i) = watcher {
+        loop {
+            if let Some(out) = i.lock().read(len)? {
+                return Ok(out);
+            }
+            if f.lock().flags & O_NONBLOCK != 0 {
+                return Err(EAGAIN);
+            }
+            ipc::wait(None);
+            process::check_exiting();
+        }
+    }
     if is_channel(f) {
         let (data, fds, _) = channel_read(f, len, false, false)?;
         drop(fds); // plain read() discards passed descriptors
@@ -1801,7 +1824,7 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
         Kind::Memfd(m, _) => m.lock().read(pos, len),
         Kind::Epoll(_) | Kind::Inet(_) => return Err(EINVAL),
         Kind::Unix(_) => return Err(ENOTCONN),
-        Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::SignalFd(_) => unreachable!(),
+        Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::SignalFd(_) => unreachable!(),
         #[cfg(feature = "linux-drivers")]
         Kind::Linux(_) => unreachable!(),
     };
@@ -1847,7 +1870,7 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
             }
             return Ok(data.len());
         }
-        Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
+        Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inotify(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
         #[cfg(feature = "linux-drivers")]
         Kind::Linux(_) => return Err(EINVAL),
         Kind::Unix(_) => return Err(ENOTCONN),
@@ -2007,6 +2030,7 @@ fn kind_name(k: &Kind) -> String {
         Kind::Channel(e) => format!("{}{:?}", if e.rx.is_some() && e.tx.is_some() { "socket " } else { "pipe " }, e.kind),
         Kind::EventFd(_) => "eventfd".into(),
         Kind::TimerFd(_) => "timerfd".into(),
+        Kind::Inotify(_) => "inotify".into(),
         Kind::SignalFd(_) => "signalfd".into(),
         Kind::Path => "path".into(),
         Kind::Unix(_) => "unix socket".into(),
@@ -2540,6 +2564,38 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 fds().add(new_file(Kind::EventFd(e), (flags & O_NONBLOCK) | 2), 0)
             }
             213 | 291 => fds().add(new_file(Kind::Epoll(ipc::Epoll::default()), 2), 0), // epoll_create(1)
+            253 | 294 => {
+                // inotify_init(), inotify_init1(flags: IN_NONBLOCK, IN_CLOEXEC)
+                let flags = if nr == 294 { a0 } else { 0 };
+                if flags & !(0o4000 | 0o2000000) != 0 {
+                    return Err(EINVAL);
+                }
+                fds().add(new_file(Kind::Inotify(inotify::new()), (flags & (O_NONBLOCK | 0o2000000)) | 2), 0)
+            }
+            254 => {
+                // inotify_add_watch(fd, path, mask)
+                let file = fds().get(a0 as i64)?;
+                let Kind::Inotify(i) = &file.lock().kind else { return Err(EINVAL) };
+                let i = i.clone();
+                let mask = a2 as u32;
+                let raw = read_cstr(a1)?;
+                let p = if mask & inotify::IN_DONT_FOLLOW != 0 { resolve_nofollow(&raw) } else { resolve(&raw) };
+                let st = stat_path(&p)?;
+                let is_dir = st.get(24..28).is_some_and(|m| u32::from_le_bytes(m.try_into().unwrap()) & 0o170000 == 0o040000);
+                if mask & inotify::IN_ONLYDIR != 0 && !is_dir {
+                    return Err(ENOTDIR);
+                }
+                i.lock().add_watch(p, mask)? as i64
+            }
+            255 => {
+                // inotify_rm_watch(fd, wd)
+                let file = fds().get(a0 as i64)?;
+                let Kind::Inotify(i) = &file.lock().kind else { return Err(EINVAL) };
+                let i = i.clone();
+                i.lock().rm_watch(a1 as i32)?;
+                ipc::notify();
+                0
+            }
             283 => {
                 // timerfd_create(clockid, flags): REALTIME, MONOTONIC, BOOTTIME and the
                 // _ALARM forms; TFD_NONBLOCK, TFD_CLOEXEC
@@ -2956,6 +3012,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                         let n = match &file.lock().kind {
                             Kind::Channel(e) => e.rx.as_ref().map_or(0, |c| c.lock().pending(e.kind != ipc::SockType::Stream)),
                             Kind::Inet(s) => crate::net::recv_pending(s.handle, s.udp),
+                            Kind::Inotify(i) => i.lock().pending(),
                             _ => 0,
                         };
                         write_user(a2, &(n as u32).to_le_bytes())?;
@@ -3205,6 +3262,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let p = resolve_nofollow(&read_cstr(a0)?);
                 let (m, rel) = ns().writable(&p)?;
                 m.fs.rmdir(&rel)?;
+                inotify::removed(&p, true);
                 0
             }
             221 => 0,                   // fadvise64: advice only
@@ -3226,6 +3284,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let mode = if nr == 90 { a1 } else { a2 };
                 let (m, rel) = ns().writable(&p)?;
                 m.fs.chmod(&rel, mode as u32)?;
+                inotify::notify(&p, inotify::IN_ATTRIB, false);
                 0
             }
             91 | 93 => {
@@ -3257,6 +3316,7 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 let (m, rel) = ns().writable(&p)?;
                 m.fs.mkdir(&rel, mode as u32 & !0o022)?;
+                inotify::notify(&p, inotify::IN_CREATE, true);
                 0
             }
             82 | 264 | 316 => {
@@ -3266,7 +3326,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     return Err(EEXIST); // RENAME_NOREPLACE
                 }
                 let (m, rf, rt) = ns().same_mount(&from, &to)?;
+                let is_dir = m.fs.lstat(&rf).is_ok_and(|st| st.ty == vfs::Type::Dir);
                 m.fs.rename(&rf, &rt)?;
+                inotify::moved(&from, &to, is_dir);
                 0
             }
             87 | 263 => {
@@ -3276,7 +3338,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                     return SHM.lock().remove(n).map(|_| 0).ok_or(ENOENT);
                 }
                 let (m, rel) = ns().writable(&p)?;
-                if nr == 263 && a2 & 0x200 != 0 { m.fs.rmdir(&rel)? } else { m.fs.unlink(&rel)? }
+                let dir = nr == 263 && a2 & 0x200 != 0;
+                if dir { m.fs.rmdir(&rel)? } else { m.fs.unlink(&rel)? }
+                inotify::removed(&p, dir);
                 ipc::unbind_name(&path_key(&p));
                 0
             }
