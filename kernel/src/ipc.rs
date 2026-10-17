@@ -322,6 +322,65 @@ pub struct EventFd {
     pub generation: u64,
 }
 
+/// timerfd: a timer read as a counter of expirations. Expirations are counted from the
+/// clock whenever the timer is looked at; waiters re-check at every timer interrupt, so
+/// no wake-up of its own is needed (1 ms resolution).
+pub struct TimerFd {
+    /// CLOCK_REALTIME (otherwise monotonic: MONOTONIC, BOOTTIME and their _ALARM forms).
+    pub realtime: bool,
+    /// Next expiration in the timer's clock (ns); 0 = disarmed.
+    pub next: u64,
+    /// Period (ns); 0 = one-shot.
+    pub interval: u64,
+    /// Expirations not yet read.
+    pub pending: u64,
+    fired: u64,
+    generation: u64,
+}
+
+pub fn timerfd(realtime: bool) -> Arc<SpinLock<TimerFd>> {
+    Arc::new(SpinLock::new(TimerFd { realtime, next: 0, interval: 0, pending: 0, fired: 0, generation: next_gen() }))
+}
+
+impl TimerFd {
+    pub fn now(&self) -> u64 {
+        if self.realtime { crate::rtc::unix_nanos() } else { pit::nanos() }
+    }
+    /// Count the expirations up to now.
+    pub fn update(&mut self) {
+        let now = self.now();
+        if self.next == 0 || now < self.next {
+            return;
+        }
+        let n = if self.interval > 0 { (now - self.next) / self.interval + 1 } else { 1 };
+        self.pending = self.pending.saturating_add(n);
+        self.fired = self.fired.wrapping_add(n);
+        self.next = if self.interval > 0 { self.next.saturating_add(n.saturating_mul(self.interval)) } else { 0 };
+    }
+    pub fn poll(&mut self) -> (u32, u64) {
+        self.update();
+        (if self.pending > 0 { POLLIN } else { 0 }, self.generation.wrapping_add(self.fired))
+    }
+    /// Arm (`value` 0 disarms) with `value` relative to now unless `absolute`; returns the
+    /// previous (interval, remaining).
+    pub fn set(&mut self, value: u64, interval: u64, absolute: bool) -> (u64, u64) {
+        self.update();
+        let old = self.get();
+        let now = self.now();
+        self.next = if value == 0 { 0 } else if absolute { value.max(1) } else { now.saturating_add(value) };
+        self.interval = interval;
+        self.pending = 0;
+        self.generation = next_gen();
+        old
+    }
+    /// (interval, time until the next expiration).
+    pub fn get(&mut self) -> (u64, u64) {
+        self.update();
+        let remaining = if self.next == 0 { 0 } else { self.next.saturating_sub(self.now()).max(1) };
+        (self.interval, remaining)
+    }
+}
+
 pub fn eventfd(initial: u64, semaphore: bool) -> Arc<SpinLock<EventFd>> {
     Arc::new(SpinLock::new(EventFd { value: initial, semaphore, generation: next_gen() }))
 }

@@ -107,6 +107,7 @@ pub enum Kind {
     /// Pipe end or Unix socket.
     Channel(ipc::End),
     EventFd(Arc<SpinLock<ipc::EventFd>>),
+    TimerFd(Arc<SpinLock<ipc::TimerFd>>),
     /// signalfd: reads the pending signals in its mask as signalfd_siginfo records.
     SignalFd(u64),
     Epoll(ipc::Epoll),
@@ -458,6 +459,7 @@ fn poll_file(f: &FileRef) -> (u32, u64) {
     match &f.kind {
         Kind::Channel(end) => end.poll(),
         Kind::EventFd(e) => e.lock().poll(),
+        Kind::TimerFd(t) => t.lock().poll(),
         Kind::SignalFd(mask) => (if signal::pending_masked(thread(), *mask) { ipc::POLLIN } else { 0 }, 0),
         Kind::Unix(UnixSocket { listener: Some(l), .. }) => l.lock().poll(),
         Kind::Unix(_) => (0, 0),
@@ -993,6 +995,7 @@ fn fd_link(n: i64) -> Option<String> {
         Kind::Random => "/dev/urandom".into(),
         Kind::Channel(_) => "socket:[1]".into(),
         Kind::EventFd(_) => "anon_inode:[eventfd]".into(),
+        Kind::TimerFd(_) => "anon_inode:[timerfd]".into(),
         Kind::SignalFd(_) => "anon_inode:[signalfd]".into(),
         Kind::Epoll(_) => "anon_inode:[eventpoll]".into(),
         Kind::Memfd(_, None) => "/memfd: (deleted)".into(),
@@ -1050,7 +1053,7 @@ impl vfs::Backend for ProcFs {
         let file = fds().get(fd).ok()?;
         let f = file.lock();
         let at = match (&f.at, &f.kind) {
-            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::Unix(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
+            (_, Kind::Channel(_) | Kind::Inet(_) | Kind::Unix(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) | Kind::Memfd(_, None)) => return None,
             (Some(at), _) => at.clone(),
             (None, Kind::File { at, .. } | Kind::Dir { at } | Kind::Memfd(_, Some(at))) => at.clone(),
             _ => return None,
@@ -1441,7 +1444,7 @@ fn stat_file(f: &OpenFile) -> Vec<u8> {
         },
         Kind::Dir { at } => at.mount.fs.lstat(&at.rel).map(|m| stat_meta(&m)).unwrap_or_else(|_| stat_buf(0o40755, 4096, 0, 2)),
         Kind::Channel(e) => stat_buf(if e.rx.is_some() && e.tx.is_some() { 0o140777 } else { 0o10600 }, 0, 0, 3),
-        Kind::EventFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) => stat_buf(0o600, 0, 0, 4),
+        Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Epoll(_) | Kind::SignalFd(_) => stat_buf(0o600, 0, 0, 4),
         Kind::Memfd(m, Some(at)) => match at.mount.fs.lstat(&at.rel) {
             Ok(meta) => stat_meta(&vfs::Meta { size: m.lock().size, ..meta }),
             Err(_) => stat_buf(0o100644, m.lock().size, 0, 7),
@@ -1706,6 +1709,41 @@ fn signalfd_read(f: &FileRef, mask: u64, len: usize) -> Result<Vec<u8>, i64> {
     }
 }
 
+/// read() on a timerfd: the number of expirations since the last read, as a u64.
+fn timerfd_read(f: &FileRef, t: &Arc<SpinLock<ipc::TimerFd>>, len: usize) -> Result<Vec<u8>, i64> {
+    if len < 8 {
+        return Err(EINVAL);
+    }
+    loop {
+        {
+            let mut t = t.lock();
+            t.update();
+            if t.pending > 0 {
+                let n = core::mem::take(&mut t.pending);
+                return Ok(n.to_le_bytes().to_vec());
+            }
+        }
+        if f.lock().flags & O_NONBLOCK != 0 {
+            return Err(EAGAIN);
+        }
+        ipc::wait(None);
+        process::check_exiting();
+    }
+}
+
+/// An itimerspec (interval, value) as nanoseconds.
+fn read_itimerspec(addr: u64) -> Result<(u64, u64), i64> {
+    let b = read_user(addr, 32)?;
+    let ts = |o: usize| -> Result<u64, i64> {
+        let (sec, ns) = (i64::from_le_bytes(b[o..o + 8].try_into().unwrap()), i64::from_le_bytes(b[o + 8..o + 16].try_into().unwrap()));
+        if sec < 0 || !(0..1_000_000_000).contains(&ns) {
+            return Err(EINVAL);
+        }
+        Ok((sec as u64).saturating_mul(1_000_000_000).saturating_add(ns as u64))
+    };
+    Ok((ts(0)?, ts(16)?))
+}
+
 fn is_channel(f: &FileRef) -> bool {
     matches!(f.lock().kind, Kind::Channel(_) | Kind::EventFd(_))
 }
@@ -1721,6 +1759,13 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
     };
     if let Some(mask) = signal_mask {
         return signalfd_read(f, mask, len);
+    }
+    let timer = match &f.lock().kind {
+        Kind::TimerFd(t) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = timer {
+        return timerfd_read(f, &t, len);
     }
     if is_channel(f) {
         let (data, fds, _) = channel_read(f, len, false, false)?;
@@ -1756,7 +1801,7 @@ fn do_read(f: &FileRef, len: usize, at: Option<usize>) -> Result<Vec<u8>, i64> {
         Kind::Memfd(m, _) => m.lock().read(pos, len),
         Kind::Epoll(_) | Kind::Inet(_) => return Err(EINVAL),
         Kind::Unix(_) => return Err(ENOTCONN),
-        Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::SignalFd(_) => unreachable!(),
+        Kind::Tty | Kind::Channel(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::SignalFd(_) => unreachable!(),
         #[cfg(feature = "linux-drivers")]
         Kind::Linux(_) => unreachable!(),
     };
@@ -1802,7 +1847,7 @@ fn do_write(f: &FileRef, data: &[u8], at: Option<usize>) -> Result<usize, i64> {
             }
             return Ok(data.len());
         }
-        Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
+        Kind::Epoll(_) | Kind::Channel(_) | Kind::EventFd(_) | Kind::TimerFd(_) | Kind::Inet(_) | Kind::SignalFd(_) => return Err(EINVAL),
         #[cfg(feature = "linux-drivers")]
         Kind::Linux(_) => return Err(EINVAL),
         Kind::Unix(_) => return Err(ENOTCONN),
@@ -1961,6 +2006,7 @@ fn kind_name(k: &Kind) -> String {
         Kind::Zero => "zero".into(),
         Kind::Channel(e) => format!("{}{:?}", if e.rx.is_some() && e.tx.is_some() { "socket " } else { "pipe " }, e.kind),
         Kind::EventFd(_) => "eventfd".into(),
+        Kind::TimerFd(_) => "timerfd".into(),
         Kind::SignalFd(_) => "signalfd".into(),
         Kind::Path => "path".into(),
         Kind::Unix(_) => "unix socket".into(),
@@ -2494,6 +2540,36 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 fds().add(new_file(Kind::EventFd(e), (flags & O_NONBLOCK) | 2), 0)
             }
             213 | 291 => fds().add(new_file(Kind::Epoll(ipc::Epoll::default()), 2), 0), // epoll_create(1)
+            283 => {
+                // timerfd_create(clockid, flags): REALTIME, MONOTONIC, BOOTTIME and the
+                // _ALARM forms; TFD_NONBLOCK, TFD_CLOEXEC
+                if !matches!(a0, 0 | 1 | 7 | 8 | 9) || a1 & !(0o4000 | 0o2000000) != 0 {
+                    return Err(EINVAL);
+                }
+                let t = ipc::timerfd(matches!(a0, 0 | 8));
+                fds().add(new_file(Kind::TimerFd(t), (a1 & (O_NONBLOCK | 0o2000000)) | 2), 0)
+            }
+            286 | 287 => {
+                // timerfd_settime(fd, flags, new, old), timerfd_gettime(fd, cur)
+                let file = fds().get(a0 as i64)?;
+                let Kind::TimerFd(t) = &file.lock().kind else { return Err(EINVAL) };
+                let t = t.clone();
+                let (interval, value) = if nr == 286 {
+                    // TFD_TIMER_ABSTIME 1, TFD_TIMER_CANCEL_ON_SET 2 (accepted; clock changes are not signalled)
+                    if a1 & !3 != 0 {
+                        return Err(EINVAL);
+                    }
+                    let (interval, value) = read_itimerspec(a2)?;
+                    t.lock().set(value, interval, a1 & 1 != 0)
+                } else {
+                    t.lock().get()
+                };
+                let out = if nr == 286 { a3 } else { a1 };
+                if out != 0 {
+                    write_user(out, &[timespec(interval), timespec(value)].concat())?;
+                }
+                0
+            }
             233 => {
                 // epoll_ctl(epfd, op, fd, event*)
                 let ep = fds().get(a0 as i64)?;

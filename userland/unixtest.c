@@ -7,7 +7,10 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -139,6 +142,36 @@ int main(void)
 	check(client(path, 0) == -ECONNREFUSED, "after the listener closes: ECONNREFUSED");
 	unlink(path);
 	check(server(path, 0) >= 0, "the path can be bound again after unlink");
+	// timerfd: a timer read as a counter of expirations (event loops of most toolkits).
+	uint64_t n = 0;
+	int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	check(tfd >= 0 && read(tfd, &n, 8) == -1 && errno == EAGAIN, "timerfd: unarmed read is EAGAIN");
+	struct itimerspec its = { .it_value = { 0, 20 * 1000000 } };
+	struct pollfd tp = { .fd = tfd, .events = POLLIN };
+	timerfd_settime(tfd, 0, &its, NULL);
+	check(poll(&tp, 1, 1000) == 1 && read(tfd, &n, 8) == 8 && n == 1, "timerfd: one-shot fires once (poll)");
+	its = (struct itimerspec){ .it_interval = { 0, 10 * 1000000 }, .it_value = { 0, 10 * 1000000 } };
+	timerfd_settime(tfd, 0, &its, NULL);
+	usleep(55 * 1000);
+	check(read(tfd, &n, 8) == 8 && n >= 4 && n <= 6, "timerfd: periodic timer counts expirations");
+	int ep = epoll_create1(0);
+	struct epoll_event ev = { .events = EPOLLIN, .data.fd = tfd }, hit;
+	epoll_ctl(ep, EPOLL_CTL_ADD, tfd, &ev);
+	check(epoll_wait(ep, &hit, 1, 1000) == 1 && hit.data.fd == tfd, "timerfd: epoll wakes on expiry");
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	its = (struct itimerspec){ .it_value = { now.tv_sec + 1, now.tv_nsec } };
+	struct itimerspec cur;
+	timerfd_settime(tfd, TFD_TIMER_ABSTIME, &its, NULL);
+	timerfd_gettime(tfd, &cur);
+	check(cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 900 * 1000000, "timerfd: absolute time, gettime remaining");
+	its = (struct itimerspec){ 0 };
+	timerfd_settime(tfd, 0, &its, NULL);
+	timerfd_gettime(tfd, &cur);
+	check(cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec == 0, "timerfd: disarmed");
+	close(ep);
+	close(tfd);
+
 	printf("unixtest: %d passed, %d failed\n", passed, failed);
 	return failed != 0;
 }
