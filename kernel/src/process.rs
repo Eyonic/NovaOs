@@ -47,9 +47,42 @@ pub const USER_MAX: u64 = 0x0000_8000_0000_0000;
 
 const NX: u64 = 1 << 63;
 
-/// SYSCALL entry stack for the running user task, and scratch for the user RSP.
-static SYSCALL_KERNEL_RSP: AtomicU64 = AtomicU64::new(0);
-static SYSCALL_USER_RSP: AtomicU64 = AtomicU64::new(0);
+/// Per CPU: scratch for the user RSP at SYSCALL entry, and the running user task's kernel
+/// stack. Each CPU's LSTAR points at its own stub (below), which addresses its own pair
+/// RIP-relative: no register is free at SYSCALL entry to find per-CPU data otherwise.
+#[repr(C)]
+struct SyscallSlot {
+    user_rsp: AtomicU64,
+    kernel_rsp: AtomicU64,
+}
+const _: () = assert!(core::mem::size_of::<SyscallSlot>() == 16);
+static SYSCALL_SLOTS: [SyscallSlot; crate::smp::MAX_CPUS] = [const { SyscallSlot { user_rsp: AtomicU64::new(0), kernel_rsp: AtomicU64::new(0) } }; crate::smp::MAX_CPUS];
+
+/// One 32-byte SYSCALL entry stub per CPU: save the user RSP in its slot, switch to the
+/// task's kernel stack, push the user RSP, continue in `syscall_entry`.
+const SYSCALL_STUB_SIZE: u64 = 32;
+core::arch::global_asm!(
+    ".pushsection .text.nova_syscall_stubs, \"ax\"",
+    ".balign 32",
+    ".globl nova_syscall_stubs",
+    "nova_syscall_stubs:",
+    ".set nova_cpu, 0",
+    ".rept {cpus}",
+    ".balign 32",
+    "mov [rip + {slots} + nova_cpu * 16], rsp",
+    "mov rsp, [rip + {slots} + nova_cpu * 16 + 8]",
+    "push qword ptr [rip + {slots} + nova_cpu * 16]",
+    "jmp {common}",
+    ".set nova_cpu, nova_cpu + 1",
+    ".endr",
+    ".popsection",
+    cpus = const crate::smp::MAX_CPUS,
+    slots = sym SYSCALL_SLOTS,
+    common = sym syscall_entry,
+);
+unsafe extern "C" {
+    static nova_syscall_stubs: u8;
+}
 
 const IA32_EFER: u32 = 0xC000_0080;
 const IA32_STAR: u32 = 0xC000_0081;
@@ -96,7 +129,7 @@ pub fn simd_summary() -> &'static str {
     }
 }
 
-/// Enable SSE/AVX for user programs and the SYSCALL instruction. Once, at boot.
+/// Enable SSE/AVX for user programs and the SYSCALL instruction on the boot CPU.
 pub fn init() {
     // SAFETY: CR0/CR4/EFER bits that enable features; the kernel itself uses none of
     // the SSE state (soft-float target).
@@ -135,11 +168,30 @@ pub fn init() {
         XSAVE_SIZE.store(cpuid(0xD, 0)[1] as u64, Ordering::Relaxed);
     }
     wrmsr(IA32_EFER, rdmsr(IA32_EFER) | 1 | (1 << 11)); // SCE, NXE
+    init_syscall(0);
+}
+
+/// An application processor: the boot CPU's CR0/CR4/EFER are copied already (smp.rs);
+/// XCR0, the x87/SSE state and SYSCALL are per CPU.
+pub fn init_cpu(cpu: usize) {
+    let xcr0 = XCR0.load(Ordering::Relaxed);
+    // SAFETY: CR4.OSXSAVE is set when XCR0 is (copied from the boot CPU); the same
+    // components are supported, the CPUs being identical.
+    unsafe {
+        if xcr0 != 0 {
+            asm!("xsetbv", in("ecx") 0, in("eax") xcr0 as u32, in("edx") (xcr0 >> 32) as u32, options(nomem, nostack, preserves_flags));
+        }
+        asm!("fninit", options(nomem, nostack));
+    }
+    init_syscall(cpu);
+}
+
+fn init_syscall(cpu: usize) {
     // SYSCALL: CS = 0x08, SS = 0x10. SYSRET: SS = 0x13 + 8, CS = 0x13 + 16. The RPL bits
     // go into STAR itself, as Linux does: Intel forces RPL 3 on both selectors, but AMD
     // loads SS verbatim, and an SS of 0x18 (RPL 0) makes the next iretq to user mode #GP.
     wrmsr(IA32_STAR, (((gdt::USER_DATA - 8) as u64) << 48) | ((gdt::KERNEL_CODE as u64) << 32));
-    wrmsr(IA32_LSTAR, syscall_entry as *const () as u64);
+    wrmsr(IA32_LSTAR, (&raw const nova_syscall_stubs) as u64 + cpu as u64 * SYSCALL_STUB_SIZE);
     wrmsr(IA32_FMASK, 0x0004_0700); // clear IF, DF, TF and AC on entry
 }
 
@@ -313,6 +365,9 @@ pub struct Memory {
     /// Pages mapped in them: virtual page -> struct page reference kept (0 for none).
     #[cfg(feature = "linux-drivers")]
     lx_pages: BTreeMap<u64, usize>,
+    /// Pages whose entries were removed or restricted since the last [`Memory::flush`]:
+    /// other CPUs running this address space may still have them in their TLBs.
+    stale: Vec<u64>,
 }
 
 // SAFETY: the raw page pointers refer to heap pages owned by this value.
@@ -548,6 +603,7 @@ impl Memory {
             lx_vmas: BTreeMap::new(),
             #[cfg(feature = "linux-drivers")]
             lx_pages: BTreeMap::new(),
+            stale: Vec::new(),
         }
     }
 
@@ -586,6 +642,20 @@ impl Memory {
         unsafe { (memory::phys_to_virt(table) as *const u64).add(((va >> 12) & 511) as usize).read() }
     }
 
+    /// Whether the page tables let user mode access `va` (writing, or fetching code).
+    fn allows(&self, va: u64, write: bool, fetch: bool) -> bool {
+        let mut table = self.cr3;
+        for level in [39, 30, 21, 12] {
+            // SAFETY: walking this process's own page tables in direct-mapped RAM.
+            let e = unsafe { (memory::phys_to_virt(table) as *const u64).add(((va >> level) & 511) as usize).read() };
+            if e & PRESENT == 0 || e & USER == 0 || (write && e & WRITABLE == 0) || (fetch && e & NX != 0) {
+                return false;
+            }
+            table = e & 0x000F_FFFF_FFFF_F000;
+        }
+        true
+    }
+
     /// The frame backing `va`, if mapped.
     pub fn page_frame(&self, va: u64) -> Option<*mut u8> {
         self.pages.get(&(va & !(PAGE - 1))).copied()
@@ -599,6 +669,11 @@ impl Memory {
     /// mremap: move the pages mapped in [from, from+len) to [to, to+len) without copying
     /// them (their frames are remapped); the areas are the caller's business.
     pub fn move_pages(&mut self, from: u64, to: u64, len: u64) {
+        self.move_pages_unflushed(from, to, len);
+        self.flush();
+    }
+
+    fn move_pages_unflushed(&mut self, from: u64, to: u64, len: u64) {
         let moving: Vec<(u64, *mut u8)> = self.pages.range(from..from + len).map(|(&va, &p)| (va, p)).collect();
         for (va, page) in moving {
             let flags = self.pte(va) & (PRESENT | USER | WRITABLE);
@@ -634,13 +709,14 @@ impl Memory {
     /// file offset `off` (page aligned): whole pages are shared with the file's memory
     /// and copied on the first write; the partial last page is copied now.
     pub fn map_file(&mut self, va: u64, file: &'static [u8], off: usize, len: u64) {
+        let mut freed = Vec::new();
         let mut i = 0;
         while i < len {
             let page_va = va + i;
             let fo = off + i as usize;
             if fo + PAGE as usize <= file.len() {
                 let frame = file[fo..].as_ptr();
-                self.discard(page_va, PAGE);
+                self.discard_unflushed(page_va, PAGE, &mut freed);
                 let tables = &mut self.tables;
                 // SAFETY: lower-half address of this space; the frame is read-only
                 // system-file memory that lives as long as the kernel.
@@ -652,15 +728,17 @@ impl Memory {
             }
             i += PAGE;
         }
+        self.flush_and_free(freed);
     }
 
     /// Map pages of a shared memory object at `va` (MAP_SHARED of a memfd).
     pub fn map_shared(&mut self, va: u64, shm: crate::ipc::SharedRef, off: usize, len: u64) {
+        let mut freed = Vec::new();
         let mut i = 0;
         while i < len {
             let page_va = va + i;
             let frame = shm.lock().page((off + i as usize) / PAGE as usize);
-            self.discard(page_va, PAGE);
+            self.discard_unflushed(page_va, PAGE, &mut freed);
             let tables = &mut self.tables;
             // SAFETY: lower-half address of this space; the frame belongs to `shm`,
             // which this address space keeps alive.
@@ -670,6 +748,7 @@ impl Memory {
             i += PAGE;
         }
         self.shared.push(shm);
+        self.flush_and_free(freed);
     }
 
     /// fork: give `child` (an empty address space) the same mappings. Private pages are
@@ -712,10 +791,28 @@ impl Memory {
         }
         let shared = self.pages.remove(&va).expect("borrowed page not mapped");
         let copy = self.map_zero_page(va, true);
-        // SAFETY: both are 4 KiB pages; map_zero_page replaced the mapping (PTE rewritten).
-        unsafe {
-            core::ptr::copy_nonoverlapping(shared, copy, PAGE as usize);
-            asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+        // SAFETY: both are 4 KiB pages; map_zero_page replaced the mapping (PTE rewritten,
+        // invalidated here). Other CPUs may still read the shared original until the
+        // flush, which is the same data.
+        unsafe { core::ptr::copy_nonoverlapping(shared, copy, PAGE as usize) };
+        self.stale.push(va);
+        self.flush();
+    }
+
+    /// Make other CPUs forget the stale translations (see `stale`).
+    fn flush(&mut self) {
+        if !self.stale.is_empty() {
+            crate::smp::flush_user(self.cr3, &self.stale);
+            self.stale.clear();
+        }
+    }
+
+    /// Flush, then give back pages that were unmapped (no CPU can reach them any more).
+    fn flush_and_free(&mut self, freed: Vec<*mut u8>) {
+        self.flush();
+        for p in freed {
+            // SAFETY: from the page pool in map_zero_page; unmapped everywhere now.
+            unsafe { memory::free_page(p) };
         }
     }
 
@@ -818,6 +915,7 @@ impl Memory {
         }
         if let Some(old) = self.lx_pages.remove(&va) {
             self.unmap_page(va);
+            self.flush();
             crate::linux::lxfile::put_page(old);
         }
         // Writable only where the area is (mprotect may have taken write access away).
@@ -843,9 +941,14 @@ impl Memory {
     #[cfg(feature = "linux-drivers")]
     fn lx_drop_pages(&mut self, start: u64, end: u64) {
         let doomed: Vec<u64> = self.lx_pages.range(start..end).map(|(&va, _)| va).collect();
+        let mut pages = Vec::with_capacity(doomed.len());
         for va in doomed {
-            let page = self.lx_pages.remove(&va).unwrap_or(0);
+            pages.push(self.lx_pages.remove(&va).unwrap_or(0));
             self.unmap_page(va);
+        }
+        // No CPU may still reach the frames when the driver gets them back.
+        self.flush();
+        for page in pages {
             crate::linux::lxfile::put_page(page);
         }
     }
@@ -1009,6 +1112,13 @@ impl Memory {
 
     /// Free the pages in [start, start+len) but keep the areas (they read as zero again).
     pub fn discard(&mut self, start: u64, len: u64) {
+        let mut freed = Vec::new();
+        self.discard_unflushed(start, len, &mut freed);
+        self.flush_and_free(freed);
+    }
+
+    /// `discard`, collecting the frames to free (after the flush) in `freed`.
+    fn discard_unflushed(&mut self, start: u64, len: u64, freed: &mut Vec<*mut u8>) {
         let end = start.saturating_add(len.next_multiple_of(PAGE));
         if self.unmapped.len() >= 256 {
             self.unmapped.pop_front();
@@ -1023,8 +1133,7 @@ impl Memory {
                 self.unmap_page(va);
                 let not_ours = self.borrowed.remove(&va) | self.foreign.remove(&va);
                 if !not_ours {
-                    // SAFETY: from the page pool in map_zero_page; just unmapped.
-                    unsafe { memory::free_page(p) };
+                    freed.push(p);
                 }
             }
         }
@@ -1058,6 +1167,7 @@ impl Memory {
             let w = writable && !self.borrowed.contains(&va);
             self.set_writable(va, w);
         }
+        self.flush();
         true
     }
 
@@ -1077,6 +1187,11 @@ impl Memory {
             let v = leaf.read();
             leaf.write(if writable { v | WRITABLE } else { v & !WRITABLE });
             asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
+        }
+        // Write access granted needs no shootdown (a stale read-only entry only causes a
+        // spurious fault, see page_fault); taken away, it does.
+        if !writable {
+            self.stale.push(va);
         }
     }
 
@@ -1122,6 +1237,7 @@ impl Memory {
             (memory::phys_to_virt(table) as *mut u64).add(((va >> 12) & 511) as usize).write(0);
             asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags));
         }
+        self.stale.push(va);
     }
 
     /// Copy `data` into user memory at `va` (mapping pages as needed, ignoring areas).
@@ -1142,6 +1258,9 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
+        // No CPU may keep these page tables loaded (none should: the last thread switched
+        // away first), nor stale translations of the frames.
+        crate::smp::evict(self.cr3);
         // Linux mappings: their frames are the drivers'; the vmas close after this.
         #[cfg(feature = "linux-drivers")]
         {
@@ -1348,6 +1467,17 @@ pub fn terminate(p: &Process, sig: u32) {
     }
     crate::linux::futex_wake_all(p);
     crate::ipc::notify();
+    kick_threads(p);
+}
+
+/// Threads of `p` running user code on other CPUs enter the kernel now (and notice that
+/// the program is exiting) instead of at their next timer tick.
+fn kick_threads(p: &Process) {
+    task::wake_process(p.pid);
+    let cpus = task::cpus_running(p.pid) & !(1 << crate::smp::id());
+    for cpu in (0..crate::smp::MAX_CPUS).filter(|c| cpus & (1 << c) != 0) {
+        crate::smp::kick(cpu);
+    }
 }
 
 impl UserState {
@@ -1399,16 +1529,13 @@ fn load_fs_gs(fs: u16, gs: u16) {
     unsafe { asm!("mov fs, {0:x}", "mov gs, {1:x}", in(reg) fs, in(reg) gs, options(nostack, preserves_flags)) };
 }
 
-/// Called by the scheduler for the task being switched in.
+/// Called by the scheduler for the task being switched in (on the CPU it will run on).
 pub fn switch_in(user: Option<&UserState>) {
     let cr3 = user.map_or(memory::kernel_cr3(), |u| u.process.cr3.load(Ordering::Relaxed));
-    if memory::read_cr3() != cr3 {
-        // SAFETY: both kinds of address space map the whole kernel identically.
-        unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
-    }
+    crate::smp::load_cr3(cr3);
     if let Some(u) = user {
         gdt::set_kernel_stack(u.kernel_rsp);
-        SYSCALL_KERNEL_RSP.store(u.kernel_rsp, Ordering::Relaxed);
+        SYSCALL_SLOTS[crate::smp::id()].kernel_rsp.store(u.kernel_rsp, Ordering::Relaxed);
         if u.compat {
             // The descriptors first: loading a selector reads its descriptor.
             gdt::set_tls(&u.tls);
@@ -1446,13 +1573,11 @@ pub struct SyscallFrame {
     pub rsp: u64,
 }
 
+/// The rest of SYSCALL entry, after the CPU's stub switched stacks and pushed the user RSP.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     naked_asm!(
-        // IF is clear (FMASK). Switch to this task's kernel stack.
-        "mov [rip + {user_rsp}], rsp",
-        "mov rsp, [rip + {kernel_rsp}]",
-        "push qword ptr [rip + {user_rsp}]",
+        // IF is clear (FMASK).
         "push r11", "push rcx",
         "push rax", "push rdi", "push rsi", "push rdx", "push r10", "push r8", "push r9",
         "push rbx", "push rbp", "push r12", "push r13", "push r14", "push r15",
@@ -1464,8 +1589,6 @@ unsafe extern "C" fn syscall_entry() {
         "pop rcx", "pop r11",
         "pop rsp",
         "sysretq",
-        user_rsp = sym SYSCALL_USER_RSP,
-        kernel_rsp = sym SYSCALL_KERNEL_RSP,
         dispatch = sym syscall_dispatch,
     )
 }
@@ -1473,6 +1596,7 @@ unsafe extern "C" fn syscall_entry() {
 extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
     // SAFETY: re-enable interrupts: syscalls may block and let other tasks run.
     unsafe { asm!("sti", options(nomem, nostack)) };
+    crate::smp::lock();
     check_exiting();
     frame.rax = crate::linux::syscall(frame) as u64;
     check_exiting();
@@ -1481,6 +1605,28 @@ extern "C" fn syscall_dispatch(frame: &mut SyscallFrame) {
     if frame.rip >= USER_MAX {
         exit(-11);
     }
+    leave_kernel();
+}
+
+/// The last step before user mode: interrupts off (until SYSRET/IRETQ), the big kernel
+/// lock released. Nothing shared may be touched after this.
+pub fn leave_kernel() {
+    // SAFETY: the return path restores the user's RFLAGS (IF set).
+    unsafe { asm!("cli", options(nomem, nostack)) };
+    crate::smp::unlock();
+}
+
+/// Enter user mode for the first time on this thread (`enter_user` or `enter_user32`),
+/// giving up the big kernel lock on the way; it is held again when the thread leaves
+/// user mode for good (exit_thread, from a system call or fault). Returns the exit code.
+fn run_user(regs: &SyscallFrame, ctx: *mut u64, compat: bool) -> i64 {
+    leave_kernel();
+    // SAFETY: the caller loaded the address space and set up the registers.
+    let code = unsafe { if compat { enter_user32(regs, ctx) } else { enter_user(regs, ctx) } };
+    // enter_user saved RFLAGS with IF clear (leave_kernel); this task ran with it set.
+    // SAFETY: plain kernel task context again.
+    unsafe { asm!("sti", options(nomem, nostack)) };
+    code
 }
 
 /// Enter user mode with the registers in `regs` (rip, rsp, rflags and all GPRs).
@@ -1586,6 +1732,7 @@ pub fn exit(code: i32) -> ! {
         u.process.exit_code.store(code, Ordering::SeqCst);
     }
     crate::linux::futex_wake_all(&u.process);
+    kick_threads(&u.process);
     exit_thread(code)
 }
 
@@ -1648,6 +1795,13 @@ pub fn kernel_user_fault(addr: u64, error: u64) -> bool {
 fn fill_fault(mut mem: crate::sync::SpinLockGuard<'_, Memory>, addr: u64, error: u64) -> bool {
     let Some(u) = task::current_user() else { return false };
     let page = addr & !(PAGE - 1);
+    if error & 1 != 0 && mem.allows(page, error & 2 != 0, error & 16 != 0) {
+        // A stale translation: another CPU granted the access (mprotect, a new page table
+        // level) after this CPU had cached the old entry, which needs no shootdown.
+        // SAFETY: INVLPG only drops a translation.
+        unsafe { asm!("invlpg [{}]", in(reg) page, options(nostack, preserves_flags)) };
+        return true;
+    }
     // A Linux driver's mapping: its fault handler maps the page (it may sleep, so the
     // address-space lock is let go first).
     #[cfg(feature = "linux-drivers")]
@@ -2141,8 +2295,7 @@ fn run_main(process: Arc<Process>, regs: SyscallFrame, setup: impl FnOnce(&mut U
     task::set_user(Some(thread));
     let ctx = &raw mut task::current_user().unwrap().exit_ctx;
     on_start(process.clone());
-    // SAFETY: the address space is loaded; registers were set up by the caller.
-    let code = unsafe { if compat { enter_user32(&regs, ctx) } else { enter_user(&regs, ctx) } } as i32;
+    let code = run_user(&regs, ctx, compat) as i32;
     process.threads.fetch_sub(1, Ordering::SeqCst);
     task::set_user(None);
     // Wait for the other threads to leave (they notice `exiting`).
@@ -2292,6 +2445,7 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
         process.exiting.store(true, Ordering::SeqCst);
         crate::linux::futex_wake_all(&process);
         crate::ipc::notify();
+        kick_threads(&process);
         let deadline = crate::pit::ticks() + 5 * crate::pit::HZ;
         while process.threads.load(Ordering::SeqCst) > 1 && crate::pit::ticks() < deadline {
             task::wait_event();
@@ -2312,8 +2466,7 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
     // Switch to the new address space, then free the old one.
     let old = core::mem::replace(&mut *process.mem.lock(), mem);
     process.cr3.store(cr3, Ordering::SeqCst);
-    // SAFETY: the new tables map the kernel's upper half like every address space.
-    unsafe { asm!("mov cr3, {}", in(reg) cr3, options(nostack, preserves_flags)) };
+    crate::smp::load_cr3(cr3);
     drop(old);
     // nova.trace=NAME on the kernel command line: trace every program whose path
     // contains NAME from its execve on (for programs started deep inside others).
@@ -2351,6 +2504,7 @@ pub fn exec(f: &mut SyscallFrame, path: String, args: Vec<String>, env: Vec<Stri
     (u.user_fs, u.user_gs) = (0, 0);
     load_fs_gs(0, 0);
     let regs = *f;
+    leave_kernel();
     // SAFETY: the new address space is loaded and the registers describe its entry.
     unsafe { resume_user(&regs, if compat { gdt::USER_CODE32 } else { gdt::USER_CODE } as u64) }
 }
@@ -2387,8 +2541,7 @@ pub fn spawn_thread32(parent: &SyscallFrame, stack: u64, tls: [u64; gdt::TLS_ENT
         thread.kernel_rsp = kernel_stack_here();
         task::set_user(Some(thread));
         let ctx = &raw mut task::current_user().unwrap().exit_ctx;
-        // SAFETY: as for run(): this task now runs in the process's address space.
-        unsafe { enter_user32(&regs, ctx) };
+        run_user(&regs, ctx, true);
         task::set_user(None);
         process.threads.fetch_sub(1, Ordering::SeqCst);
     });
@@ -2420,8 +2573,7 @@ pub fn spawn_thread(parent: &SyscallFrame, stack: u64, tls: Option<u64>, clear_t
         thread.kernel_rsp = kernel_stack_here();
         task::set_user(Some(thread));
         let ctx = &raw mut task::current_user().unwrap().exit_ctx;
-        // SAFETY: as for run(): this task now runs in the process's address space.
-        unsafe { enter_user(&regs, ctx) };
+        run_user(&regs, ctx, false);
         task::set_user(None);
         process.threads.fetch_sub(1, Ordering::SeqCst);
     });

@@ -38,7 +38,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::bootcell::BootCell;
-use crate::{gdt, input, keyboard, pic, pit, println, serial};
+use crate::{gdt, input, keyboard, pic, pit, println, serial, smp};
 
 /// Register state at the time of the exception or IRQ, as laid out on the stack
 /// by `exception_common` / `irq_common` (lowest address first).
@@ -274,7 +274,12 @@ pub fn init() {
     gate.attributes = 0xEE;
     // SAFETY: as above; vector 0x80 < 256.
     unsafe { (*idt)[crate::apic::SYSCALL32_VECTOR as usize] = gate };
-    let pointer = DescriptorTablePointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: idt as u64 };
+    load_idt();
+}
+
+/// Load the IDT on this CPU (every CPU shares the one table `init` built).
+pub fn load_idt() {
+    let pointer = DescriptorTablePointer { limit: (size_of::<[Gate; 256]>() - 1) as u16, base: IDT.get() as u64 };
     // SAFETY: the IDT is 'static, fully initialised, and every present gate points
     // at a stub defined above.
     unsafe { asm!("lidt [{}]", in(reg) &pointer, options(readonly, nostack, preserves_flags)) };
@@ -291,17 +296,34 @@ pub fn enable() {
     unsafe { asm!("sti", options(nomem, nostack)) };
 }
 
-/// Called from `irq_common` with interrupts disabled. Handlers only record data
-/// (tick count, raw input bytes); they never print or take locks.
+/// Called from `irq_common` with interrupts disabled. Top halves only record data (tick
+/// count, raw input bytes) and need no lock; handlers that run driver code go through
+/// smp::device_irq, which runs them under the big kernel lock (here or on its holder).
 extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
     let vector = frame.vector as u8;
+    let user = frame.cs & 3 == 3;
     if vector == crate::apic::SPURIOUS_VECTOR {
         return; // spurious local APIC interrupt: no EOI
     }
-    if vector >= crate::apic::FIRST_DYNAMIC_VECTOR {
-        dynamic_irq(vector);
-        return;
+    if vector >= smp::IPI_KICK {
+        crate::apic::eoi();
+        cpu_interrupt(vector, user);
+    } else if vector >= crate::apic::FIRST_DYNAMIC_VECTOR {
+        crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+        smp::device_irq(vector);
+        crate::apic::eoi();
+    } else {
+        legacy_irq(vector, user);
     }
+    // Back to user mode: give up the lock if this interrupt took it (preemption, a kick).
+    // The thread may have moved to another CPU meanwhile; that CPU holds it now.
+    if user && smp::held() {
+        smp::unlock();
+    }
+}
+
+/// The 8259/ISA vectors 32-47 (the I/O APIC routes the same lines to them).
+fn legacy_irq(vector: u8, user: bool) {
     let irq = vector.wrapping_sub(pic::IRQ_BASE);
     let apic = crate::apic::active();
     if !apic && !pic::is_genuine(irq) {
@@ -318,36 +340,77 @@ extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
             }
         }
         // ACPI's SCI, or PCI devices driven by Linux drivers on a PIC line.
-        line => {
-            if !crate::acpi::interrupt(line as u32) {
-                #[cfg(feature = "linux-drivers")]
-                crate::linuxkpi::irq(line as u32);
-            }
-        }
+        _ => smp::device_irq(vector),
     }
     if apic {
         crate::apic::eoi();
     } else {
         pic::end_of_interrupt(irq);
     }
-    // Preempt user programs on the timer, so they cannot monopolise the CPU.
-    if irq == pic::IRQ_TIMER && frame.cs & 3 == 3 && pit::ticks() % pit::PREEMPT_TICKS == 0 {
-        crate::task::yield_now();
-        // A thread spinning in user code learns here that its program is exiting.
-        crate::process::check_exiting();
+    if irq == pic::IRQ_TIMER {
+        if !user {
+            smp::sample();
+        }
+        // Waiting tasks may be runnable now: if this CPU is busy, an idle one looks.
+        crate::task::tick_kick();
+        // Preempt user programs on the timer, so they cannot monopolise the CPU.
+        if user && pit::ticks() % pit::PREEMPT_TICKS == 0 {
+            preempt();
+        }
     }
 }
 
-/// A vector the APIC code handed out: a PCI INTx GSI, an MSI message or the SCI.
-fn dynamic_irq(vector: u8) {
-    crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
-    if let Some(irq) = crate::apic::vector_irq(vector)
-        && !crate::acpi::interrupt(irq)
-    {
+/// Timer preemption of the user thread this CPU runs (an interrupt from user mode).
+fn preempt() {
+    smp::lock_from_user();
+    crate::task::yield_now();
+    // A thread spinning in user code learns here that its program is exiting.
+    crate::process::check_exiting();
+}
+
+/// The per-CPU vectors: IPIs and the application processors' LAPIC timer. EOI sent.
+fn cpu_interrupt(vector: u8, user: bool) {
+    match vector {
+        smp::TIMER_VECTOR => {
+            if !user {
+                smp::sample();
+            }
+            let ticks = smp::tick(smp::id());
+            if user && ticks % pit::PREEMPT_TICKS == 0 {
+                preempt();
+            }
+        }
+        smp::IPI_TLB => smp::service_tlb(),
+        smp::IPI_IRQ => smp::run_forwarded(),
+        smp::IPI_KICK => {
+            // An idle CPU sees the flag when its halt ends; a CPU in user mode enters the
+            // kernel so that a program being torn down stops running here.
+            if user {
+                smp::take_kick(smp::id());
+                smp::lock_from_user();
+                crate::process::check_exiting();
+            }
+        }
+        smp::IPI_STOP => crate::halt_forever(),
+        _ => {}
+    }
+}
+
+/// Run the handler of device interrupt `vector` (BKL held, interrupts disabled): ACPI's
+/// SCI or a Linux driver's, on a legacy line or a dynamic vector.
+pub fn device_handler(vector: u8) {
+    let irq = if vector >= crate::apic::FIRST_DYNAMIC_VECTOR {
+        match crate::apic::vector_irq(vector) {
+            Some(irq) => irq,
+            None => return,
+        }
+    } else {
+        vector.wrapping_sub(pic::IRQ_BASE) as u32
+    };
+    if !crate::acpi::interrupt(irq) {
         #[cfg(feature = "linux-drivers")]
         crate::linuxkpi::irq(irq);
     }
-    crate::apic::eoi();
 }
 
 fn read_cr2() -> u64 {
@@ -365,8 +428,12 @@ extern "C" fn exception_dispatch(frame: &ExceptionFrame) {
 
     // Faults in user programs end the program, not the system.
     if frame.cs & 3 == 3 {
+        smp::lock_from_user();
         match frame.vector {
-            14 if crate::process::page_fault(cr2, frame.error_code) => return,
+            14 if crate::process::page_fault(cr2, frame.error_code) => {
+                smp::unlock();
+                return;
+            }
             14 => {
                 crate::process::FAULT_RSP.store(frame.rsp, core::sync::atomic::Ordering::Relaxed);
                 crate::process::fault("segmentation fault", frame.rip, Some(cr2))
@@ -387,6 +454,7 @@ extern "C" fn exception_dispatch(frame: &ExceptionFrame) {
         return;
     }
 
+    smp::stop_others();
     match DEPTH.fetch_add(1, Ordering::SeqCst) {
         0 => report(frame, info, cr2),
         // The reporter itself faulted. Print one short line and stop.

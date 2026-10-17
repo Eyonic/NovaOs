@@ -59,6 +59,7 @@ mod setup;
 mod shell;
 mod shields;
 mod signal;
+mod smp;
 mod storage;
 mod sync;
 mod task;
@@ -120,7 +121,7 @@ extern "C" fn kmain() -> ! {
     }
 
     gdt::init();
-    println!("[nova] gdt: loaded (kernel 0x08/0x10, user 0x2b/0x23, user32 0x1b, tss 0x30, #DF on IST1)");
+    println!("[nova] gdt: loaded (kernel 0x08/0x10, user 0x2b/0x23, user32 0x1b, tss 0x80 + 16 per CPU, #DF on IST1)");
     interrupts::init();
     process::init();
     let (exceptions, irqs) = interrupts::installed_vectors();
@@ -161,6 +162,7 @@ extern "C" fn kmain() -> ! {
     interrupts::enable();
     println!("[nova] interrupts: enabled (timer, keyboard, mouse, COM1)");
     println!("[nova] clock: TSC at {} MHz", pit::calibrate() / 1_000_000);
+    println!("[nova] smp: {}", smp::start_aps());
     if acpi::init_namespace(apic::active()) {
         println!("[nova] acpi: AML namespace ready ({} interrupt model)", if apic::active() { "I/O APIC" } else { "PIC" });
     }
@@ -182,6 +184,7 @@ static PANICKING: AtomicBool = AtomicBool::new(false);
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
+    smp::stop_others();
     tty::emergency();
     console::resume();
     if PANICKING.swap(true, Ordering::SeqCst) {

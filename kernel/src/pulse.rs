@@ -1040,10 +1040,14 @@ fn mix(clients: &mut [Client]) -> bool {
     }
     let mut acc = vec![0i32; frames * 2];
     let sink_gain = gain(SINK_VOLUME.load(Ordering::Relaxed), SINK_MUTED.load(Ordering::Relaxed));
+    let mut produced = 0;
     for s in clients.iter_mut().flat_map(|c| c.streams.iter_mut()).filter(|s| s.playing()) {
-        s.mix_into(&mut acc, frames, sink_gain);
+        produced = produced.max(s.mix_into(&mut acc, frames, sink_gain));
     }
-    let samples: Vec<i16> = acc.iter().map(|&v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16).collect();
+    // Only what the streams gave: padding a short mix with silence would put a gap
+    // before their next samples (a stream started with little queued, prebuf 0 as VLC
+    // asks). If the buffer runs dry, the controller plays zeros by itself.
+    let samples: Vec<i16> = acc[..produced * 2].iter().map(|&v| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16).collect();
     hda::write(&samples);
     true
 }

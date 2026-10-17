@@ -136,12 +136,14 @@ a local stand-in for the Messages API that also checks Nova's requests follow th
 Logs go to `build/logs/test-<timestamp>/`.
 
 Environment overrides: `LIMINE_EFI`, `OVMF_CODE`, `OVMF_VARS_TEMPLATE` (file locations),
-`NOVA_NO_KVM=1` (software emulation), `PROFILE=dev` (debug build), `TIMEOUT`, `NOVA_CMDLINE`
+`NOVA_NO_KVM=1` (software emulation), `NOVA_SMP` (QEMU CPUs, default 4), `NOVA_TEST_CMDLINE`
+(appended to every test case's command line, e.g. `nova.cpus=1`), `PROFILE=dev` (debug build), `TIMEOUT`, `NOVA_CMDLINE`
 (kernel command line baked into `build/nova.img`), `CC`/`CXX` (compilers for `userland/`).
 
 Kernel command line options: `nova.mode=shell` (text shell instead of setup/desktop),
 `nova.install=no` (don't offer installation), `nova.deepseek_api=<url>` (DeepSeek-mode endpoint), `nova.comfyui=<url>` (image server), `nova.claude_api=<url>` (another API endpoint),
-`nova.test=<case>` (self-tests).
+`nova.test=<case>` (self-tests), `nova.cpus=<n>` (use at most n CPUs; `nova.cpus=1` runs on
+the boot CPU alone, see [docs/smp.md](docs/smp.md)).
 
 ## Repository layout
 

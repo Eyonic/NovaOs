@@ -158,8 +158,8 @@ IRQ 0 (PIT), IRQ 1 (PS/2 keyboard), IRQ 2 (cascade), IRQ 4 (COM1), IRQ 12 (PS/2 
 APIC entries masked, but with base revision 3 the local APIC is in whatever state the firmware left,
 and a masked LINT0 would swallow the PIC's output. `pic::init` therefore hardware-disables the local
 APIC (clears `IA32_APIC_BASE` bit 11, and bit 10 for x2APIC). With the LAPIC off, the PIC's INTR
-line goes straight to the CPU, as on a pre-APIC PC. That is fine for one CPU. SMP would need the
-LAPIC and I/O APIC instead.
+line goes straight to the CPU, as on a pre-APIC PC. That is fine for one CPU; with an I/O APIC
+(apic.rs, below) Nova uses the LAPICs and every CPU ([smp.md](smp.md)).
 
 The PIT's channel 0 runs at 1000 Hz (divisor 1193, mode 3; user programs are preempted every 4 ticks). Its handler only increments a tick
 counter, which `uptime` and `sleep` read.
