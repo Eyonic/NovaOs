@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 """Check a WAV file recorded by QEMU's wav audio backend (scripts/test.sh audio cases).
 
-    check_audio.py FILE HZ:MS [HZ:MS ...]
+    check_audio.py [--bridge MS] FILE HZ:MS [HZ:MS ...]
 
 The recording must contain exactly the given tones, in order, separated by silence: each
 one at the given frequency (within 2 %) and about the given length, without dropouts or
 discontinuities (no sample-to-sample step larger than a clean sine of that frequency and
 level could make). Prints one line per tone; exit status 1 on any mismatch.
+
+--bridge MS counts one tone interrupted by at most one silence of up to MS milliseconds
+as one tone (its length includes the gap). The media case needs it: libVLC keeps audio
+in sync with the clock, and QEMU's audio backend fills a buffer of its own that the
+guest cannot see, so once per playback libVLC corrects about 0.1 s of drift with a
+moment of silence. Real HD Audio hardware has no such hidden buffer.
 """
 import struct
 import sys
@@ -61,20 +67,32 @@ def segments(samples, rate):
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
-    path, want = sys.argv[1], [tuple(map(int, a.split(":"))) for a in sys.argv[2:]]
+    args = sys.argv[1:]
+    bridge_ms = 0
+    if args[0] == "--bridge":
+        bridge_ms, args = int(args[1]), args[2:]
+    path, want = args[0], [tuple(map(int, a.split(":"))) for a in args[1:]]
     rate, channels, left = read_wav(path)
     found = segments(left, rate)
+    bridged = 0
+    for i in range(len(found) - 1):
+        if bridge_ms and found[i + 1][0] - found[i][1] <= rate * bridge_ms // 1000:
+            print(f"audio check: bridging a {(found[i + 1][0] - found[i][1]) * 1000 // rate} ms gap at {found[i][1] / rate:.2f} s")
+            found[i:i + 2] = [(found[i][0], found[i + 1][1], [found[i], found[i + 1]])]
+            bridged += 1
+            break
+    found = [f if len(f) == 3 else (f[0], f[1], [f]) for f in found]
     print(f"audio check: {path}: {len(left) / rate:.2f} s at {rate} Hz, {channels} channels, {len(found)} tone(s)")
     ok = len(found) == len(want)
     if not ok:
         print(f"audio check: expected {len(want)} tone(s)")
-    for i, ((start, end), (hz, ms)) in enumerate(zip(found, want)):
-        # Measure away from the fades at either end.
-        inner = left[start + rate // 50:end - rate // 50]
-        crossings = sum(1 for a, b in zip(inner, inner[1:]) if (a < 0) != (b < 0))
-        freq = crossings / 2 / (len(inner) / rate)
-        peak = max(abs(s) for s in inner)
-        step = max(abs(b - a) for a, b in zip(inner, inner[1:]))
+    for i, ((start, end, pieces), (hz, ms)) in enumerate(zip(found, want)):
+        # Measure away from the fades at either end of each piece (a bridged tone has two).
+        parts = [left[a + rate // 50:b - rate // 50] for a, b in pieces]
+        crossings = sum(sum(1 for a, b in zip(p, p[1:]) if (a < 0) != (b < 0)) for p in parts)
+        freq = crossings / 2 / (sum(len(p) for p in parts) / rate)
+        peak = max(abs(s) for p in parts for s in p)
+        step = max(abs(b - a) for p in parts for a, b in zip(p, p[1:]))
         clean_step = 2 * 3.14159265 * hz / rate * peak
         length = (end - start) * 1000 / rate
         good = abs(freq - hz) <= hz * 0.02 and abs(length - ms) <= max(60, ms * 0.15) and step <= clean_step * 1.3 + 64

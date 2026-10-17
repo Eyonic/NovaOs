@@ -293,8 +293,8 @@ define_case() {
                           "  artist: Nova Test Tones" "  album: Sine Waves" "  title: Concert A" "media: first frame 640x360"
                           "media: state Playing")
                 FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "media: the engine stopped" "state Error" "unimplemented Linux syscall")
-                # The clip is 5 s of tone; the engine needs up to a second to start.
-                AUDIO_CHECK=("${run_dir:-}/media.wav" 440:4300) ;;
+                # The clip is 5 s of tone (see check_audio.py for --bridge).
+                AUDIO_CHECK=(--bridge 150 "${run_dir:-}/media.wav" 440:5000) ;;
         audioich9) # The same driver on QEMU's ICH9 controller with an output-only codec: a tone.
                 CMDLINE="nova.mode=shell"
                 QEMU_EXTRA=(-audiodev "wav,id=snd0,out.frequency=48000,path=${run_dir:-}/audio-ich9.wav" -device ich9-intel-hda -device hda-output,audiodev=snd0)
