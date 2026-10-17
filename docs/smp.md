@@ -55,6 +55,12 @@ from another).
   exceptions and interrupts, the first entry of a thread, execve) and when a CPU goes idle.
 * Waiting for it, a CPU keeps interrupts enabled where it can and serves TLB shootdowns in
   any case, so the holder can never wait for the waiter.
+* Handed over in the scheduler (`smp::relax`): a CPU about to pick the next task first lets
+  in the CPUs waiting for the lock (usually threads entering a system call). Without this, a
+  CPU running parked tasks one after another, each re-checking its condition, kept the lock
+  for good: with Chromium on the desktop under 4 CPUs the lock was held 97% of the time,
+  the other CPUs waited for it 67% of theirs, and Chromium's main thread starved in its
+  system calls (the `browser` case failed under load).
 
 Without the lock run only: user mode, the idle halt, interrupt top halves that just record
 data (PIT ticks, the PS/2 and COM1 rings, which take a small producer lock now), and IPIs.
@@ -86,9 +92,11 @@ affinity allows this CPU). A CPU with nothing to run switches to its idle task, 
 
 * halts with the lock released until it is *kicked* (`IPI_KICK`), or, on the boot CPU,
   until any interrupt (parked tasks wait for "the next interrupt", as before);
-* is kicked when a task becomes ready (`task::wake`, `spawn`), when a CPU sees more work
-  than it can take, and by the boot CPU's timer tick when the boot CPU is busy and tasks are
-  waiting (one idle CPU at a time: it kicks others if it finds more).
+* is kicked when a task becomes ready (`task::wake`, `spawn`), when a CPU leaves a task
+  that is still ready (preempted) or sees more ready tasks than it can take, and by the boot
+  CPU's timer, at the preemption rate, when the boot CPU is busy and tasks are waiting (one
+  idle CPU at a time). Parked tasks that an interrupt made runnable do not count as work for
+  another CPU: they usually just re-check and park again, which the lock serialises anyway.
 
 User threads are preempted every 4 ms by their CPU's timer (PIT on the boot CPU, LAPIC on
 the others). `sched_setaffinity`/`sched_getaffinity` set and report a per-task CPU mask.
@@ -122,6 +130,9 @@ ranges since kernel entries may be global. MMIO mappings are never removed.
   `nproc` agree (Chromium, Mesa and games size their thread pools from these).
 * `task::cpu_usage` averages over all CPUs; `ps` shows which CPU runs a task.
 * Panics and fatal kernel exceptions stop the other CPUs first (`IPI_STOP`).
+* `madvise(MADV_FREE)` keeps the pages (it used to drop them at once like
+  `MADV_DONTNEED`): Linux keeps a page the program writes again, and a thread on another CPU
+  may write it while the call runs.
 
 Signals are still delivered when the target thread next returns from a system call, as
 before; a thread spinning in user code on another CPU sees a fatal signal (via the exit
@@ -129,17 +140,21 @@ kick) at once, a handled one at its next system call.
 
 ## Measurements
 
-Steam from `steam` to its sign-in window (docs/steam.md, QEMU/KVM, 10 GiB), two runs each:
+Steam from `steam` to its sign-in window (docs/steam.md, QEMU/KVM, 10 GiB), runs of the
+two configurations interleaved so that both see the same network:
 
-| | update phase | to sign-in window |
-|---|---|---|
-| `nova.cpus=1` | 58 s | 71-72 s |
-| 4 CPUs | 52-53 s | 66-67 s |
+| | update phase | web helper started | sign-in window |
+|---|---|---|---|
+| `nova.cpus=1` | 60-61 s | +70 s | 74 s |
+| 4 CPUs | 52-53 s | +60-61 s | 64-65 s |
 
 The update phase (the bootstrapper fetching and unpacking the client) leaves the CPUs
 85-90% idle: it waits on downloads and sleeps. When the client starts, the BKL is held
 55-90% of the time (mmap, clone, getdents, access, readlink of many processes at once),
 which caps the gain there.
+
+`cpus` in the Nova shell shows, since its previous call, each CPU's idle and lock-wait
+time, how long the BKL was held, and what for (the holder's system call at timer ticks).
 
 ## Testing
 
@@ -160,10 +175,11 @@ switched off).
 * Parked tasks poll: a task in `wait_event` becomes runnable at the next interrupt and
   checks its condition. Futex waits and sleeps no longer do (`task::block`: parked until
   `task::wake` or a deadline; a wake that comes early is remembered), but poll, epoll and
-  wait4 still do, which is most of the BKL time of an idle Steam (about 12%). They need
-  wake-ups from every event source (sockets, pipes, timers, device interrupts).
-
-`cpus` in the Nova shell shows, since its previous call, each CPU's idle and lock-wait
-time, how long the BKL was held, and what for (the holder's system call at timer ticks).
+  wait4 still do, which is most of the BKL time of an idle Steam (about 12%). Tried and
+  measured: `ipc::wait` parked with `task::block` (re-check every 10 ms) gains nothing as
+  long as the network task wakes every I/O waiter after each stack poll (every tick); with
+  that wake limited to polls where smoltcp moved a packet, idle Steam's lock time fell to
+  about 1%, but the Steam client then stalled before starting its web helper on 4 CPUs
+  (some socket readiness is not announced by packet activity). That needs finding first.
 * Device interrupts on other CPUs (MSI affinity), asynchronous signal delivery to a thread
   running on another CPU, x2APIC for machines with APIC ids above 254, PCID.
