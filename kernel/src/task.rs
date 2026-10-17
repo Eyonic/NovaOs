@@ -338,6 +338,19 @@ pub fn each_thread(pid: u64, mut f: impl FnMut(&mut crate::process::UserState)) 
     }
 }
 
+/// Run `f` on the user state of thread `tid` of process `pid` (tgkill). False if there
+/// is no such thread. Not for the calling thread, whose state is `process::thread()`.
+pub fn with_user_thread(pid: u64, tid: u64, f: impl FnOnce(&mut crate::process::UserState)) -> bool {
+    let s = scheduler();
+    match s.tasks.iter_mut().filter_map(|t| t.user.as_deref_mut()).find(|u| u.process.pid == pid && u.tid == tid) {
+        Some(u) => {
+            f(u);
+            true
+        }
+        None => false,
+    }
+}
+
 /// (id, name, state) of every task, for the `ps` command.
 pub fn list() -> Vec<(usize, String, &'static str)> {
     let s = scheduler();

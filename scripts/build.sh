@@ -323,6 +323,63 @@ if [[ "${NOVA_DRM_TOOLS:-0}" == 1 ]]; then
         copy_with_deps $(ldd "$NOVA_KMSCUBE" | awk '/=> \//{print $3}')
     fi
 fi
+# NOVA_MEDIA=1: the media engine behind Videos, Music and Photos (userland/media/novamedia.c,
+# a libVLC program), with the host's libvlc, libvlccore and a trimmed set of its plugins
+# (file access, the common demuxers and codecs, PulseAudio output, subtitles, tags) plus
+# the shared libraries they need, and sample media made by scripts/make-test-media.sh.
+# VLC is LGPL 2.1 (some plugins GPL): all of it goes into this local image only, never
+# into the repository. docs/media.md lists what the selection covers.
+if [[ "${NOVA_MEDIA:-0}" == 1 ]]; then
+    if [[ -f /usr/include/vlc/vlc.h && -f /usr/lib/libvlc.so.5 && -d /usr/lib/vlc/plugins ]]; then
+        log "Including the media engine (libVLC $(pkg-config --modversion libvlc 2>/dev/null || echo 3))"
+        "${CC:-gcc}" -O2 -Wall -o "$USERLAND_OUT/novamedia" "$USERLAND_SRC/media/novamedia.c" -lvlc >>"$BUILD_LOG" 2>&1 || fail "compiling novamedia failed (needs libvlc; log: $BUILD_LOG)"
+        strip "$USERLAND_OUT/novamedia"
+        copy_with_deps /usr/lib/libvlc.so.5 /usr/lib/libvlccore.so.9 /usr/lib/vlc/libvlc_pulse.so.0
+        vlc_plugins=(
+            access/libfilesystem_plugin.so access/libattachment_plugin.so
+            audio_output/libpulse_plugin.so audio_output/libamem_plugin.so audio_output/libadummy_plugin.so
+            audio_filter/libaudio_format_plugin.so audio_filter/libscaletempo_plugin.so audio_filter/libequalizer_plugin.so
+            audio_filter/libgain_plugin.so audio_filter/libsamplerate_plugin.so audio_filter/libugly_resampler_plugin.so
+            audio_filter/libtrivial_channel_mixer_plugin.so audio_filter/libsimple_channel_mixer_plugin.so
+            audio_mixer/libfloat_mixer_plugin.so audio_mixer/libinteger_mixer_plugin.so
+            codec/libavcodec_plugin.so codec/libdav1d_plugin.so codec/libvpx_plugin.so codec/libopus_plugin.so
+            codec/libflac_plugin.so codec/libvorbis_plugin.so codec/libmpg123_plugin.so codec/libfaad_plugin.so
+            codec/liba52_plugin.so codec/libaraw_plugin.so codec/libadpcm_plugin.so codec/liblpcm_plugin.so
+            codec/libtheora_plugin.so codec/librawvideo_plugin.so codec/libpng_plugin.so codec/libjpeg_plugin.so
+            codec/libsubsdec_plugin.so codec/libsubsusf_plugin.so codec/libwebvtt_plugin.so codec/libsubstx3g_plugin.so
+            codec/libspudec_plugin.so codec/libcc_plugin.so
+            demux/libmp4_plugin.so demux/libmkv_plugin.so demux/libavformat_plugin.so demux/libavi_plugin.so
+            demux/libogg_plugin.so demux/libes_plugin.so demux/libflacsys_plugin.so demux/libwav_plugin.so
+            demux/libaiff_plugin.so demux/libsubtitle_plugin.so demux/libimage_plugin.so demux/libh26x_plugin.so
+            demux/libmpgv_plugin.so demux/libps_plugin.so demux/libts_plugin.so demux/libmjpeg_plugin.so
+            demux/libvobsub_plugin.so demux/librawaud_plugin.so
+            meta_engine/libfolder_plugin.so meta_engine/libtaglib_plugin.so
+            misc/libxml_plugin.so
+            stream_filter/libprefetch_plugin.so stream_filter/libcache_read_plugin.so stream_filter/libcache_block_plugin.so
+            stream_filter/libskiptags_plugin.so
+            text_renderer/libfreetype_plugin.so text_renderer/libtdummy_plugin.so
+            video_filter/libblend_plugin.so video_filter/libdeinterlace_plugin.so video_filter/libtransform_plugin.so
+            video_filter/libscale_plugin.so video_filter/libcanvas_plugin.so
+            video_output/libvmem_plugin.so video_output/libvdummy_plugin.so
+        )
+        for p in "${vlc_plugins[@]}" $(cd /usr/lib/vlc/plugins && ls packetizer/*.so video_chroma/*.so); do
+            [[ -f "/usr/lib/vlc/plugins/$p" ]] && copy_with_deps "/usr/lib/vlc/plugins/$p"
+        done
+        # The plugin cache (so libVLC need not load every plugin to find out what it is):
+        # generated with the plugins at the path they have in the image.
+        if [[ -x /usr/lib/vlc/vlc-cache-gen && -x /usr/bin/bwrap ]]; then
+            bwrap --ro-bind / / --bind "$SYSROOT/usr/lib/vlc/plugins" /usr/lib/vlc/plugins --dev /dev --proc /proc \
+                /usr/lib/vlc/vlc-cache-gen /usr/lib/vlc/plugins >>"$BUILD_LOG" 2>&1 || log "warning: the VLC plugin cache was not generated"
+        fi
+        # Subtitles: the freetype renderer finds fonts through fontconfig.
+        [[ -d /etc/fonts && ! -d "$SYSROOT/etc/fonts" ]] && { mkdir -p "$SYSROOT/etc"; cp -rL /etc/fonts "$SYSROOT/etc/fonts"; }
+        mkdir -p "$SYSROOT/usr/share/nova/media"
+        "$ROOT/scripts/make-test-media.sh" "$SYSROOT/usr/share/nova/media" >>"$BUILD_LOG" 2>&1 || log "warning: the sample media were not generated (ffmpeg; log: $BUILD_LOG)"
+        log "Media engine: $(du -shL "$SYSROOT/usr/lib/vlc" | cut -f1) of plugins, $(du -sh "$SYSROOT/usr/share/nova/media" | cut -f1) of samples"
+    else
+        log "warning: NOVA_MEDIA=1 but libVLC is not installed (vlc package, /usr/include/vlc): skipping the media engine"
+    fi
+fi
 # Steam's launcher and bootstrap (Valve's proprietary redistributable), if the host has the
 # steam package: only into this local image, never into the repository.
 if [[ -f /usr/lib/steam/bootstraplinux_ubuntu12_32.tar.xz && -f /usr/lib/steam/bin_steam.sh ]]; then

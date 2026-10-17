@@ -22,6 +22,9 @@ fn name_for(icon: char) -> Option<&'static str> {
         '%' => "monitor",
         '\u{263c}' => "settings", // ☼
         'o' => "power",
+        '\u{25B6}' => "video",  // ▶
+        '\u{266A}' => "music",  // ♪
+        '\u{25A3}' => "photos", // ▣
         _ => return None,
     })
 }

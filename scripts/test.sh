@@ -28,7 +28,7 @@ NO_ERR="error code: none (not pushed for this vector)"
 TIMEOUT="${TIMEOUT:-30}"
 SETTLE=2   # seconds the VM must stay up and silent after the verdict (no reset, no extra output)
 
-ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 seccomp vfs containers wayland busybox net linuxnet linuxmsi usbinput drm audio audioich9 nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
+ALL_CASES=(boot panic de ud gp pf bp df nested shell keyboard crash native procs compat32 seccomp vfs containers wayland busybox net linuxnet linuxmsi usbinput drm audio audioich9 media nvme nvmeboot chromium browser setup installed hostlogin deepseek oom apps)
 MOCK_PORT=$(( 20000 + $$ % 20000 ))
 TEST_KEY="sk-ant-test-0123456789abcdef"   # the mock API's only valid key (scripts/mock_anthropic.py)
 CLAUDE_BOX="│ ✻ Claude Code for Nova                               │"
@@ -294,6 +294,30 @@ define_case() {
                           "patone: played 660 Hz for 600 ms (float32le, 44100 Hz)" "s16le 2ch 48000Hz")
                 FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "failed:" "Connection failure")
                 AUDIO_CHECK=("${run_dir:-}/audio.wav" 440:600 1000:600 660:600) ;;
+        media)  # The media apps' engine (userland/media/novamedia.c, libVLC) and decoders, headless:
+                # the kernel-side image decoders (JPEG with EXIF orientation, GIF, PNG), then the
+                # engine decoding a WebP picture, reading a song's tags, and playing the 5 s MKV sample
+                # (H.264 + FLAC) to its end: frames must reach the kernel through the shared buffer and
+                # the 440 Hz tone must come out of Nova's PulseAudio server, recorded by QEMU's wav backend.
+                # Needs an image built with NOVA_MEDIA=1 (libvlc and ffmpeg on the host).
+                CMDLINE="nova.mode=shell"
+                [[ -f /usr/include/vlc/vlc.h ]] || SKIP="libvlc is not installed on the host"
+                [[ -x "$USERLAND_OUT/novamedia" ]] || SKIP="the image was not built with NOVA_MEDIA=1"
+                QEMU_EXTRA=(-audiodev "wav,id=snd0,out.frequency=48000,path=${run_dir:-}/media.wav" -device intel-hda -device hda-duplex,audiodev=snd0)
+                INPUT=("wait:$PROMPT" "ser:media decode usr/share/nova/media/pattern.jpg" "wait:media: decoded"
+                       "ser:media decode usr/share/nova/media/rotated.jpg" "wait:media: decoded"
+                       "ser:media decode usr/share/nova/media/animation.gif" "wait:media: decoded"
+                       "ser:media engine-decode usr/share/nova/media/pattern.webp" "wait:media: engine decoded"
+                       "ser:media probe usr/share/nova/media/01 Concert A.mp3" "wait:media: probed"
+                       "ser:media play usr/share/nova/media/Tone Check.mkv 7" "wait:media: played" "sleep:1")
+                EXPECT=("${shell[@]}")
+                CONTAINS=("media: decoded usr/share/nova/media/pattern.jpg: 800x500 1 frame(s)" "media: decoded usr/share/nova/media/rotated.jpg: 800x500 1 frame(s)"
+                          "media: decoded usr/share/nova/media/animation.gif: 320x200 20 frame(s)" "media: engine decoded usr/share/nova/media/pattern.webp: 800x500"
+                          "  artist: Nova Test Tones" "  album: Sine Waves" "  title: Concert A" "media: first frame 640x360"
+                          "media: state Playing")
+                FORBID=("$PANIC" "$EXC" "NESTED" "segmentation fault" "media: the engine stopped" "state Error" "unimplemented Linux syscall")
+                # The clip is 5 s of tone (see check_audio.py for --bridge).
+                AUDIO_CHECK=(--bridge 150 "${run_dir:-}/media.wav" 440:5000) ;;
         audioich9) # The same driver on QEMU's ICH9 controller with an output-only codec: a tone.
                 CMDLINE="nova.mode=shell"
                 QEMU_EXTRA=(-audiodev "wav,id=snd0,out.frequency=48000,path=${run_dir:-}/audio-ich9.wav" -device ich9-intel-hda -device hda-output,audiodev=snd0)
@@ -491,8 +515,10 @@ run_case() {
     QEMU_PIDS+=("$pid")
 
     clean()   { tr -d '\r' <"$serial_log" | sed 's/\x1b\[[0-9;=?]*[A-Za-z]//g'; }
-    has_line(){ clean | grep -qFx -- "$1"; }
-    has_sub() { clean | grep -qF  -- "$1"; }
+    # grep without -q reads the whole log: with pipefail, an early exit would make
+    # tr/sed fail with SIGPIPE on long logs and the check report a false miss.
+    has_line(){ clean | grep -Fx -- "$1" >/dev/null; }
+    has_sub() { clean | grep -F  -- "$1" >/dev/null; }
     prompts() { clean | grep -oF -- "$PROMPT" | wc -l; }
     all_ok() {
         local l

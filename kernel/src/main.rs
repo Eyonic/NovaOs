@@ -37,6 +37,7 @@ mod linux;
 mod linuxkpi;
 mod lineedit;
 mod log;
+mod media;
 mod memory;
 mod monitor;
 mod mouse;

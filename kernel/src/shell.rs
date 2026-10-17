@@ -49,6 +49,7 @@ const COMMANDS: &[Command] = &[
     Command { name: "strace", args: "<file> [args]", help: "run a program, logging its system calls to serial", run: cmd_strace },
     Command { name: "wayland", args: "[save <file.ppm>]", help: "Wayland compositor status, or save the largest window as an image", run: cmd_wayland },
     Command { name: "netstat", args: "", help: "TCP sockets: state, endpoints, queued bytes", run: cmd_netstat },
+    Command { name: "media", args: "play|decode|probe <file>", help: "exercise the media engine and image decoders (tests)", run: cmd_media },
     Command { name: "recent", args: "<pid>|<name>", help: "show running programs' last system calls", run: cmd_recent },
     Command { name: "peer", args: "<pid> <fd>", help: "which processes hold the other end of a socket", run: cmd_peer },
     Command { name: "trace", args: "<pid> on|off", help: "log a running program's system calls to serial", run: cmd_trace },
@@ -202,6 +203,10 @@ fn cmd_netstat(_: &str, _: &History) {
     for line in crate::net::tcp_sockets() {
         println!("{line}");
     }
+}
+
+fn cmd_media(args: &str, _: &History) {
+    crate::media::shell(args);
 }
 
 fn cmd_wayland(args: &str, _: &History) {

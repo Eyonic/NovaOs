@@ -9,8 +9,8 @@ copies the files into the image under `usr/share/nova/`.
 | Directory | What | Processing |
 |---|---|---|
 | `home/` | Home's key art: a portrait capsule per item (`browser.png`, `web_video.png`, `restart.png`, ...), a wide hero per item (`hero_browser.png`, ...) and the wallpaper (`wall.png`) | see below; capsules 352x500, heroes 768x480, wallpaper 800x500 |
-| `icons/` | App icons (assistant, browser, terminal, files, editor, monitor, settings, power) | see below; 128x128 |
-| `glyphs/` | Symbolic UI icons (48: arrows, search, grid/list, folder, document, gear, shield, cpu, memory, network, ...): white strokes on black, used as tint masks by `Canvas::draw_mask` | drawn, not generated: see below; 128x128 |
+| `icons/` | App icons (assistant, browser, terminal, files, editor, monitor, settings, power, video, music, photos) | see below; 128x128 |
+| `glyphs/` | Symbolic UI icons (72: arrows, search, grid/list, folder, document, gear, shield, cpu, memory, network, and the media set: play, pause, skip, volume, subtitles, audio, queue, shuffle, repeat, fullscreen, rotate, film, music, disc, sliders, ...): white strokes on black, used as tint masks by `Canvas::draw_mask` | drawn, not generated: see below; 128x128 |
 
 ## Home key art
 
@@ -58,6 +58,9 @@ Nothing is a stock scene, no text, logos, trademarks or people.
 | DeckCraft (`craft_deckcraft`) | tangerine orange (`#F06818`) | blank landscape glass panes fanned one behind another, like slides |
 | PdfCraft (`craft_pdfcraft`) | teal (`#10A088`) | a closed folio of brushed-metal covers, a seam of teal light along its pages |
 | PhotoCraft (`craft_photocraft`) | azure blue (`#2878F0`) | a crystal prism glowing from within, splitting light into a fan of rays |
+| Videos (`video`) | tangerine orange | a thick triangular prism of dark smoky glass standing on one point: a play button, glowing from within |
+| Music (`music`) | magenta-pink | one eighth note sculpted from dark glass and brushed metal, glowing from within |
+| Photos (`photos`) | golden amber | a camera lens of smoky dark glass seen from the front, its elements glowing, a golden aperture ring |
 | Wallpaper (`wall`) | violet on near-black | a single small star flaring in a dark indigo sky, the nova |
 
 **Composition rules.**

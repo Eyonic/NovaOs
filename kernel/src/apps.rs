@@ -58,6 +58,9 @@ pub const BUNDLED: &[(&str, &str)] = &[
     ("system/apps/editor.rhai", include_str!("apps/editor.rhai")),
     ("system/apps/monitor.rhai", include_str!("apps/monitor.rhai")),
     ("system/apps/settings.rhai", include_str!("apps/settings.rhai")),
+    ("system/apps/video.rhai", include_str!("apps/video.rhai")),
+    ("system/apps/music.rhai", include_str!("apps/music.rhai")),
+    ("system/apps/photos.rhai", include_str!("apps/photos.rhai")),
 ];
 
 /// Install or update the bundled apps on the system filesystem.
@@ -476,6 +479,9 @@ const NATIVE_EDITOR: &str = "system/apps/editor.rhai";
 const NATIVE_FILES: &str = "system/apps/files.rhai";
 const NATIVE_MONITOR: &str = "system/apps/monitor.rhai";
 const NATIVE_SETTINGS: &str = "system/apps/settings.rhai";
+const NATIVE_VIDEO: &str = "system/apps/video.rhai";
+const NATIVE_MUSIC: &str = "system/apps/music.rhai";
+const NATIVE_PHOTOS: &str = "system/apps/photos.rhai";
 
 pub fn launch(path: &str) -> Result<(), String> {
     if path == NATIVE_EDITOR {
@@ -495,6 +501,22 @@ pub fn launch(path: &str) -> Result<(), String> {
     }
     if path == NATIVE_SETTINGS {
         crate::settings::open();
+        return Ok(());
+    }
+    if path == NATIVE_VIDEO {
+        crate::media::video::open(None);
+        return Ok(());
+    }
+    if path == NATIVE_MUSIC {
+        crate::media::music::open(None);
+        return Ok(());
+    }
+    if path == NATIVE_PHOTOS {
+        crate::media::photos::open(None);
+        return Ok(());
+    }
+    if !path.ends_with(".rhai") && crate::media::open_file(path) {
+        // A video, song or picture: its media app.
         return Ok(());
     }
     if let Some(entry) = crate::desktop::handler_for(path) {
@@ -608,7 +630,7 @@ pub fn check(path: &str, events: &[String]) -> Result<CheckReport, String> {
 /// Render an app's current frame without a window (for desktop previews): load it,
 /// run init, `ticks` ticks and draw. None if it fails.
 pub fn snapshot(path: &str, ticks: u32) -> Option<Canvas> {
-    if [NATIVE_EDITOR, NATIVE_FILES, NATIVE_MONITOR, NATIVE_SETTINGS].contains(&path) {
+    if [NATIVE_EDITOR, NATIVE_FILES, NATIVE_MONITOR, NATIVE_SETTINGS, NATIVE_VIDEO, NATIVE_MUSIC, NATIVE_PHOTOS].contains(&path) {
         return None; // native app: Home shows its poster
     }
     let src = fs::read_string(path).ok()?;
