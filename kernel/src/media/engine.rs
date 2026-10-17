@@ -152,6 +152,7 @@ impl Engine {
     /// at `start_ms`, paused if `paused`.
     pub fn open(&mut self, path: &str, start_ms: i64, paused: bool) {
         self.reset_media();
+        self.frame = None;
         self.state = PlayState::Opening;
         let cmd = if paused { "open-paused" } else { "open" };
         self.send(&format!("{cmd} /{} {}", path.trim_start_matches('/'), start_ms.max(0)));

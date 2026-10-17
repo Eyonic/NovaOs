@@ -137,13 +137,18 @@ impl Resume {
         let f = t.rows.get(path)?;
         Some((f.first()?.parse().ok()?, f.get(1)?.parse().ok()?))
     }
-    /// Remember `pos` of `len`; near the start or the end nothing is kept.
+    /// Remember `pos` of `len`. Near the end (5 s, or a tenth of a short file) the video
+    /// counts as watched and is forgotten; near the start an earlier position is kept
+    /// (opening a video and leaving at once must not lose where it was stopped).
     pub fn set(path: &str, pos: i64, len: i64) {
         let mut t = Table::load("resume.txt");
-        if len > 0 && pos > 5000 && pos < len - 5000 && len - pos > len / 25 {
+        let margin = 5000.min(len / 10).max(500);
+        if len > 0 && pos >= margin && pos <= len - margin {
             t.rows.insert(path.into(), alloc::vec![pos.to_string(), len.to_string(), rtc::unix_time().to_string()]);
-        } else {
+        } else if len > 0 && pos >= margin {
             t.rows.remove(path);
+        } else {
+            return;
         }
         t.save();
     }
@@ -294,7 +299,10 @@ pub fn fmt_time(ms: i64) -> String {
 
 /// "47m", "1h 12m", "2 h" for row headers.
 pub fn fmt_duration(ms: i64) -> String {
-    let m = (ms.max(0) + 30_000) / 60_000;
+    if ms < 60_000 {
+        return format!("{}s", (ms.max(0) + 999) / 1000);
+    }
+    let m = (ms + 30_000) / 60_000;
     if m >= 60 { format!("{}h {:02}m", m / 60, m % 60) } else { format!("{m}m") }
 }
 

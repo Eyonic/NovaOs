@@ -217,6 +217,9 @@ static void log_cb(void *data, int level, const libvlc_log_t *ctx, const char *f
 /* ---- commands ----------------------------------------------------------------- */
 
 static void set_media(const char *path, int64_t start_ms, int audio) {
+    /* A player that reached the end (or is still playing) must be stopped before it takes
+     * new media, or play() does nothing. */
+    libvlc_media_player_stop(mp);
     if (media) { libvlc_media_release(media); media = NULL; }
     media = libvlc_media_new_path(vlc, path);
     if (!media) { say("error cannot open %s", path); return; }
@@ -329,7 +332,7 @@ int main(int argc, char **argv) {
     (void)argc; (void)argv;
     setenv("VLC_PLUGIN_PATH", "/usr/lib/vlc/plugins", 0);
     setenv("PULSE_SERVER", "unix:/run/user/1000/pulse/native", 0);
-    setenv("HOME", "/home/nova", 0);
+    setenv("HOME", "/home/nova", 1); /* libVLC's caches (cover art) live under $HOME */
     mkdir("/home/nova", 0755);
     int fd = memfd_create("nova-media-frames", 0);
     if (fd < 0 || ftruncate(fd, 2 * SLOT_BYTES) < 0) { say("error memfd: %s", strerror(errno)); return 1; }
@@ -339,6 +342,10 @@ int main(int argc, char **argv) {
     const char *args[] = {
         "--no-xlib", "--aout=pulse", "--vout=vmem", "--no-video-title-show", "--no-osd", "--no-stats", "--no-lua",
         "--no-media-library", "--no-one-instance", "--file-caching=600", "--no-snapshot-preview", "--subsdec-encoding=UTF-8",
+        /* Subtitles in Nova's typeface (fontconfig finds it in usr/share/fonts). */
+        "--freetype-font=Noto Sans", "--freetype-bold",
+        /* A slow machine shows fewer frames rather than broken ones. */
+        "--no-skip-frames", "--drop-late-frames",
     };
     vlc = libvlc_new(sizeof args / sizeof args[0], args);
     if (!vlc) { say("error libvlc_new failed (plugins missing?)"); return 1; }

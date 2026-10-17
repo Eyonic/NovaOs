@@ -224,17 +224,7 @@ pub fn card(c: &mut Canvas, r: Rect, img: Option<&Canvas>, glyph: &str, title: &
         c.fill_round_rect(outer, ui::RADIUS + 4, if selected { ui::SELECTION } else { ui::HOVER });
     }
     match img {
-        Some(i) => {
-            c.fill_round_rect(r, ui::RADIUS, 0x000000);
-            let (iw, ih) = (i.width as i32, i.height as i32);
-            // Cover: scale to fill, crop the overflow, as video thumbnails are shown.
-            let (tw, th) = if iw * r.h > ih * r.w { ((iw * r.h / ih.max(1)).max(1), r.h) } else { (r.w, (ih * r.w / iw.max(1)).max(1)) };
-            let mut tmp = Canvas::new(tw as usize, th as usize);
-            tmp.blit_scaled(i, tmp.bounds(), 0, 255);
-            let mut crop = Canvas::new(r.w as usize, r.h as usize);
-            crop.blit(&tmp, Rect::new((tw - r.w) / 2, (th - r.h) / 2, r.w, r.h), 0, 0);
-            c.blit_scaled(&crop, r, ui::RADIUS, 255);
-        }
+        Some(i) => fill_with(c, r, i, ui::RADIUS),
         None => {
             c.fill_round_rect(r, ui::RADIUS, ui::PANEL);
             c.stroke_round_rect_w(r, ui::RADIUS, 1, ui::BORDER);
@@ -255,6 +245,18 @@ pub fn card(c: &mut Canvas, r: Rect, img: Option<&Canvas>, glyph: &str, title: &
     }
     font::draw_clipped(c, r.x + 2, r.y + r.h + 8, title, 13, Weight::Bold, ui::TEXT, r.w - 4);
     font::draw_clipped(c, r.x + 2, r.y + r.h + 26, caption, ui::CAPTION, Weight::Regular, ui::DIM, r.w - 4);
+}
+
+/// `img` scaled to fill `r` with the overflow cropped (thumbnails, tiles), rounded.
+pub fn fill_with(c: &mut Canvas, r: Rect, img: &Canvas, radius: i32) {
+    c.fill_round_rect(r, radius, 0x000000);
+    let (iw, ih) = (img.width as i32, img.height as i32);
+    let (tw, th) = if iw * r.h > ih * r.w { ((iw * r.h / ih.max(1)).max(1), r.h) } else { (r.w, (ih * r.w / iw.max(1)).max(1)) };
+    let mut tmp = Canvas::new(tw as usize, th as usize);
+    tmp.blit_scaled(img, tmp.bounds(), 0, 255);
+    let mut crop = Canvas::new(r.w as usize, r.h as usize);
+    crop.blit(&tmp, Rect::new((tw - r.w) / 2, (th - r.h) / 2, r.w, r.h), 0, 0);
+    c.blit_scaled(&crop, r, radius, 255);
 }
 
 /// A row title with an optional right-hand note ("Continue Watching", "4 items").
@@ -311,7 +313,7 @@ pub fn shortcuts_sheet(c: &mut Canvas, area: Rect, title: &str, rows: &[(&str, &
     c.blend_rect(area, 0, 150);
     let cols = 2;
     let per_col = rows.len().div_ceil(cols);
-    let w = 560.min(area.w - 32);
+    let w = 620.min(area.w - 32);
     let h = 110 + per_col as i32 * 34 + 40;
     let r = Rect::new(area.x + (area.w - w) / 2, area.y + (area.h - h) / 2, w, h);
     popover(c, r);

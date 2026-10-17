@@ -233,7 +233,7 @@ impl Music {
         }
         // Cover art: libVLC extracts embedded pictures to its cache (a tmpfs file).
         if let Some(url) = meta.get("artwork") {
-            let file = url.trim_start_matches("file://").to_string();
+            let file = percent_decode(url.trim_start_matches("file://"));
             if let Some(data) = crate::vfs::read_file(file.trim_start_matches('/')).ok().filter(|d| !d.is_empty())
                 && let Ok(img) = super::image::decode(&data)
             {
@@ -782,12 +782,16 @@ impl Music {
             };
             self.hits.push((*r, Hit::Nav(target)));
         }
-        let n = self.visible_songs().len();
-        let note = format!("{n} song{}", if n == 1 { "" } else { "s" });
+        let plural = |n: usize, what: &str| format!("{n} {what}{}", if n == 1 { "" } else { "s" });
+        let note = match self.view {
+            View::Albums => plural(self.albums().len(), "album"),
+            View::Artists => plural(self.artists().len(), "artist"),
+            _ => plural(self.visible_songs().len(), "song"),
+        };
         let nx = rects.last().map_or(x, |r| r.x + r.w + 10);
         font::draw(c, nx, 22, &note, ui::CAPTION, Weight::Regular, ui::DIM);
         let sr = Rect::new(w - 232, (TOP_H - ui::CONTROL_H) / 2, 216, ui::CONTROL_H);
-        ui::field_icon(c, sr, &self.search, "Search songs, artists, albums", self.searching, Some("search"));
+        ui::field_icon(c, sr, &self.search, "Search music", self.searching, Some("search"));
         self.hits.push((sr, Hit::Search));
     }
 
@@ -1006,7 +1010,10 @@ impl Music {
         let bar = Rect::new(0, h - BAR_H, w, BAR_H);
         c.fill_rect(bar, ui::SIDEBAR);
         ui::divider(c, Rect::new(0, bar.y, w, 1));
-        let (state, pos, len) = self.engine.as_ref().map_or((PlayState::Idle, 0, 0), |e| (e.state, e.position_ms(), e.length_ms));
+        let (state, pos, len) = match (&self.engine, self.current) {
+            (Some(e), Some(_)) => (e.state, e.position_ms(), e.length_ms),
+            _ => (PlayState::Idle, 0, 0),
+        };
         let playing = state == PlayState::Playing;
         // Left: cover, title, artist.
         let left_w = (w / 4).max(220);
@@ -1127,6 +1134,25 @@ impl Music {
             font::draw(c, r.x + 44, y + 6, "No presets (engine not running)", ui::CAPTION, Weight::Regular, ui::DIM);
         }
     }
+}
+
+/// "%20" and friends in a file URL back to bytes.
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() + 0 && i + 2 <= b.len() - 1
+            && let (Some(h), Some(l)) = ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `queue` rotated so playing starts at `start` while keeping the list order.

@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 
 use super::chrome::{self, BAR_H, SIDEBAR_W, TOP_H, VIDEO_ACCENT as ACCENT};
 use super::engine::{Engine, PlayState};
-use super::library::{self, display_name, fmt_time, folder_name, Entry, History, Prefs, Resume, Thumbs};
+use super::library::{self, display_name, fmt_time, folder_name, Entry, History, Prefs, Resume, TagCache, Tags, Thumbs};
 use crate::font::{self, Weight};
 use crate::gfx::{blend, Canvas, Rect};
 use crate::input::Key;
@@ -26,10 +26,11 @@ use crate::{fs, pit, task};
 
 pub const ICON: char = '\u{25B6}';
 
-const CARD_W: i32 = 192;
-const CARD_H: i32 = 108;
-const CARD_PITCH_X: i32 = CARD_W + 24;
-const CARD_PITCH_Y: i32 = CARD_H + 76;
+/// Cards are at least this wide and stretch so a row fills the width.
+const CARD_MIN_W: i32 = 180;
+const CARD_GAP: i32 = 20;
+/// Below a card's picture: its title and caption.
+const CARD_TEXT_H: i32 = 76;
 const ROW_H: i32 = 40;
 const SPEEDS: [i32; 6] = [50, 75, 100, 125, 150, 200];
 const HIDE_AFTER: u64 = 2500;
@@ -105,6 +106,8 @@ enum Hit {
     QueueRepeat,
     QueueClear,
     Resume(i64),
+    /// A Continue Watching card: play from the saved position.
+    Continue(String, i64),
     Dismiss,
     Sheet,
     Replay,
@@ -150,6 +153,8 @@ struct Video {
     last_click: (u64, Option<Hit>),
     saved_at: u64,
     drawn_seq: u64,
+    drawn_at: u64,
+    drawn_state: PlayState,
     hits: Vec<(Rect, Hit)>,
     ended_handled: bool,
 }
@@ -194,6 +199,8 @@ impl Video {
             last_click: (0, None),
             saved_at: 0,
             drawn_seq: 0,
+            drawn_at: 0,
+            drawn_state: PlayState::Idle,
             hits: Vec::new(),
             ended_handled: false,
         };
@@ -245,6 +252,10 @@ impl Video {
 
     /// Play `path`, queueing the rest of its folder after it.
     fn play_path(&mut self, path: &str, from_outside: bool) {
+        self.play_path_from(path, from_outside, 0);
+    }
+
+    fn play_path_from(&mut self, path: &str, from_outside: bool, start_ms: i64) {
         let folder = folder_name(path);
         let mut q: Vec<String> = self.listed().into_iter().filter(|e| folder_name(&e.path) == folder).map(|e| e.path).collect();
         if !q.iter().any(|p| p == path) {
@@ -255,7 +266,7 @@ impl Video {
         }
         self.qpos = q.iter().position(|p| p == path).unwrap_or(0);
         self.queue = q;
-        self.start_current(0);
+        self.start_current(start_ms);
     }
 
     fn start_current(&mut self, start_ms: i64) {
@@ -397,10 +408,15 @@ impl Video {
         if Thumbs::exists(&path) {
             return;
         }
-        if let Some(e) = self.engine()
-            && let Some(frame) = e.thumbnail(&path, 20)
-        {
-            Thumbs::put(&path, &frame, 384);
+        if let Some(e) = self.engine() {
+            let frame = e.thumbnail(&path, 20);
+            let len = e.length_ms;
+            if let Some(frame) = frame {
+                Thumbs::put(&path, &frame, 384);
+            }
+            if len > 0 {
+                TagCache::set(&path, &Tags { title: e.meta.get("title").cloned().unwrap_or_default(), length_ms: len, ..Default::default() });
+            }
         }
     }
 
@@ -476,11 +492,11 @@ impl Video {
                     self.engine = None;
                     engine_changed = true;
                 } else {
-                    if e.frame_seq != self.drawn_seq {
-                        engine_changed = true;
+                    if e.frame_seq != self.drawn_seq && pit::ticks() - self.drawn_at >= 30 {
+                        engine_changed = true; // at most ~30 frames a second reach the screen
                     }
-                    if self.view == View::Player && (e.state == PlayState::Playing || e.state == PlayState::Ended) {
-                        engine_changed = true;
+                    if e.state != self.drawn_state || (self.view == View::Player && pit::ticks() - self.drawn_at >= 250) {
+                        engine_changed = true; // the clock, the seek bar
                     }
                     ended = e.state == PlayState::Ended && !self.ended_handled;
                     save = e.state == PlayState::Playing && pit::ticks() - self.saved_at > 5000;
@@ -498,7 +514,7 @@ impl Video {
             if save {
                 self.leave_player(false);
             }
-            if redraw || engine_changed || self.view == View::Player {
+            if redraw || engine_changed {
                 self.render();
             }
         }
@@ -598,7 +614,7 @@ impl Video {
                 if self.view != View::Library {
                     self.view = View::Library;
                 }
-                let cols = if self.grid { self.columns() } else { 1 };
+                let cols = if self.grid { self.cards().0 } else { 1 };
                 let i = self.selected.unwrap_or(0);
                 let j = match k {
                     Key::Left => i.saturating_sub(1),
@@ -652,6 +668,7 @@ impl Video {
                 self.searching = false;
             }
             Hit::Entry(p) => self.play_path(&p, false),
+            Hit::Continue(p, ms) => self.play_path_from(&p, false, ms),
             Hit::Folder(f) => {
                 self.view = View::Library;
                 self.folder = Some(f);
@@ -844,8 +861,13 @@ impl Video {
         Rect::new(SIDEBAR_W, TOP_H, w - SIDEBAR_W, h - TOP_H)
     }
 
-    fn columns(&self) -> usize {
-        ((self.content().w - 40 + 24) / CARD_PITCH_X).max(1) as usize
+    /// Card grid of the content area: (columns, card width, card height); 16:9 cards
+    /// between 24 px margins.
+    fn cards(&self) -> (usize, i32, i32) {
+        let avail = self.content().w - 48;
+        let cols = ((avail + CARD_GAP) / (CARD_MIN_W + CARD_GAP)).max(1);
+        let w = (avail - (cols - 1) * CARD_GAP) / cols;
+        (cols as usize, w, w * 9 / 16)
     }
 
     fn state(&self, r: Rect) -> State {
@@ -879,7 +901,7 @@ impl Video {
             let rows: [(&str, &[&str]); 12] = [
                 ("Play / Pause", &["Space"]),
                 ("Toggle fullscreen", &["F"]),
-                ("Seek backward / forward", &["Left", "Right"]),
+                ("Seek back / forward", &["Left", "Right"]),
                 ("Volume down / up", &["Down", "Up"]),
                 ("Previous / next item", &["P", "N"]),
                 ("Show / hide queue", &["Q"]),
@@ -987,15 +1009,19 @@ impl Video {
         let x0 = area.x + 24;
         chrome::row_title(c, x0, y, area.w - 48, title, note);
         let y = y + 36;
-        let per = ((area.w - 48 + 24) / CARD_PITCH_X).max(1) as usize;
+        let (per, cw, ch) = self.cards();
         for (i, (path, caption, progress)) in items.iter().take(per).enumerate() {
-            let r = Rect::new(x0 + i as i32 * CARD_PITCH_X, y, CARD_W, CARD_H);
+            let r = Rect::new(x0 + i as i32 * (cw + CARD_GAP), y, cw, ch);
             let thumb = Thumbs::get(path);
             let hit = Rect::new(r.x - 6, r.y - 6, r.w + 12, r.h + 56);
             chrome::card(c, r, thumb.as_deref(), "film", &display_name(path), caption, *progress, self.state(hit), false, ACCENT);
-            self.hits.push((hit, Hit::Entry(path.clone())));
+            let target = match progress {
+                Some((pos, _)) => Hit::Continue(path.clone(), *pos),
+                None => Hit::Entry(path.clone()),
+            };
+            self.hits.push((hit, target));
         }
-        y + CARD_PITCH_Y
+        y + ch + CARD_TEXT_H
     }
 
     fn draw_home(&mut self, c: &mut Canvas) {
@@ -1007,7 +1033,7 @@ impl Video {
         }
         let mut recent = self.all.clone();
         recent.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(a.path.cmp(&b.path)));
-        let recent: Vec<(String, String, Option<(i64, i64)>)> = recent.iter().take(8).map(|e| (e.path.clone(), folder_name(&e.path), None)).collect();
+        let recent: Vec<(String, String, Option<(i64, i64)>)> = recent.iter().take(8).map(|e| (e.path.clone(), caption_of(&e.path), None)).collect();
         if recent.is_empty() {
             let msg = if self.engine_error.is_some() { "Put videos in a Videos folder. The media engine is not in this image, so nothing can play yet." } else { "Put videos (mp4, mkv, webm, avi) in a Videos folder and they show up here." };
             ui::empty_state(c, area, "film", "No videos yet", msg);
@@ -1046,8 +1072,8 @@ impl Video {
             return;
         }
         let x0 = area.x + 24;
-        let cols = self.columns();
-        let total_h = if self.grid { (items.len().div_ceil(cols)) as i32 * CARD_PITCH_Y + 40 } else { items.len() as i32 * ROW_H + 60 };
+        let (cols, cw, ch) = self.cards();
+        let total_h = if self.grid { (items.len().div_ceil(cols)) as i32 * (ch + CARD_TEXT_H) + 40 } else { items.len() as i32 * ROW_H + 60 };
         self.scroll = self.scroll.min((total_h - area.h).max(0));
         if !self.grid {
             let y = area.y + 12 - self.scroll;
@@ -1058,14 +1084,14 @@ impl Video {
         for (i, e) in items.iter().enumerate() {
             let sel = self.selected == Some(i);
             if self.grid {
-                let r = Rect::new(x0 + (i % cols) as i32 * CARD_PITCH_X, area.y + 20 + (i / cols) as i32 * CARD_PITCH_Y - self.scroll, CARD_W, CARD_H);
+                let r = Rect::new(x0 + (i % cols) as i32 * (cw + CARD_GAP), area.y + 20 + (i / cols) as i32 * (ch + CARD_TEXT_H) - self.scroll, cw, ch);
                 if r.y + r.h + 50 < area.y || r.y > area.y + area.h {
                     continue;
                 }
                 let hit = Rect::new(r.x - 6, r.y - 6, r.w + 12, r.h + 56);
                 let progress = Resume::get(&e.path);
                 let thumb = Thumbs::get(&e.path);
-                chrome::card(c, r, thumb.as_deref(), "film", &display_name(&e.path), &folder_name(&e.path), progress, self.state(hit), sel, ACCENT);
+                chrome::card(c, r, thumb.as_deref(), "film", &display_name(&e.path), &caption_of(&e.path), progress, self.state(hit), sel, ACCENT);
                 self.hits.push((hit, Hit::Entry(e.path.clone())));
             } else {
                 let r = Rect::new(x0 - 8, area.y + 40 + i as i32 * ROW_H - self.scroll, area.w - 40, ROW_H - 2);
@@ -1138,7 +1164,9 @@ impl Video {
         };
         if let Some(e) = &self.engine {
             self.drawn_seq = e.frame_seq;
+            self.drawn_state = e.state;
         }
+        self.drawn_at = pit::ticks();
         match &frame {
             Some(f) => {
                 let dst = fit_rect(area, f.width as i32, f.height as i32);
@@ -1269,7 +1297,9 @@ impl Video {
             tx += 36;
         }
         // Resume toast.
-        if let Some((ms, _)) = self.resume_offer {
+        if let Some((ms, _)) = self.resume_offer
+            && self.pop == Pop::None
+        {
             let text = format!("You already watched till {}", fmt_time(ms));
             let tw = font::width(&text, 13, Weight::Regular);
             let bw = font::width("Continue watching", ui::CAPTION, Weight::Bold) + 20;
@@ -1316,8 +1346,8 @@ impl Video {
             1 => &audio,
             _ => &subs,
         };
-        let rows = list.len().max(1) as i32 + if tab == 2 { 1 + sidecars.len() as i32 } else { 0 };
-        let h = 60 + 26 + rows * 36 + 16 + if tab == 2 { 44 } else { 0 };
+        let rows = list.len().max(1) as i32 + if tab == 2 { sidecars.len().max(1) as i32 } else { 0 };
+        let h = 60 + 26 + rows * 36 + 12 + if tab == 2 { 34 } else { 0 };
         let r = chrome::popover_rect(anchor, 320, h.min(bounds.h - 16), bounds);
         chrome::popover(c, r);
         self.hits.push((r, Hit::Swallow));
@@ -1326,7 +1356,7 @@ impl Video {
             self.hits.push((*t, Hit::Tab(i)));
         }
         let mut y = r.y + 60;
-        y = ui::section_label(c, r.x + 16, y, "Embedded tracks");
+        y = ui::section_label(c, r.x + 16, y, "Tracks");
         let kind = ['v', 'a', 's'][tab];
         let cur = match tab {
             1 => cur_a,
@@ -1346,7 +1376,7 @@ impl Video {
         }
         if tab == 2 {
             y += 8;
-            y = ui::section_label(c, r.x + 16, y, "External tracks");
+            y = ui::section_label(c, r.x + 16, y, "Add a subtitle file");
             if sidecars.is_empty() {
                 font::draw(c, r.x + 44, y + 8, "Put .srt or .vtt files next to the video", ui::CAPTION, Weight::Regular, ui::DIM);
                 y += 36;
@@ -1408,7 +1438,7 @@ impl Video {
 
     fn draw_queue_pop(&mut self, c: &mut Canvas, anchor: Rect, bounds: Rect) {
         let n = self.queue.len();
-        let total: i64 = self.queue.iter().map(|p| Resume::get(p).map_or(0, |(_, l)| l)).sum();
+        let total: i64 = self.queue.iter().map(|p| length_of(p)).sum();
         let rows = n.clamp(1, 9) as i32;
         let h = 60 + rows * 40 + 16;
         let r = chrome::popover_rect(anchor, 360, h.min(bounds.h - 16), bounds);
@@ -1427,7 +1457,8 @@ impl Video {
         let first = self.qpos.saturating_sub(4).min(n.saturating_sub(rows as usize));
         for (i, p) in self.queue.iter().enumerate().skip(first).take(rows as usize) {
             let row = Rect::new(r.x + 8, r.y + 58 + (i - first) as i32 * 40, r.w - 16, 38);
-            let dur = Resume::get(p).map_or(String::new(), |(_, l)| fmt_time(l));
+            let len = length_of(p);
+            let dur = if len > 0 { fmt_time(len) } else { String::new() };
             chrome::queue_row(c, row, &display_name(p), &dur, i == self.qpos, playing, self.state(row), ACCENT);
             self.hits.push((row, Hit::QueueItem(i)));
         }
@@ -1435,6 +1466,17 @@ impl Video {
             font::draw(c, r.x + 40, r.y + 68, "The queue is empty", ui::BODY, Weight::Regular, ui::DIM);
         }
     }
+}
+
+/// A video's length from the resume table or the tag cache (0 if unknown yet).
+fn length_of(path: &str) -> i64 {
+    Resume::get(path).map(|(_, l)| l).or_else(|| TagCache::get(path).map(|t| t.length_ms)).unwrap_or(0)
+}
+
+/// "Samples · 5:00" under a card.
+fn caption_of(path: &str) -> String {
+    let len = length_of(path);
+    if len > 0 { format!("{} \u{00b7} {}", folder_name(path), fmt_time(len)) } else { folder_name(path) }
 }
 
 fn speed_label(percent: i32) -> String {

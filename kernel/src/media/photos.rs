@@ -25,6 +25,7 @@ pub const ICON: char = '\u{25A3}';
 const BAR_H: i32 = 52;
 const STRIP_H: i32 = 84;
 const INFO_W: i32 = 260;
+const TITLE_H: i32 = 60;
 const HIDE_AFTER: u64 = 2500;
 const ZOOMS: [i32; 10] = [10, 25, 50, 75, 100, 150, 200, 300, 400, 800];
 
@@ -201,8 +202,18 @@ impl Photos {
             if data.len() > 6 << 20 {
                 return None; // too big to decode just for a strip
             }
-            let img = image::decode(&data).ok()?;
-            Some(library::Thumbs::put(path, img.first(), 160))
+            match image::decode(&data) {
+                Ok(img) => Some(library::Thumbs::put(path, img.first(), 320)),
+                Err(_) => {
+                    // WebP and friends: the engine decodes them (once; the thumbnail is kept).
+                    if !self.engine_tried {
+                        self.engine_tried = true;
+                        self.engine = Engine::start().ok();
+                    }
+                    let f = self.engine.as_mut()?.decode(path)?;
+                    Some(library::Thumbs::put(path, &f, 320))
+                }
+            }
         });
         if self.thumbs.len() > 200 {
             self.thumbs.remove(0);
@@ -275,7 +286,8 @@ impl Photos {
         }
         let strip = if self.strip && self.entries.len() > 1 { STRIP_H } else { 0 };
         let info = if self.info { INFO_W } else { 0 };
-        Rect::new(0, 0, w - info, h - BAR_H - strip)
+        // The name and the library button get a band of their own above the picture.
+        Rect::new(0, TITLE_H, w - info, h - BAR_H - strip - TITLE_H)
     }
 
     fn state(&self, r: Rect) -> State {
@@ -466,9 +478,11 @@ impl Photos {
             ui::empty_state(c, area, "image", "No pictures yet", "Put pictures (png, jpg, gif, webp) in a Pictures folder, or open one from Files.");
             return;
         }
-        let tile = 156;
-        let pitch = tile + 20;
-        let per = ((w - 40 + 20) / pitch).max(1) as usize;
+        // Square tiles at least 150 px wide, stretched so a row fills the width.
+        let per = ((w - 40 + 16) / (150 + 16)).max(1);
+        let tile = (w - 40 - (per - 1) * 16) / per;
+        let pitch = tile + 16;
+        let per = per as usize;
         for (i, e) in self.entries.clone().iter().enumerate() {
             let r = Rect::new(20 + (i % per) as i32 * pitch, area.y + 20 + (i / per) as i32 * (pitch + 24), tile, tile);
             if r.y > h {
@@ -480,11 +494,7 @@ impl Photos {
                 c.fill_round_rect(hit, ui::RADIUS + 4, ui::HOVER);
             }
             match t {
-                Some(t) => {
-                    c.fill_round_rect(r, ui::RADIUS, 0x0B0C12);
-                    let fit = super::video::fit_rect(r, t.width as i32, t.height as i32);
-                    c.blit_scaled(&t, fit, ui::RADIUS_S, 255);
-                }
+                Some(t) => chrome::fill_with(c, r, &t, ui::RADIUS),
                 None => {
                     c.fill_round_rect(r, ui::RADIUS, ui::PANEL);
                     ui::symbol(c, "image", ui::FAINT, Rect::new(r.x + r.w / 2 - 20, r.y + r.h / 2 - 20, 40, 40));
@@ -548,8 +558,10 @@ impl Photos {
         let entry = self.index.and_then(|i| self.entries.get(i)).cloned();
         let name = entry.as_ref().map(|e| e.path.rsplit('/').next().unwrap_or(&e.path).to_string()).unwrap_or_default();
         // Top overlay: name and position in the folder.
-        for y in 0..64 {
-            c.blend_rect(Rect::new(area.x, y, area.w, 1), 0, (150 * (64 - y) / 64) as u32);
+        if self.fullscreen {
+            for y in 0..64 {
+                c.blend_rect(Rect::new(area.x, y, area.w, 1), 0, (150 * (64 - y) / 64) as u32);
+            }
         }
         let lib = Rect::new(16, 14, 36, 36);
         if self.state(lib) != State::Normal {
@@ -638,7 +650,7 @@ impl Photos {
                 y += 10;
             }
             y += 8;
-            chrome::hint_rows(c, ir.x + ui::PAD, y, &[("\u{2190} \u{2192}", "Previous / next"), ("+ -", "Zoom"), ("0", "Fit"), ("R", "Rotate"), ("F", "Fullscreen"), ("W", "Set as wallpaper")]);
+            chrome::hint_rows(c, ir.x + ui::PAD, y, &[("Left Right", "Previous / next"), ("+ -", "Zoom"), ("0", "Fit"), ("R", "Rotate"), ("F", "Fullscreen"), ("W", "Set as wallpaper")]);
         }
         self.draw_bar(c, Rect::new(0, h - BAR_H, w, BAR_H), false, zoom, fit);
     }
