@@ -686,5 +686,5 @@ extern "C" fn nova_input_event(kind: u16, code: u16, value: i32) {
         _ => {}
     }
     // Wake whoever waits for input (the desktop and shells poll after interrupts).
-    crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    crate::task::device_event();
 }

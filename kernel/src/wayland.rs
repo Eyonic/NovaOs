@@ -317,7 +317,6 @@ impl Client {
         }
         c.push(ipc::Message { data: core::mem::take(&mut self.out), fds: core::mem::take(&mut self.outfds), pid: 0 });
         drop(c);
-        ipc::notify();
     }
 
     /// Read what the client sent; false once it hung up.

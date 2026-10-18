@@ -467,6 +467,7 @@ fn poll_file(f: &FileRef) -> (u32, u64) {
         Kind::Unix(UnixSocket { listener: Some(l), .. }) => l.lock().poll(),
         Kind::Unix(_) => (0, 0),
         Kind::Inet(s) => {
+            ipc::watch(ipc::NET_KEY);
             let (r, w, hup, err) = crate::net::sock_poll(s.handle, s.udp);
             let mut ev = 0;
             if r {
@@ -1644,7 +1645,6 @@ fn channel_read(file: &FileRef, len: usize, peek_message: bool, dontwait: bool) 
                             c.read_message(len).unwrap()
                         };
                         drop(c);
-                        ipc::notify();
                         return Ok(r);
                     }
                     if c.writer_closed {
@@ -1656,7 +1656,6 @@ fn channel_read(file: &FileRef, len: usize, peek_message: bool, dontwait: bool) 
                         return Err(EINVAL);
                     }
                     if let Some(v) = e.lock().take() {
-                        ipc::notify();
                         return Ok((v.to_le_bytes().to_vec(), Vec::new(), false));
                     }
                 }
@@ -1687,7 +1686,6 @@ fn channel_write(file: &FileRef, data: &[u8], fds: Vec<FileRef>, dontwait: bool)
                     if c.writable() {
                         c.push(ipc::Message { data: data.to_vec(), fds: fds.take().unwrap_or_default(), pid: proc().pid as u32 });
                         drop(c);
-                        ipc::notify();
                         return Ok(data.len());
                     }
                 }
@@ -1697,7 +1695,6 @@ fn channel_write(file: &FileRef, data: &[u8], fds: Vec<FileRef>, dontwait: bool)
                     }
                     let v = u64::from_le_bytes(data[..8].try_into().unwrap());
                     e.lock().add(v);
-                    ipc::notify();
                     return Ok(8);
                 }
                 _ => return Err(EINVAL),
@@ -1745,7 +1742,7 @@ fn timerfd_read(f: &FileRef, t: &Arc<SpinLock<ipc::TimerFd>>, len: usize) -> Res
     loop {
         {
             let mut t = t.lock();
-            t.update();
+            t.poll(); // counts expirations, and the wait below ends at the next one
             if t.pending > 0 {
                 let n = core::mem::take(&mut t.pending);
                 return Ok(n.to_le_bytes().to_vec());
@@ -2391,13 +2388,16 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let file = fds().get(a0 as i64)?;
                 if let Kind::Channel(end) = &file.lock().kind {
                     if a1 != 0 && let Some(tx) = &end.tx {
-                        tx.lock().writer_closed = true;
+                        let mut c = tx.lock();
+                        c.writer_closed = true;
+                        c.generation = ipc::bump(ipc::key(&*c));
                     }
                     if a1 != 1 && let Some(rx) = &end.rx {
-                        rx.lock().reader_closed = true;
+                        let mut c = rx.lock();
+                        c.reader_closed = true;
+                        c.generation = ipc::bump(ipc::key(&*c));
                     }
                 }
-                ipc::notify();
                 0
             }
             49 => {
@@ -2616,7 +2616,6 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 let Kind::Inotify(i) = &file.lock().kind else { return Err(EINVAL) };
                 let i = i.clone();
                 i.lock().rm_watch(a1 as i32)?;
-                ipc::notify();
                 0
             }
             283 => {

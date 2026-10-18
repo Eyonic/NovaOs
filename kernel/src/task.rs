@@ -31,6 +31,17 @@ const IDLE_STACK_SIZE: usize = 64 * 1024;
 
 /// Incremented by every IRQ (see interrupts.rs); parked tasks wait for it to change.
 pub static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Incremented by device events only (input, NICs, Linux drivers' wake-ups), not by the
+/// timer: tasks parked in [`wait_io`] wait for it to change.
+pub static DEV_IRQ: AtomicU64 = AtomicU64::new(0);
+/// DEV_IRQ when the scheduler last looked: whether [`tick_kick`] has new work to offer.
+static DEV_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// A device produced something (interrupt context too): tasks waiting for I/O re-check.
+pub fn device_event() {
+    DEV_IRQ.fetch_add(1, Ordering::SeqCst);
+    IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+}
 
 /// Timestamp-counter cycles spent halted in idle tasks, summed over the CPUs.
 static IDLE_CYCLES: AtomicU64 = AtomicU64::new(0);
@@ -71,6 +82,9 @@ enum State {
     Waiting(u64),
     /// Parked until [`wake`] or the deadline (a tick count; u64::MAX: none). Nothing polls.
     Blocked(u64),
+    /// Parked until [`wake`], a device event (DEV_IRQ differs from the first value) or the
+    /// deadline (the second): an I/O wait, which timer ticks alone do not end.
+    Io(u64, u64),
     Finished,
 }
 
@@ -99,11 +113,15 @@ struct Task {
     wake_pending: bool,
     /// Its Linux task_struct (Linux's `current` while it runs; linuxkpi.rs), or 0.
     lx: usize,
+    /// Earliest timerfd expiration (ticks) among those its current I/O wait polled.
+    io_timer: u64,
+    /// Keys of the objects its current I/O wait polled (ipc::watch).
+    watch: Vec<usize>,
 }
 
 impl Task {
     fn new(id: usize, name: &str, rsp: u64, stack: Option<Box<[u8]>>, entry: Option<Box<dyn FnOnce() + Send>>, tty: Option<crate::tty::TtyRef>) -> Self {
-        Self { id, name: name.into(), state: State::Ready, rsp, stack, entry, tty, user: None, runs: 0, cpu: None, idle_of: None, affinity: u64::MAX, wake_pending: false, lx: 0 }
+        Self { id, name: name.into(), state: State::Ready, rsp, stack, entry, tty, user: None, runs: 0, cpu: None, idle_of: None, affinity: u64::MAX, wake_pending: false, lx: 0, io_timer: u64::MAX, watch: Vec::new() }
     }
 }
 
@@ -295,6 +313,56 @@ pub fn block(deadline: Option<u64>) {
     irq_restore(flags);
 }
 
+/// A timerfd the current task just polled expires at tick `at`: its next I/O wait ends
+/// by then.
+pub fn note_timer(at: u64) {
+    let s = scheduler();
+    let i = cur(s);
+    s.tasks[i].io_timer = s.tasks[i].io_timer.min(at);
+}
+
+/// The current task's next I/O wait is for the object with this key.
+pub fn watch(key: usize) {
+    let s = scheduler();
+    let i = cur(s);
+    let w = &mut s.tasks[i].watch;
+    // Re-checks poll the same objects again; a scan that never waits stops growing here.
+    if w.len() < 4096 && !w.contains(&key) {
+        w.push(key);
+    }
+}
+
+/// The keys noted by [`watch`] since the last call.
+pub fn take_watch() -> Vec<usize> {
+    let s = scheduler();
+    let i = cur(s);
+    core::mem::take(&mut s.tasks[i].watch)
+}
+
+/// The earliest tick noted by [`note_timer`] since the last call (u64::MAX: none).
+pub fn take_timer() -> u64 {
+    let s = scheduler();
+    let i = cur(s);
+    core::mem::replace(&mut s.tasks[i].io_timer, u64::MAX)
+}
+
+/// Park for I/O ([`crate::ipc::wait`]) until [`wake`], a device event or `deadline` (a
+/// tick count). A wake that came since the task last parked returns at once.
+pub fn wait_io(deadline: u64) {
+    let flags = irq_save();
+    let s = scheduler();
+    let current = cur(s);
+    let t = &mut s.tasks[current];
+    if core::mem::take(&mut t.wake_pending) {
+        irq_restore(flags);
+        return;
+    }
+    t.state = State::Io(DEV_IRQ.load(Ordering::SeqCst), deadline);
+    NEXT_DEADLINE.fetch_min(deadline, Ordering::Relaxed);
+    schedule();
+    irq_restore(flags);
+}
+
 /// The earliest deadline of a blocked task (an upper bound: it is only lowered here and
 /// recomputed when scheduling), for the boot CPU's tick to know when to look again.
 static NEXT_DEADLINE: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -305,7 +373,7 @@ pub fn wake(id: usize) {
     let s = scheduler();
     let mut kick = false;
     if let Some(t) = s.tasks.iter_mut().find(|t| t.id == id) {
-        if matches!(t.state, State::Waiting(_) | State::Blocked(_)) {
+        if matches!(t.state, State::Waiting(_) | State::Blocked(_) | State::Io(..)) {
             t.state = State::Ready;
             kick = t.cpu.is_none();
         } else if t.state == State::Ready {
@@ -330,7 +398,9 @@ pub fn sleep_ticks(ticks: u64) {
 /// CPU is busy, wake an idle one to run them (one at a time: it wakes others if it finds
 /// more work than it can run).
 pub fn tick_kick() {
-    let work = QUEUED.load(Ordering::Relaxed) > 0 || crate::pit::ticks() >= NEXT_DEADLINE.load(Ordering::Relaxed);
+    let work = QUEUED.load(Ordering::Relaxed) > 0
+        || crate::pit::ticks() >= NEXT_DEADLINE.load(Ordering::Relaxed)
+        || DEV_IRQ.load(Ordering::Relaxed) != DEV_SEEN.load(Ordering::Relaxed);
     // At the preemption rate: the busy CPU itself looks that often.
     if smp::count() > 1 && work && crate::pit::ticks() % crate::pit::PREEMPT_TICKS == 0 && !smp::is_idle(smp::id()) && !TICK_KICKED.load(Ordering::Relaxed) && smp::kick_idle() {
         TICK_KICKED.store(true, Ordering::Relaxed);
@@ -342,6 +412,7 @@ fn runnable(state: State) -> bool {
         State::Ready => true,
         State::Waiting(seen) => IRQ_COUNT.load(Ordering::SeqCst) != seen,
         State::Blocked(deadline) => crate::pit::ticks() >= deadline,
+        State::Io(seen, deadline) => DEV_IRQ.load(Ordering::SeqCst) != seen || crate::pit::ticks() >= deadline,
         State::Finished => false,
     }
 }
@@ -391,11 +462,12 @@ fn schedule() {
     let mut more = false;
     let mut queued = 0;
     let mut deadline = u64::MAX;
+    DEV_SEEN.store(DEV_IRQ.load(Ordering::Relaxed), Ordering::Relaxed);
     for k in 1..=n {
         let i = (current + k) % n;
         let t = &s.tasks[i];
         match t.state {
-            State::Blocked(d) => deadline = deadline.min(d),
+            State::Blocked(d) | State::Io(_, d) => deadline = deadline.min(d),
             State::Finished => {}
             _ if t.cpu.is_none() && t.idle_of.is_none() => queued += 1,
             _ => {}
@@ -657,7 +729,7 @@ pub fn list() -> Vec<(usize, String, &'static str)> {
             } else {
                 match t.state {
                     State::Ready => "ready",
-                    State::Waiting(_) | State::Blocked(_) => "waiting",
+                    State::Waiting(_) | State::Blocked(_) | State::Io(..) => "waiting",
                     State::Finished => "finished",
                 }
             };

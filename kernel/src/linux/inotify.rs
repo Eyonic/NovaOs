@@ -113,10 +113,11 @@ impl Inotify {
         if self.queue.back() != Some(&e) {
             self.queue.push_back(e);
         }
-        self.generation = ipc::next_gen();
+        self.generation = ipc::bump(ipc::key(self));
     }
 
     pub fn poll(&self) -> (u32, u64) {
+        ipc::watch(ipc::key(self));
         (if self.queue.is_empty() { 0 } else { POLLIN }, self.generation)
     }
 
@@ -174,7 +175,6 @@ fn notify_cookie(path: &str, mask: u32, is_dir: bool, cookie: u32) {
     let (dir, name) = split(path);
     let dirflag = if is_dir { IN_ISDIR } else { 0 };
     let instances: Vec<InotifyRef> = INSTANCES.lock().iter().filter_map(|w| w.upgrade()).collect();
-    let mut woke = false;
     for inst in instances {
         let mut i = inst.lock();
         let mut fired = Vec::new();
@@ -196,19 +196,14 @@ fn notify_cookie(path: &str, mask: u32, is_dir: bool, cookie: u32) {
             if oneshot {
                 let _ = i.rm_watch(wd);
             }
-            woke = true;
         }
         // A deleted or moved-away file's own watch ends.
         if mask & IN_DELETE_SELF != 0 {
             let gone: Vec<i32> = i.watches.iter().filter(|w| w.path == path).map(|w| w.wd).collect();
             for wd in gone {
                 let _ = i.rm_watch(wd);
-                woke = true;
-            }
+                }
         }
-    }
-    if woke {
-        ipc::notify();
     }
 }
 

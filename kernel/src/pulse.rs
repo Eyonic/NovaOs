@@ -1005,7 +1005,6 @@ impl Client {
         }
         c.push(ipc::Message { data: core::mem::take(&mut self.out), fds: Vec::new(), pid: 0 });
         drop(c);
-        ipc::notify();
     }
 }
 

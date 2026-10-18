@@ -167,35 +167,43 @@ variables, mmap/munmap/mprotect from many threads, and a page replaced again and
 shootdown shows up as stale reads (hundreds of thousands of them when the shootdown is
 switched off).
 
+## I/O waits
+
+`ipc::wait` (poll, select, epoll, blocking reads and writes, the kernel's Wayland and
+PulseAudio servers) parks the task in the `Io` state instead of making it runnable at every
+interrupt. It ends on:
+
+- a change to an object the task polled: while it scans its descriptors, `poll_file` records
+  each object's key (`ipc::watch`, the address of the struct holding its generation), and the
+  task waits in those keys' buckets of a 256-entry hashed table. A change (`ipc::bump`, at
+  every generation change of a channel, listener, eventfd, timerfd or inotify instance) wakes
+  that bucket only. The network task wakes the sockets' key when a fingerprint of every
+  socket's readiness (state, can/may receive/send, queue lengths) changes, whoever polled the
+  stack;
+- the expiry of a timerfd the task polled (`task::note_timer`);
+- a device event (`task::device_event`: input, NIC and other device interrupts, Linux
+  drivers' poll wake-ups; a counter the timer does not bump);
+- its own deadline, or a 10 ms re-check for readiness nothing announces;
+- `ipc::notify`, which wakes every I/O waiter, for changes waiters cannot name (signals,
+  exits, SysV semaphores).
+
+Waits that polled nothing (the kernel's servers, blocking reads) wake on any change.
+
+Measured with Steam in QEMU on 4 CPUs, fresh images, interleaved runs, timed by a shell loop
+that spawns no processes (Steam rotates `webhelper.txt` when it restarts the web helper, so
+reading it later misleads):
+
+| | web helper | sign-in window | kernel lock held, idle Steam |
+|---|---|---|---|
+| wake at every interrupt | 61-62 s | 64-67 s | 13-14% |
+| I/O waits | 61-65 s | 64-68 s | 5-6% |
+
 ## What's next
 
 * Take the BKL off self-contained hot paths: futex wait/wake, `sched_yield`,
   `clock_gettime`/`gettimeofday` (better: a vDSO), `getpid`-style calls, page faults on
   private anonymous memory.
-* Parked tasks poll: a task in `wait_event` becomes runnable at the next interrupt and
-  checks its condition. Futex waits and sleeps no longer do (`task::block`: parked until
-  `task::wake` or a deadline; a wake that comes early is remembered), but poll, epoll and
-  wait4 still do, which is most of the BKL time of an idle Steam (about 12%). Tried and
-  measured: `ipc::wait` parked with `task::block` (re-check every 10 ms) gains nothing as
-  long as the network task wakes every I/O waiter after each stack poll (every tick); with
-  that wake limited to polls where smoltcp moved a packet, idle Steam's lock time fell to
-  about 1%, but the Steam client then stalled before starting its web helper on 4 CPUs
-  (some socket readiness is not announced by packet activity). That needs finding first.
-
-  Second attempt (2026-10-17, not merged), measured on fresh images with the same script
-  (baseline: web helper +62 s, sign-in +66 s, idle Steam 14% lock time):
-  - the network task notifies only when a fingerprint of every socket's readiness
-    (state, can/may recv/send, queue lengths) changes, whoever polled the stack;
-  - `ipc::wait` parks in a new `Io` state until `notify`, a device interrupt (a separate
-    counter that the timer does not bump), the caller's deadline, the expiry of a timerfd
-    the caller itself polled, or a 10 ms re-check;
-  - every `next_gen()` marks a change, and the system-call exit wakes waiters once.
-
-  Steam then reached the sign-in window at +127 s, or later. Logging showed that almost
-  no readiness was found only by the 10 ms re-check, so wake-ups were not missed. The cost
-  is the opposite: `notify` wakes every I/O waiter (100+ Chromium threads), and doing so
-  after every state-changing system call wakes them far more often than once per tick.
-  The way forward is per-object wait queues (a waiter registers on the channels, sockets
-  and timerfds it polls, and a change wakes only those), not a global wake list.
+* Wait4 still parks in `wait_event` (runnable at every interrupt); poll, select, epoll and
+  blocking reads no longer do (see "I/O waits" above).
 * Device interrupts on other CPUs (MSI affinity), asynchronous signal delivery to a thread
   running on another CPU, x2APIC for machines with APIC ids above 254, PCID.

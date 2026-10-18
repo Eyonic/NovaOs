@@ -118,6 +118,44 @@ fn with_stack<R>(f: impl FnOnce(&mut Stack) -> R) -> Result<R, String> {
 }
 
 impl Stack {
+    /// A fingerprint of every socket's readiness (state, what it can do, queue lengths):
+    /// it changes whenever a waiter's answer could.
+    fn readiness(&self) -> u64 {
+        use core::hash::{Hash, Hasher};
+        struct Fnv(u64);
+        impl Hasher for Fnv {
+            fn finish(&self) -> u64 {
+                self.0
+            }
+            fn write(&mut self, bytes: &[u8]) {
+                for &b in bytes {
+                    self.0 = (self.0 ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        for (handle, sock) in self.sockets.iter() {
+            handle.hash(&mut h);
+            let mut mix = |v: u64| h.write_u64(v);
+            match sock {
+                smoltcp::socket::Socket::Tcp(t) => {
+                    mix(t.state() as u64);
+                    mix(t.can_recv() as u64 | (t.can_send() as u64) << 1 | (t.may_recv() as u64) << 2 | (t.may_send() as u64) << 3);
+                    mix(t.recv_queue() as u64);
+                    mix(t.send_queue() as u64);
+                }
+                smoltcp::socket::Socket::Udp(u) => {
+                    mix(u.can_recv() as u64 | (u.can_send() as u64) << 1);
+                    mix(u.recv_queue() as u64);
+                    mix(u.send_queue() as u64);
+                }
+                _ => {}
+            }
+        }
+        h.write_u8(self.ip.is_some() as u8);
+        h.finish()
+    }
+
     fn poll(&mut self) {
         self.iface.poll(now(), &mut self.device, &mut self.sockets);
         match self.sockets.get_mut::<dhcpv4::Socket>(self.dhcp).poll() {
@@ -172,15 +210,25 @@ pub fn init(nic: Box<dyn Nic>) {
         dns_servers: Vec::new(),
         next_port,
     });
-    task::spawn("net", || loop {
-        POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        let _ = with_stack(|s| {
-            s.poll();
-            reap_orphans(s);
-        });
-        // Blocked socket calls and epoll waits re-check after every poll.
-        crate::ipc::notify();
-        task::wait_event();
+    task::spawn("net", || {
+        let mut seen = 0;
+        loop {
+            POLLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let digest = with_stack(|s| {
+                s.poll();
+                reap_orphans(s);
+                s.readiness()
+            });
+            // Blocked socket calls and epoll waits re-check when a socket changed, whoever
+            // polled the stack (system calls poll it too).
+            if let Ok(d) = digest
+                && d != seen
+            {
+                seen = d;
+                crate::ipc::changed(crate::ipc::NET_KEY);
+            }
+            task::wait_event();
+        }
     });
 }
 

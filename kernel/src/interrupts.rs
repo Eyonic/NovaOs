@@ -309,7 +309,7 @@ extern "C" fn irq_dispatch(frame: &ExceptionFrame) {
         crate::apic::eoi();
         cpu_interrupt(vector, user);
     } else if vector >= crate::apic::FIRST_DYNAMIC_VECTOR {
-        crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+        crate::task::device_event();
         smp::device_irq(vector);
         crate::apic::eoi();
     } else {
@@ -329,7 +329,11 @@ fn legacy_irq(vector: u8, user: bool) {
     if !apic && !pic::is_genuine(irq) {
         return;
     }
-    crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    if irq == pic::IRQ_TIMER {
+        crate::task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    } else {
+        crate::task::device_event();
+    }
     match irq {
         pic::IRQ_TIMER => pit::tick(),
         pic::IRQ_KEYBOARD => input::SCANCODES.push(keyboard::read_scancode()),

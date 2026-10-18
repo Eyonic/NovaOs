@@ -25,28 +25,97 @@ pub const POLLRDHUP: u32 = 0x2000;
 /// Bytes a pipe or socket buffers before writers block.
 const CAPACITY: usize = 512 * 1024;
 
+/// I/O waiters that named no object (kernel tasks, blocking reads): any change wakes them.
 static WAITERS: SpinLock<Vec<usize>> = SpinLock::new(Vec::new());
+/// I/O waiters by the objects they polled, hashed: a change wakes only its bucket.
+const BUCKETS: usize = 256;
+static KEYED: [SpinLock<Vec<usize>>; BUCKETS] = [const { SpinLock::new(Vec::new()) }; BUCKETS];
 static GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// The key of the network sockets (one for all of them: the network task announces a
+/// change of any).
+pub const NET_KEY: usize = 1;
 
 pub fn next_gen() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Something changed: wake every task waiting for I/O.
-pub fn notify() {
-    let ws = core::mem::take(&mut *WAITERS.lock());
+/// An object's key: the address of the struct that holds its generation.
+pub fn key<T>(object: &T) -> usize {
+    object as *const T as usize
+}
+
+fn bucket(key: usize) -> usize {
+    ((key as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize % BUCKETS
+}
+
+fn wake_all(list: &SpinLock<Vec<usize>>) {
+    let ws = core::mem::take(&mut *list.lock());
     for t in ws {
         task::wake(t);
     }
 }
 
-/// Park until [`notify`], an interrupt, or the deadline (in ticks).
+/// The object with this key changed: wake the tasks that polled it (and those that wait
+/// for any change).
+pub fn changed(key: usize) {
+    wake_all(&KEYED[bucket(key)]);
+    wake_all(&WAITERS);
+}
+
+/// A new generation for the object with this key, waking its waiters.
+pub fn bump(key: usize) -> u64 {
+    changed(key);
+    next_gen()
+}
+
+/// The calling task's next I/O wait is for the object with this key (poll_file).
+pub fn watch(key: usize) {
+    task::watch(key);
+}
+
+/// Something changed that waiters cannot name (a signal, an exit): wake every I/O waiter.
+pub fn notify() {
+    wake_all(&WAITERS);
+    for b in &KEYED {
+        wake_all(b);
+    }
+}
+
+/// Longest I/O wait without a re-check (ticks): for readiness that no [`notify`] or
+/// device event announces.
+const RECHECK: u64 = pit::HZ / 100;
+
+/// A timerfd the calling task polls expires `ns` from now: its I/O wait ends by then.
+fn timer_due(ns: u64) {
+    let ticks = ns.div_ceil(1_000_000_000 / pit::HZ);
+    task::note_timer(pit::ticks().saturating_add(ticks));
+}
+
+/// Park until [`notify`], a device event, the expiration of a timerfd the caller polled
+/// before waiting, or the deadline (in ticks); callers re-check their condition after
+/// every return.
 pub fn wait(deadline: Option<u64>) {
-    if deadline.is_some_and(|d| pit::ticks() >= d) {
+    let now = pit::ticks();
+    let timer = task::take_timer();
+    let keys = task::take_watch();
+    if deadline.is_some_and(|d| now >= d) || now >= timer {
         return;
     }
-    WAITERS.lock().push(task::current_id());
-    task::wait_event();
+    let id = task::current_id();
+    let add = |list: &SpinLock<Vec<usize>>| {
+        let mut l = list.lock();
+        if !l.contains(&id) {
+            l.push(id);
+        }
+    };
+    if keys.is_empty() {
+        add(&WAITERS);
+    }
+    for k in keys {
+        add(&KEYED[bucket(k)]);
+    }
+    task::wait_io(deadline.unwrap_or(u64::MAX).min(now + RECHECK).min(timer));
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +161,7 @@ impl Channel {
     pub fn push(&mut self, m: Message) {
         self.bytes += m.data.len();
         self.queue.push_back(m);
-        self.generation = next_gen();
+        self.generation = bump(key(self));
     }
     /// Stream read: up to `max` bytes, crossing message boundaries; fds of every
     /// message touched are returned.
@@ -121,7 +190,7 @@ impl Channel {
             }
         }
         self.bytes -= out.len();
-        self.generation = next_gen();
+        self.generation = bump(key(self));
         (out, fds)
     }
     /// Datagram read: one whole message (truncated to `max`).
@@ -129,7 +198,7 @@ impl Channel {
         let m = self.queue.pop_front()?;
         self.last_sender = m.pid;
         self.bytes -= m.data.len();
-        self.generation = next_gen();
+        self.generation = bump(key(self));
         let truncated = m.data.len() > max;
         let mut data = m.data;
         data.truncate(max);
@@ -159,14 +228,13 @@ impl Drop for End {
             let mut c = rx.lock();
             c.reader_closed = true;
             c.queue.clear(); // drop any fds in flight
-            c.generation = next_gen();
+            c.generation = bump(key(&*c));
         }
         if let Some(tx) = &self.tx {
             let mut c = tx.lock();
             c.writer_closed = true;
-            c.generation = next_gen();
+            c.generation = bump(key(&*c));
         }
-        notify();
     }
 }
 
@@ -177,6 +245,8 @@ impl End {
             // (shutdown(2) or the peer closing). A shut receive side reads EOF (POLLIN |
             // POLLRDHUP); POLLHUP only once both directions are shut.
             let (r, t) = (rx.lock(), tx.lock());
+            watch(key(&*r));
+            watch(key(&*t));
             let rcv_shut = r.writer_closed || r.reader_closed;
             let snd_shut = t.reader_closed || t.writer_closed;
             let mut ev = 0;
@@ -198,6 +268,7 @@ impl End {
         let mut generation_mark = 0;
         if let Some(rx) = &self.rx {
             let c = rx.lock();
+            watch(key(&*c));
             if c.readable() {
                 ev |= POLLIN;
             }
@@ -208,6 +279,7 @@ impl End {
         }
         if let Some(tx) = &self.tx {
             let c = tx.lock();
+            watch(key(&*c));
             if c.writable() && !c.reader_closed {
                 ev |= POLLOUT;
             }
@@ -251,6 +323,7 @@ pub type ListenerRef = Arc<SpinLock<Listener>>;
 
 impl Listener {
     pub fn poll(&self) -> (u32, u64) {
+        watch(key(self));
         (if self.queue.is_empty() { 0 } else { POLLIN }, self.generation)
     }
 }
@@ -307,9 +380,8 @@ pub fn connect_name(key: &str, kind: SockType, inet: Option<(u16, u16)>) -> Resu
     client.inet = inet;
     server.inet = inet.map(|(c, s)| (s, c));
     l.queue.push_back(server);
-    l.generation = next_gen();
+    l.generation = bump(self::key(&*l));
     drop(l);
-    notify();
     Ok(client)
 }
 
@@ -359,6 +431,10 @@ impl TimerFd {
     }
     pub fn poll(&mut self) -> (u32, u64) {
         self.update();
+        watch(key(self));
+        if self.next != 0 {
+            timer_due(self.next.saturating_sub(self.now()));
+        }
         (if self.pending > 0 { POLLIN } else { 0 }, self.generation.wrapping_add(self.fired))
     }
     /// Arm (`value` 0 disarms) with `value` relative to now unless `absolute`; returns the
@@ -370,7 +446,10 @@ impl TimerFd {
         self.next = if value == 0 { 0 } else if absolute { value.max(1) } else { now.saturating_add(value) };
         self.interval = interval;
         self.pending = 0;
-        self.generation = next_gen();
+        self.generation = bump(key(self));
+        if self.next != 0 {
+            timer_due(self.next.saturating_sub(now));
+        }
         old
     }
     /// (interval, time until the next expiration).
@@ -387,6 +466,7 @@ pub fn eventfd(initial: u64, semaphore: bool) -> Arc<SpinLock<EventFd>> {
 
 impl EventFd {
     pub fn poll(&self) -> (u32, u64) {
+        watch(key(self));
         let mut ev = 0;
         if self.value > 0 {
             ev |= POLLIN;
@@ -398,7 +478,7 @@ impl EventFd {
     }
     pub fn add(&mut self, v: u64) {
         self.value = self.value.saturating_add(v).min(u64::MAX - 1);
-        self.generation = next_gen();
+        self.generation = bump(key(self));
     }
     pub fn take(&mut self) -> Option<u64> {
         if self.value == 0 {
@@ -406,7 +486,7 @@ impl EventFd {
         }
         let v = if self.semaphore { 1 } else { self.value };
         self.value -= v;
-        self.generation = next_gen();
+        self.generation = bump(key(self));
         Some(v)
     }
 }
@@ -530,7 +610,6 @@ impl End {
         }
         c.push(Message { data: data.to_vec(), fds: Vec::new(), pid: 0 });
         drop(c);
-        notify();
         Ok(())
     }
 
@@ -541,7 +620,6 @@ impl End {
         if c.readable() {
             let (d, _) = c.read_stream(usize::MAX);
             drop(c);
-            notify();
             return Ok(d);
         }
         if c.writer_closed { Err(()) } else { Ok(Vec::new()) }

@@ -326,7 +326,7 @@ extern "C" fn nova_fd_get(fd: c_int) -> *mut c_void {
 /// waiters in poll/select/epoll re-check, as after any interrupt.
 #[unsafe(no_mangle)]
 extern "C" fn nova_poll_wake() {
-    task::IRQ_COUNT.fetch_add(1, Ordering::SeqCst);
+    task::device_event();
 }
 
 /// copy_from_user()/copy_to_user()/get_user(): is the range mapped in the calling
