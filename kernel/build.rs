@@ -4,6 +4,7 @@ fn main() {
     println!("cargo:rerun-if-changed=linker.ld");
 
     build_uacpi(&dir);
+    build_vdso(&dir);
 
     // FEATURES=linux-drivers: link the Linux objects scripts/build-linux.sh built. They are
     // passed as plain object files (not an archive), so the drivers, which nothing
@@ -60,4 +61,25 @@ fn build_uacpi(dir: &str) {
     println!("cargo:rustc-link-lib=static=uacpi");
     let version = std::fs::read_to_string(format!("{uacpi}/VERSION")).unwrap_or_default();
     println!("cargo:rustc-env=NOVA_UACPI_VERSION={}", version.trim());
+}
+
+/// The vDSO of 64-bit programs (vdso/vdso.c): a small shared object the kernel embeds and
+/// maps into each process (src/vdso.rs). User-mode code, so built like a shared library,
+/// with no relocations and Linux's symbol versions (vdso/vdso.lds).
+fn build_vdso(dir: &str) {
+    let out = std::env::var("OUT_DIR").unwrap();
+    let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".into());
+    for f in ["vdso.c", "vdso.lds"] {
+        println!("cargo:rerun-if-changed={dir}/vdso/{f}");
+    }
+    let status = std::process::Command::new(&cc)
+        .args(["-O2", "-fPIC", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fcf-protection=none", "-nostdlib", "-shared"])
+        .arg(format!("-Wl,-T,{dir}/vdso/vdso.lds"))
+        .args(["-Wl,--hash-style=both", "-Wl,-soname=linux-vdso.so.1", "-Wl,--no-undefined", "-Wl,--build-id=none", "-Wl,-z,max-page-size=4096"])
+        .arg("-o")
+        .arg(format!("{out}/vdso.so"))
+        .arg(format!("{dir}/vdso/vdso.c"))
+        .status()
+        .expect("running the C compiler for the vDSO");
+    assert!(status.success(), "building the vDSO failed");
 }

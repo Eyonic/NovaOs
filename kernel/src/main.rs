@@ -6,6 +6,7 @@
 extern crate alloc;
 
 mod acpi;
+mod vdso;
 mod apic;
 mod apps;
 mod bootcell;

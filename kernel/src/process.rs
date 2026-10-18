@@ -2116,7 +2116,7 @@ fn load_elf(u: &mut Memory, elf: &[u8], dyn_base: u64, is_static: bool) -> Resul
 }
 
 /// Build the initial stack: argc, argv, envp, auxv (System V ABI), return RSP.
-fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, interp_base: u64, execfn: &str) -> u64 {
+fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, interp_base: u64, execfn: &str, vdso: u64) -> u64 {
     let top = u.stack_top();
     u.areas.push(Area { start: top - STACK_SIZE, end: top, writable: true });
     let mut sp = top;
@@ -2137,7 +2137,7 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
     let random_ptr = push_bytes(u, &mut sp, &random);
     let argv: Vec<u64> = args.iter().map(|a| push_bytes(u, &mut sp, &cstr(a))).collect();
     let envp: Vec<u64> = env.iter().map(|e| push_bytes(u, &mut sp, &cstr(e))).collect();
-    let auxv: [(u64, u64); 17] = [
+    let mut auxv: Vec<(u64, u64)> = alloc::vec![
         (3, l.phdr),
         (4, if l.class32 { 32 } else { 56 }),
         (5, l.phnum),
@@ -2156,6 +2156,9 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
         (25, random_ptr),
         (31, execfn_ptr),
     ];
+    if vdso != 0 {
+        auxv.push((33, vdso)); // AT_SYSINFO_EHDR
+    }
     let words = 1 + argv.len() + 1 + envp.len() + 1 + (auxv.len() + 1) * 2;
     let wsize = if l.class32 { 4 } else { 8 };
     sp &= !15;
@@ -2252,7 +2255,8 @@ fn load_program(mem: &mut Memory, path: &str, elf: &[u8], is_static: bool, args:
         None => (loaded.entry, 0),
     };
     // The heap starts after the program, not after the loader.
-    let rsp = build_stack(mem, args, env, &loaded, interp_base, path);
+    let vdso = if mem.compat { 0 } else { crate::vdso::map(mem) };
+    let rsp = build_stack(mem, args, env, &loaded, interp_base, path, vdso);
     Ok((start, rsp))
 }
 

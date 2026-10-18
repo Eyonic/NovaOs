@@ -67,6 +67,13 @@ pub fn unix_nanos() -> u64 {
     BOOT_UNIX.load(Ordering::Relaxed) * 1_000_000_000 + pit::nanos().saturating_sub(boot_ns)
 }
 
+/// CLOCK_REALTIME minus the monotonic clock (pit::nanos), in nanoseconds, wrapping: the
+/// vDSO's wall clock.
+pub fn realtime_offset() -> u64 {
+    let boot_ns = BOOT_TICKS.load(Ordering::Relaxed) * (1_000_000_000 / pit::HZ);
+    (BOOT_UNIX.load(Ordering::Relaxed) * 1_000_000_000).wrapping_sub(boot_ns)
+}
+
 /// Seconds since 1970-01-01 UTC (the RTC is assumed to hold UTC, as QEMU's does by default).
 pub fn unix_time() -> u64 {
     BOOT_UNIX.load(Ordering::Relaxed) + (pit::ticks() - BOOT_TICKS.load(Ordering::Relaxed)) / pit::HZ

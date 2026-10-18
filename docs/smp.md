@@ -198,10 +198,21 @@ reading it later misleads):
 | wake at every interrupt | 61-62 s | 64-67 s | 13-14% |
 | I/O waits | 61-65 s | 64-68 s | 5-6% |
 
+## The vDSO
+
+64-bit programs get a vDSO (`kernel/vdso/vdso.c`, built by `kernel/build.rs`, mapped by
+`src/vdso.rs` and announced with `AT_SYSINFO_EHDR`): `clock_gettime`, `gettimeofday` and
+`time` run in user mode, with no system call and no kernel lock. They read the TSC and a
+read-only data page mapped just below the object (the TSC base, the nanoseconds at that
+base, a multiplier, the wall-clock offset). The kernel's own clock (`pit::nanos`) uses the
+same multiply-and-shift, so the two never disagree by rounding. Clocks other than the
+realtime, monotonic and boottime ones still make the system call. `clock_gettime` costs
+about 10 ns in QEMU (ctest). 32-bit programs have no vDSO yet and use `int 0x80`.
+
 ## What's next
 
 * Take the BKL off self-contained hot paths: futex wait/wake, `sched_yield`,
-  `clock_gettime`/`gettimeofday` (better: a vDSO), `getpid`-style calls, page faults on
+  `getpid`-style calls, page faults on
   private anonymous memory.
 * Wait4 still parks in `wait_event` (runnable at every interrupt); poll, select, epoll and
   blocking reads no longer do (see "I/O waits" above).

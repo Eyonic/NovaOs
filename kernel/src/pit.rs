@@ -62,17 +62,28 @@ pub fn calibrate() -> u64 {
     TSC_BASE.store(t0, Ordering::Relaxed);
     TICK_BASE.store(k0, Ordering::Relaxed);
     TSC_HZ.store(hz, Ordering::Relaxed);
+    TSC_MULT.store(((1_000_000_000u128 << 32) / hz as u128) as u64, Ordering::Relaxed);
     hz
 }
 
+/// Nanoseconds per TSC tick, times 2^32 (0 before calibration).
+static TSC_MULT: AtomicU64 = AtomicU64::new(0);
+
 /// Nanoseconds since the timer started, with TSC resolution (tick resolution
-/// before calibration).
+/// before calibration). The vDSO computes the same, from [`clock_params`].
 pub fn nanos() -> u64 {
-    let hz = TSC_HZ.load(Ordering::Relaxed);
-    if hz == 0 {
+    let mult = TSC_MULT.load(Ordering::Relaxed);
+    if mult == 0 {
         return ticks() * (1_000_000_000 / HZ);
     }
     let base_ns = TICK_BASE.load(Ordering::Relaxed) * (1_000_000_000 / HZ);
     let elapsed = rdtsc().wrapping_sub(TSC_BASE.load(Ordering::Relaxed));
-    base_ns + ((elapsed as u128 * 1_000_000_000) / hz as u128) as u64
+    base_ns + ((elapsed as u128 * mult as u128) >> 32) as u64
+}
+
+/// (TSC at the base, nanoseconds at the base, nanoseconds per tick times 2^32): the clock
+/// [`nanos`] reads, for the vDSO. None before calibration.
+pub fn clock_params() -> Option<(u64, u64, u64)> {
+    let mult = TSC_MULT.load(Ordering::Relaxed);
+    (mult != 0).then(|| (TSC_BASE.load(Ordering::Relaxed), TICK_BASE.load(Ordering::Relaxed) * (1_000_000_000 / HZ), mult))
 }

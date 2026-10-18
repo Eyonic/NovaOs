@@ -7,7 +7,7 @@
 //! implementation (compat32_table.rs, generated from Linux's syscall tables); the others
 //! convert their structures here (32-bit pointers, `long`s, time_t, stat64, iovec, ...),
 //! as Linux's `compat_sys_*` functions do. glibc's i386 port uses the int 0x80 path when
-//! the kernel offers no vDSO, which Nova does not.
+//! the kernel offers no vDSO: Nova has one for 64-bit programs only (src/vdso.rs).
 
 use alloc::string::String;
 use alloc::vec::Vec;

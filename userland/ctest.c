@@ -8,7 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -110,6 +112,28 @@ int main(void) {
     char cwd[256];
     CHECK("getcwd", getcwd(cwd, sizeof cwd) && cwd[0] == '/');
     CHECK("getpid", getpid() > 0);
+
+    /* The vDSO: clock_gettime and friends without a system call, on the kernel's clock. */
+    CHECK("vDSO mapped (AT_SYSINFO_EHDR)", getauxval(AT_SYSINFO_EHDR) != 0);
+    struct timespec k1, v, k2;
+    syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &k1);
+    clock_gettime(CLOCK_MONOTONIC, &v);
+    syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &k2);
+    long long nk1 = k1.tv_sec * 1000000000LL + k1.tv_nsec, nv = v.tv_sec * 1000000000LL + v.tv_nsec,
+              nk2 = k2.tv_sec * 1000000000LL + k2.tv_nsec;
+    CHECK("clock_gettime(MONOTONIC) between two system calls", nk1 <= nv && nv <= nk2);
+    struct timespec rk, rv;
+    syscall(SYS_clock_gettime, CLOCK_REALTIME, &rk);
+    clock_gettime(CLOCK_REALTIME, &rv);
+    long long dr = (rv.tv_sec - rk.tv_sec) * 1000000000LL + (rv.tv_nsec - rk.tv_nsec);
+    CHECK("clock_gettime(REALTIME) matches the system call", dr >= 0 && dr < 1000000);
+    struct timespec a0, a1, ts;
+    clock_gettime(CLOCK_MONOTONIC, &a0);
+    for (int i = 0; i < 1000000; i++) clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &a1);
+    long long per = ((a1.tv_sec - a0.tv_sec) * 1000000000LL + (a1.tv_nsec - a0.tv_nsec)) / 1000000;
+    printf("  clock_gettime: %lld ns per call\n", per);
+    CHECK("clock_gettime under 500 ns (no system call)", per < 500);
 
     printf("ctest: %d passed, %d failed\n", passed, failed);
     return failed;

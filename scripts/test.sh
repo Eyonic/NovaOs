@@ -121,11 +121,11 @@ define_case() {
                 FORBID=("$PANIC" "$EXC" "API error" "  API key: " "not usable" "Claude" "The image failed") ;;
         native) # C/C++ programs (static glibc/libstdc++) through the Linux syscall layer.
                 CMDLINE="nova.mode=shell"
-                INPUT=("wait:$PROMPT" "ser:mem" "wait:kernel heap:" "ser:hello one two" "wait:  HOME=/" "ser:ctest" "wait:ctest: 24 passed"
+                INPUT=("wait:$PROMPT" "ser:mem" "wait:kernel heap:" "ser:hello one two" "wait:  HOME=/" "ser:ctest" "wait:ctest: 28 passed"
                        "ser:cxxtest" "wait:static destructor ran" "ser:threads" "wait:threads: " "ser:hello-dyn" "wait:objects in the process"
                        "ser:cxxtest-dyn" "wait:static destructor ran" "ser:guess" "wait:Your guess: " "ser:50"
                        "wait:Your guess: " "ser:x" "wait:[exit status 1]" "ser:mem" "wait:kernel heap:")
-                EXPECT=("${shell[@]}" "Hello from C on Nova!" "  argv[2] = two" "ctest: 24 passed, 0 failed"
+                EXPECT=("${shell[@]}" "Hello from C on Nova!" "  argv[2] = two" "ctest: 28 passed, 0 failed"
                         "cxxtest: 17 passed, 0 failed" "cxxtest: static destructor ran" "threads: 7 passed, 0 failed"
                         "Hello from a dynamically linked C program on Nova!" "  loaded /usr/lib/libc.so.6" "I'm thinking of a number between 1 and 100."
                         "[exit status 1]")
