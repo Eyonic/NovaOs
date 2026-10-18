@@ -7,7 +7,7 @@
 //! implementation (compat32_table.rs, generated from Linux's syscall tables); the others
 //! convert their structures here (32-bit pointers, `long`s, time_t, stat64, iovec, ...),
 //! as Linux's `compat_sys_*` functions do. glibc's i386 port uses the int 0x80 path when
-//! the kernel offers no vDSO: Nova has one for 64-bit programs only (src/vdso.rs).
+//! the kernel offers no vDSO; Nova's (src/vdso.rs) serves only the clock calls.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -849,9 +849,11 @@ fn push_frame(f: &mut Frame32, sig: u32, sender: u32, to_thread: bool, action: &
     let sc = sigcontext(f, old_mask);
     let retcode_at = frame + if rt { RT_RETCODE } else { OLD_RETCODE };
     let ret = if action.flags & SA_RESTORER != 0 { action.restorer as u32 } else { retcode_at as u32 };
-    // "mov eax, N; int 0x80": rt_sigreturn (173) or sigreturn (119).
-    let nr: u32 = if rt { 173 } else { 119 };
-    let retcode = [0xB8, nr as u8, (nr >> 8) as u8, 0, 0, 0xCD, 0x80, 0x90];
+    // Linux's retcodes: "mov eax, 173; int 0x80" (rt_sigreturn), or for old-style frames
+    // "pop eax; mov eax, 119; int 0x80" (the pop drops the handler's argument, so that
+    // sigreturn finds the frame where it expects it). glibc's i386 port passes no
+    // restorer of its own when there is a vDSO, so these run.
+    let retcode = if rt { [0xB8, 173, 0, 0, 0, 0xCD, 0x80, 0x90] } else { [0x58, 0xB8, 119, 0, 0, 0, 0xCD, 0x80] };
     write_user(frame, &alloc::vec![0u8; size as usize])?;
     if rt {
         put_words(frame, &[ret, sig, (frame + RT_INFO) as u32, (frame + RT_UC) as u32])?;

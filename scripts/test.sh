@@ -143,7 +143,7 @@ define_case() {
                 INPUT=("wait:$PROMPT" "ser:proctest" "wait:proctest: ")
                 EXPECT=("${shell[@]}" "proctest: processes and signals" "  ok   fork() + execve(/bin/hello)"
                         "  ok   posix_spawn(/bin/hello)" "  ok   kill(child, SIGTERM): WIFSIGNALED, WTERMSIG == SIGTERM"
-                        "proctest: 15 passed, 0 failed")
+                        "proctest: 19 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall") ;;
         compat32) # 32-bit (i386) Linux programs in compatibility mode: static and dynamically
                 # linked (ld-linux.so.2), processes and signals, threads with TLS descriptors
@@ -153,7 +153,7 @@ define_case() {
                        "ser:proctest32" "wait:proctest: " "wait:$PROMPT" "ser:threads32" "wait:threads32: ")
                 EXPECT=("${shell[@]}" "Hello from a 32-bit program on Nova! (pointer size 4, argc 2)"
                         "Hello from a dynamically linked 32-bit program! sqrt(2) = 1.414214"
-                        "proctest: 15 passed, 0 failed" "  ok   each thread has its own __thread variable"
+                        "proctest: 19 passed, 0 failed" "  ok   each thread has its own __thread variable"
                         "threads32: 7 passed, 0 failed")
                 FORBID=("$PANIC" "$EXC" "NESTED" "  FAIL " "unimplemented Linux syscall" "segmentation fault") ;;
         seccomp) # seccomp for sandboxes (Chromium's): no_new_privs, BPF filters with ERRNO, TRAP

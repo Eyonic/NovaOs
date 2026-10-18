@@ -1,6 +1,7 @@
 /* proctest: processes and signals as Linux programs use them (fork, exec, wait, kill,
  * sigaction, posix_spawn, pipes across fork, close-on-exec). Prints one line per check
- * and a summary; scripts/test.sh runs it in the "procs" case. */
+ * and a summary; scripts/test.sh runs it in the "procs" case (64-bit, and 32-bit as
+ * proctest32). The last checks are the clock in the vDSO. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -9,7 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -174,6 +178,27 @@ int main(int argc, char **argv)
 	      "kill(child, SIGTERM): WIFSIGNALED, WTERMSIG == SIGTERM");
 	check(chld > 0, "the parent got SIGCHLD");
 	check(waitpid(-1, &status, 0) == -1 && errno == ECHILD, "no children left: ECHILD");
+
+	/* The vDSO (64- or 32-bit): the C library's clock without a system call. */
+	check(getauxval(AT_SYSINFO_EHDR) != 0, "vDSO mapped (AT_SYSINFO_EHDR)");
+	struct timespec k1, v, k2, rk, rv, a0, a1, ts;
+	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &k1);
+	clock_gettime(CLOCK_MONOTONIC, &v);
+	syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &k2);
+	long long n1 = k1.tv_sec * 1000000000LL + k1.tv_nsec, nv = v.tv_sec * 1000000000LL + v.tv_nsec,
+		  n2 = k2.tv_sec * 1000000000LL + k2.tv_nsec;
+	check(n1 <= nv && nv <= n2, "clock_gettime(MONOTONIC) between two system calls");
+	syscall(SYS_clock_gettime, CLOCK_REALTIME, &rk);
+	clock_gettime(CLOCK_REALTIME, &rv);
+	long long dr = (rv.tv_sec - (long long)rk.tv_sec) * 1000000000LL + (rv.tv_nsec - rk.tv_nsec);
+	check(dr >= 0 && dr < 1000000, "clock_gettime(REALTIME) matches the system call");
+	clock_gettime(CLOCK_MONOTONIC, &a0);
+	for (int i = 0; i < 200000; i++)
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+	clock_gettime(CLOCK_MONOTONIC, &a1);
+	long long per = ((a1.tv_sec - (long long)a0.tv_sec) * 1000000000LL + (a1.tv_nsec - a0.tv_nsec)) / 200000;
+	printf("  clock_gettime: %lld ns per call\n", per);
+	check(per < 500, "clock_gettime under 500 ns (no system call)");
 
 	printf("proctest: %d passed, %d failed\n", passed, failed);
 	return failed != 0;

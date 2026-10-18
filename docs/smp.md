@@ -200,14 +200,18 @@ reading it later misleads):
 
 ## The vDSO
 
-64-bit programs get a vDSO (`kernel/vdso/vdso.c`, built by `kernel/build.rs`, mapped by
-`src/vdso.rs` and announced with `AT_SYSINFO_EHDR`): `clock_gettime`, `gettimeofday` and
+Programs get a vDSO (`kernel/vdso/vdso.c`, and `vdso32.c` for 32-bit programs, built by
+`kernel/build.rs`, mapped by `src/vdso.rs` and announced with `AT_SYSINFO_EHDR`):
+`clock_gettime` (and the 32-bit `clock_gettime64`), `gettimeofday` and
 `time` run in user mode, with no system call and no kernel lock. They read the TSC and a
 read-only data page mapped just below the object (the TSC base, the nanoseconds at that
 base, a multiplier, the wall-clock offset). The kernel's own clock (`pit::nanos`) uses the
 same multiply-and-shift, so the two never disagree by rounding. Clocks other than the
 realtime, monotonic and boottime ones still make the system call. `clock_gettime` costs
-about 10 ns in QEMU (ctest). 32-bit programs have no vDSO yet and use `int 0x80`.
+about 10 ns in QEMU (ctest), 18 ns in a 32-bit program (proctest32). The 32-bit vDSO also
+has `__kernel_vsyscall` (`int 0x80; ret`, passed as `AT_SYSINFO`): glibc's i386 port makes
+every system call through it once a vDSO exists, and it then passes no signal restorer of
+its own, so the kernel's return trampolines on the signal frame run (they match Linux's).
 
 ## What's next
 

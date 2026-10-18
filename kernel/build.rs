@@ -63,23 +63,35 @@ fn build_uacpi(dir: &str) {
     println!("cargo:rustc-env=NOVA_UACPI_VERSION={}", version.trim());
 }
 
-/// The vDSO of 64-bit programs (vdso/vdso.c): a small shared object the kernel embeds and
-/// maps into each process (src/vdso.rs). User-mode code, so built like a shared library,
-/// with no relocations and Linux's symbol versions (vdso/vdso.lds).
+/// The vDSOs of 64- and 32-bit programs (vdso/vdso.c, vdso/vdso32.c): small shared objects
+/// the kernel embeds and maps into each process (src/vdso.rs). User-mode code, so built
+/// like shared libraries, with no relocations and Linux's symbol versions (vdso/*.lds).
 fn build_vdso(dir: &str) {
     let out = std::env::var("OUT_DIR").unwrap();
     let cc = std::env::var("CC").unwrap_or_else(|_| "gcc".into());
-    for f in ["vdso.c", "vdso.lds"] {
-        println!("cargo:rerun-if-changed={dir}/vdso/{f}");
+    for (name, arch, soname) in [("vdso", "-m64", "linux-vdso.so.1"), ("vdso32", "-m32", "linux-gate.so.1")] {
+        for ext in ["c", "lds"] {
+            println!("cargo:rerun-if-changed={dir}/vdso/{name}.{ext}");
+        }
+        let status = std::process::Command::new(&cc)
+            .args([arch, "-O2", "-fPIC", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fcf-protection=none", "-nostdlib", "-shared"])
+            .arg(format!("-Wl,-T,{dir}/vdso/{name}.lds"))
+            .arg(format!("-Wl,-soname={soname}"))
+            .args(["-Wl,--hash-style=both", "-Wl,--no-undefined", "-Wl,--build-id=none", "-Wl,-z,max-page-size=4096"])
+            .arg("-o")
+            .arg(format!("{out}/{name}.so"))
+            .arg(format!("{dir}/vdso/{name}.c"))
+            .status()
+            .expect("running the C compiler for the vDSO");
+        assert!(status.success(), "building {name}.so failed (the 32-bit one needs gcc's -m32 support)");
     }
-    let status = std::process::Command::new(&cc)
-        .args(["-O2", "-fPIC", "-fno-stack-protector", "-fno-asynchronous-unwind-tables", "-fcf-protection=none", "-nostdlib", "-shared"])
-        .arg(format!("-Wl,-T,{dir}/vdso/vdso.lds"))
-        .args(["-Wl,--hash-style=both", "-Wl,-soname=linux-vdso.so.1", "-Wl,--no-undefined", "-Wl,--build-id=none", "-Wl,-z,max-page-size=4096"])
-        .arg("-o")
-        .arg(format!("{out}/vdso.so"))
-        .arg(format!("{dir}/vdso/vdso.c"))
-        .status()
-        .expect("running the C compiler for the vDSO");
-    assert!(status.success(), "building the vDSO failed");
+    // AT_SYSINFO of 32-bit programs: where __kernel_vsyscall is in vdso32.so.
+    let syms = std::process::Command::new("nm").arg("-D").arg(format!("{out}/vdso32.so")).output().expect("running nm on vdso32.so");
+    let syms = String::from_utf8_lossy(&syms.stdout);
+    let offset = syms
+        .lines()
+        .find(|l| l.ends_with(" __kernel_vsyscall") || l.contains(" __kernel_vsyscall@"))
+        .and_then(|l| u64::from_str_radix(l.split_whitespace().next()?, 16).ok())
+        .expect("__kernel_vsyscall in vdso32.so");
+    println!("cargo:rustc-env=NOVA_VSYSCALL32={offset}");
 }

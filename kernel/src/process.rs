@@ -2158,6 +2158,9 @@ fn build_stack(u: &mut Memory, args: &[String], env: &[String], l: &Loaded, inte
     ];
     if vdso != 0 {
         auxv.push((33, vdso)); // AT_SYSINFO_EHDR
+        if l.class32 {
+            auxv.push((32, vdso + crate::vdso::VSYSCALL32)); // AT_SYSINFO: __kernel_vsyscall
+        }
     }
     let words = 1 + argv.len() + 1 + envp.len() + 1 + (auxv.len() + 1) * 2;
     let wsize = if l.class32 { 4 } else { 8 };
@@ -2255,7 +2258,8 @@ fn load_program(mem: &mut Memory, path: &str, elf: &[u8], is_static: bool, args:
         None => (loaded.entry, 0),
     };
     // The heap starts after the program, not after the loader.
-    let vdso = if mem.compat { 0 } else { crate::vdso::map(mem) };
+    let compat = mem.compat;
+    let vdso = crate::vdso::map(mem, compat);
     let rsp = build_stack(mem, args, env, &loaded, interp_base, path, vdso);
     Ok((start, rsp))
 }
