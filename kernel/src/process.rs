@@ -1455,7 +1455,9 @@ pub fn wait_child(pid: i64, nohang: bool, reap: bool) -> Result<Option<(u64, i32
             return Err(4); // EINTR: a signal handler runs first
         }
         check_exiting();
-        task::wait_event();
+        // A child's exit and every signal call ipc::notify.
+        crate::ipc::watch(crate::ipc::PROC_KEY);
+        crate::ipc::wait(None);
     }
 }
 

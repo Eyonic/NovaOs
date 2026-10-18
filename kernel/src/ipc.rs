@@ -35,6 +35,9 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 /// The key of the network sockets (one for all of them: the network task announces a
 /// change of any).
 pub const NET_KEY: usize = 1;
+/// The key of process events (exits, signals): waits for children and for signals sleep
+/// on it, and the global [`notify`] those events call wakes them.
+pub const PROC_KEY: usize = 2;
 
 pub fn next_gen() -> u64 {
     GENERATION.fetch_add(1, Ordering::Relaxed)

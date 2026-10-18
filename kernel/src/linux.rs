@@ -2990,7 +2990,9 @@ fn dispatch(f: &mut SyscallFrame, nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a
                 }
                 while !signal::has_deliverable(thread()) {
                     process::check_exiting();
-                    task::wait_event();
+                    // Signals call ipc::notify.
+                    ipc::watch(ipc::PROC_KEY);
+                    ipc::wait(None);
                 }
                 return Err(EINTR);
             }

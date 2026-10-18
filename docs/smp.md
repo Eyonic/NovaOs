@@ -188,6 +188,8 @@ interrupt. It ends on:
   exits, SysV semaphores).
 
 Waits that polled nothing (the kernel's servers, blocking reads) wake on any change.
+`wait4`, `pause` and `sigsuspend` sleep on a key of their own (`ipc::PROC_KEY`) that only
+`ipc::notify` wakes, which child exits and signals call.
 
 Measured with Steam in QEMU on 4 CPUs, fresh images, interleaved runs, timed by a shell loop
 that spawns no processes (Steam rotates `webhelper.txt` when it restarts the web helper, so
@@ -218,7 +220,5 @@ its own, so the kernel's return trampolines on the signal frame run (they match 
 * Take the BKL off self-contained hot paths: futex wait/wake, `sched_yield`,
   `getpid`-style calls, page faults on
   private anonymous memory.
-* Wait4 still parks in `wait_event` (runnable at every interrupt); poll, select, epoll and
-  blocking reads no longer do (see "I/O waits" above).
 * Device interrupts on other CPUs (MSI affinity), asynchronous signal delivery to a thread
   running on another CPU, x2APIC for machines with APIC ids above 254, PCID.
